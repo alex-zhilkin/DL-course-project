@@ -10,25 +10,79 @@ from .graph import build_graph, clone_graph
 
 
 def _fmt3g(value) -> str:
-    if value is None:
-        return "skipped"
-    try:
-        return f"{float(value):.3g}"
-    except Exception:
-        return str(value)
+    return f"{float(value):.3g}"
 
 
 def _weighted_rollout_loss(losses: list[torch.Tensor], decay: float) -> torch.Tensor:
     if len(losses) == 1:
         return losses[0]
-    if not math.isfinite(decay) or decay <= 0.0:
-        raise ValueError(f"train_rollout_loss_decay must be > 0, got {decay}")
     stacked = torch.stack(losses)
     if abs(decay - 1.0) <= 1e-12:
         return stacked.mean()
     weights = stacked.new_tensor([decay**i for i in range(len(losses))])
     weights = weights / weights.sum()
     return (stacked * weights).sum()
+
+
+_HYBRID_GLOBAL_PARAM_PREFIXES = (
+    "global_decoder.",
+    "global_out.",
+    "local_film.",
+)
+_HYBRID_GLOBAL_PARAM_NAMES = {
+    "global_gate",
+    "global_to_local_scale",
+}
+
+
+def _build_optimizer(model, cfg):
+    base_lr = float(cfg.learning_rate)
+    global_lr = getattr(cfg, "global_learning_rate", None)
+    weight_decay = float(getattr(cfg, "weight_decay", 0.0))
+    model_type = str(getattr(cfg, "model_type", "")).strip().lower()
+
+    use_split = (
+        model_type == "hybrid_legacy"
+        and global_lr is not None
+        and math.isfinite(float(global_lr))
+        and float(global_lr) > 0.0
+        and abs(float(global_lr) - base_lr) > 1e-20
+    )
+    if not use_split:
+        optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+        optimizer.param_groups[0]["name"] = "main"
+        return optimizer
+
+    global_params = []
+    local_params = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_global = (name in _HYBRID_GLOBAL_PARAM_NAMES) or any(
+            name.startswith(prefix) for prefix in _HYBRID_GLOBAL_PARAM_PREFIXES
+        )
+        if is_global:
+            global_params.append(p)
+        else:
+            local_params.append(p)
+
+    groups = []
+    if local_params:
+        groups.append({"params": local_params, "lr": base_lr, "name": "local"})
+    if global_params:
+        groups.append({"params": global_params, "lr": float(global_lr), "name": "global"})
+    optimizer = torch.optim.Adam(groups, weight_decay=weight_decay)
+    return optimizer
+
+
+def _lr_text(optimizer) -> str:
+    if len(optimizer.param_groups) == 1:
+        return _fmt3g(optimizer.param_groups[0]["lr"])
+    parts = []
+    for i, group in enumerate(optimizer.param_groups):
+        name = str(group.get("name", f"g{i}"))
+        parts.append(f"{name}:{_fmt3g(group['lr'])}")
+    return ",".join(parts)
 
 
 def _sample_autoregressive_loss(
@@ -111,7 +165,7 @@ def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None)
             steps += 1
 
     out = loss_sum / max(steps, 1), steps
-    if not is_train and hasattr(model, "freeze_normalizers") and prev_freeze is not None:
+    if not is_train and hasattr(model, "freeze_normalizers"):
         model.freeze_normalizers = prev_freeze
     return out
 
@@ -127,11 +181,7 @@ def train_model(
     cv_eval_fn: Callable | None = None,
     rollout_checkpoint_fn: Callable | None = None,
 ):
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-    )
+    optimizer = _build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer,
         gamma=cfg.learning_rate_decay,
@@ -166,6 +216,8 @@ def train_model(
             f"decay={train_rollout_loss_decay:.3g}",
             flush=True,
         )
+        if len(optimizer.param_groups) > 1:
+            print(f"[train] optimizer groups lr={_lr_text(optimizer)}", flush=True)
 
     for epoch in range(cfg.epochs):
         epoch_start = time.perf_counter()
@@ -194,8 +246,14 @@ def train_model(
                     optimizer=None,
                 )
 
-        rollout_metrics = None
-        if rollout_eval_fn is not None and rollout_every > 0 and (epoch + 1) % rollout_every == 0:
+        rollout_metrics = {
+            "rollout_r2": float("nan"),
+            "rollout_pearson_r": float("nan"),
+            "rollout_pos_mse": float("nan"),
+            "used": 0,
+            "total": 0,
+        }
+        if rollout_every > 0 and (epoch + 1) % rollout_every == 0:
             with torch.no_grad():
                 was_training = model.training
                 had_freeze = hasattr(model, "freeze_normalizers")
@@ -204,22 +262,25 @@ def train_model(
                 if had_freeze:
                     model.freeze_normalizers = True
                 rollout_metrics = rollout_eval_fn(model)
-                if had_freeze and prev_freeze is not None:
+                if had_freeze:
                     model.freeze_normalizers = prev_freeze
                 model.train(was_training)
-            if rollout_checkpoint_fn is not None:
-                rollout_checkpoint_fn(
-                    epoch + 1,
-                    model,
-                    optimizer,
-                    scheduler,
-                    rollout_metrics,
-                    train_loss,
-                    val_loss,
-                )
+            rollout_checkpoint_fn(
+                epoch + 1,
+                model,
+                optimizer,
+                scheduler,
+                rollout_metrics,
+                train_loss,
+                val_loss,
+            )
 
-        cv_metrics = None
-        if cv_eval_fn is not None and cv_eval_every > 0 and (epoch + 1) % cv_eval_every == 0:
+        cv_metrics = {
+            "cv_abs_pearson_r": float("nan"),
+            "cv_fit_r2": float("nan"),
+            "cv_used": 0,
+        }
+        if cv_eval_every > 0 and (epoch + 1) % cv_eval_every == 0:
             with torch.no_grad():
                 was_training = model.training
                 had_freeze = hasattr(model, "freeze_normalizers")
@@ -228,21 +289,22 @@ def train_model(
                 if had_freeze:
                     model.freeze_normalizers = True
                 cv_metrics = cv_eval_fn(model)
-                if had_freeze and prev_freeze is not None:
+                if had_freeze:
                     model.freeze_normalizers = prev_freeze
                 model.train(was_training)
 
         scheduler.step()
         epoch_seconds = time.perf_counter() - epoch_start
         lr = float(optimizer.param_groups[0]["lr"])
-        rollout_r2 = None if rollout_metrics is None else rollout_metrics["rollout_r2"]
-        rollout_pearson_r = None if rollout_metrics is None else rollout_metrics.get("rollout_pearson_r")
-        rollout_pos_mse = None if rollout_metrics is None else rollout_metrics["rollout_pos_mse"]
-        rollout_used = None if rollout_metrics is None else rollout_metrics["used"]
-        rollout_total = None if rollout_metrics is None else rollout_metrics["total"]
-        cv_abs_pearson_r = None if cv_metrics is None else cv_metrics.get("cv_abs_pearson_r")
-        cv_fit_r2 = None if cv_metrics is None else cv_metrics.get("cv_fit_r2")
-        cv_used = None if cv_metrics is None else cv_metrics.get("cv_used")
+        lr_text = _lr_text(optimizer)
+        rollout_r2 = float(rollout_metrics["rollout_r2"])
+        rollout_pearson_r = float(rollout_metrics["rollout_pearson_r"])
+        rollout_pos_mse = float(rollout_metrics["rollout_pos_mse"])
+        rollout_used = int(rollout_metrics["used"])
+        rollout_total = int(rollout_metrics["total"])
+        cv_abs_pearson_r = float(cv_metrics["cv_abs_pearson_r"])
+        cv_fit_r2 = float(cv_metrics["cv_fit_r2"])
+        cv_used = int(cv_metrics["cv_used"])
         stats["epoch"].append(epoch + 1)
         stats["loss"].append(train_loss)
         stats["val_loss"].append(val_loss)
@@ -260,49 +322,34 @@ def train_model(
         should_log = (
             (epoch + 1 == cfg.epochs)
             or (val_every > 0 and (epoch + 1) % val_every == 0)
-            or (rollout_metrics is not None)
-            or (cv_metrics is not None)
+            or (rollout_every > 0 and (epoch + 1) % rollout_every == 0)
+            or (cv_eval_every > 0 and (epoch + 1) % cv_eval_every == 0)
         )
         if verbose and should_log:
             val_text = _fmt3g(val_loss)
-            if rollout_r2 is None:
-                rollout_text = "skipped"
-            else:
-                pearson_text = "nan" if rollout_pearson_r is None else _fmt3g(rollout_pearson_r)
-                mse_text = "nan" if rollout_pos_mse is None else _fmt3g(rollout_pos_mse)
-                rollout_text = (
-                    f"r2={_fmt3g(rollout_r2)} p={pearson_text} mse={mse_text} "
-                    f"({rollout_used}/{rollout_total})"
-                )
-            if cv_metrics is None:
-                cv_text = "skipped"
-            else:
-                cv_p = "nan" if cv_abs_pearson_r is None else _fmt3g(cv_abs_pearson_r)
-                cv_r2 = "nan" if cv_fit_r2 is None else _fmt3g(cv_fit_r2)
-                cv_n = "?" if cv_used is None else str(int(cv_used))
-                cv_text = f"|p|={cv_p} r2={cv_r2} (n={cv_n})"
+            rollout_text = (
+                f"r2={_fmt3g(rollout_r2)} p={_fmt3g(rollout_pearson_r)} "
+                f"mse={_fmt3g(rollout_pos_mse)} ({rollout_used}/{rollout_total})"
+            )
+            cv_text = f"|p|={_fmt3g(cv_abs_pearson_r)} r2={_fmt3g(cv_fit_r2)} (n={cv_used})"
             gate_text = ""
             if hasattr(model, "get_global_gate_stats"):
                 g = model.get_global_gate_stats()
                 if isinstance(g, dict) and ("abs_mean" in g) and ("max_abs" in g):
-                    ratio = g.get("global_ratio", None)
-                    ratio_text = "nan" if ratio is None else _fmt3g(ratio)
                     gate_text = (
                         f"gabs={_fmt3g(g['abs_mean'])} "
                         f"gmax={_fmt3g(g['max_abs'])} "
-                        f"g_over_l={ratio_text} "
+                        f"g_over_l={_fmt3g(g['global_ratio'])} "
                     )
-            print(
+            line = (
                 f"[ep {epoch + 1:>3}/{cfg.epochs}] "
-                f"tr={_fmt3g(train_loss)} va={val_text} lr={_fmt3g(lr)} "
+                f"tr={_fmt3g(train_loss)} va={val_text} lr={lr_text} "
                 f"roll={rollout_text} "
-                f"cv={cv_text} "
                 f"{gate_text}"
-                f"norm={'fz' if getattr(model, 'freeze_normalizers', False) else 'tr'} "
-                f"n=({train_steps},{val_steps}) "
-                f"t={_fmt3g(epoch_seconds)}s",
-                flush=True,
             )
+            line += f"cv={cv_text} "
+            line += f"t={_fmt3g(epoch_seconds)}s"
+            print(line, flush=True)
 
     if verbose:
         total_seconds = time.perf_counter() - train_start

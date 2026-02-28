@@ -21,6 +21,8 @@ class ExperimentConfig:
     model_extras: dict = field(default_factory=dict)
 
     learning_rate: float = 1e-4
+    global_learning_rate: float | None = None
+    hybrid_global_only_epochs: int = 0
     learning_rate_decay: float = 0.995
     weight_decay: float = 0.0
     epochs: int = 100

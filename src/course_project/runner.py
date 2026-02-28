@@ -17,6 +17,7 @@ from .metrics import (
 )
 from .models import create_model, resolve_model_inputs
 from .training import train_model
+from .utils import resolve_device
 
 
 def _set_seed(seed: int) -> None:
@@ -25,53 +26,41 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def _resolve_device(device: str) -> str:
-    return "cpu" if device == "cuda" and not torch.cuda.is_available() else device
-
-
 def _fmt3g(value) -> str:
-    try:
-        return f"{float(value):.3g}"
-    except Exception:
-        return str(value)
+    return f"{float(value):.3g}"
 
 
-def _select_best_rollout_checkpoint(entries: list[dict]) -> dict | None:
-    best = None
-    best_r2 = float("-inf")
-    best_epoch = -1
-    for entry in entries:
-        r2 = float(entry.get("rollout_r2", float("nan")))
-        if not np.isfinite(r2):
+def _select_best_rollout_checkpoint(entries: list[dict]) -> dict:
+    return max(entries, key=lambda e: (float(e["rollout_r2"]), int(e["epoch"])))
+
+
+def _select_best_cv_checkpoint(entries: list[dict], stats: dict) -> dict:
+    epoch_to_path = {int(e["epoch"]): str(e["path"]) for e in entries}
+    candidates = []
+    for epoch, score in zip(stats["epoch"], stats["cv_fit_r2"]):
+        value = float(score)
+        if not np.isfinite(value):
             continue
-        epoch = int(entry.get("epoch", -1))
-        if (r2 > best_r2) or (r2 == best_r2 and epoch > best_epoch):
-            best = entry
-            best_r2 = r2
-            best_epoch = epoch
-    return best
+        ep = int(epoch)
+        if ep in epoch_to_path:
+            candidates.append(
+                {
+                    "epoch": ep,
+                    "path": epoch_to_path[ep],
+                    "cv_fit_r2": value,
+                }
+            )
+    return max(candidates, key=lambda e: (float(e["cv_fit_r2"]), int(e["epoch"])))
 
 
-def _write_rollout_scatter(rows: list[dict], out_path: Path, title: str, *, verbose: bool = False) -> None:
-    if not rows:
-        return
+def _write_rollout_scatter(rows: list[dict], out_path: Path, title: str) -> None:
     x = np.asarray([row["target_rollout_sides_p_ratio"] for row in rows], dtype=float)
     y = np.asarray([row["pred_rollout_p_ratio"] for row in rows], dtype=float)
-    finite = np.isfinite(x) & np.isfinite(y)
-    if int(finite.sum()) < 1:
-        return
-    x = x[finite]
-    y = y[finite]
     lo = float(np.min(np.concatenate([x, y])))
     hi = float(np.max(np.concatenate([x, y])))
     pad = max((hi - lo) * 0.05, 1e-6)
 
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        if verbose:
-            print(f"[run] scatter skipped: matplotlib unavailable ({exc})", flush=True)
-        return
+    import matplotlib.pyplot as plt
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.0, 6.0))
@@ -90,7 +79,7 @@ def _write_rollout_scatter(rows: list[dict], out_path: Path, title: str, *, verb
 
 def run_experiment(cfg: ExperimentConfig) -> dict:
     _set_seed(cfg.seed)
-    device = _resolve_device(cfg.device)
+    device = resolve_device(cfg.device)
     verbose = bool(getattr(cfg, "verbose", True))
     cfg_dict = cfg.to_dict()
 
@@ -165,7 +154,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             "scheduler_state_dict": scheduler.state_dict(),
             "rollout_metrics": rollout_summary,
             "train_loss": float(train_loss),
-            "val_loss": None if val_loss is None else float(val_loss),
+            "val_loss": float(val_loss),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         current_model.cfg = cfg_dict
@@ -189,8 +178,8 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         val_data,
         cfg,
         device,
-        rollout_eval_fn=_rollout_eval if getattr(cfg, "rollout_every", 0) > 0 else None,
-        cv_eval_fn=_cv_eval if getattr(cfg, "cv_eval_every", 0) > 0 else None,
+        rollout_eval_fn=_rollout_eval,
+        cv_eval_fn=_cv_eval,
         rollout_checkpoint_fn=_save_rollout_checkpoint,
     )
 
@@ -203,19 +192,23 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         last_ckpt_path,
     )
 
-    best_rollout = _select_best_rollout_checkpoint(rollout_checkpoints)
-    selected_checkpoint = None
-    if best_rollout is not None:
-        selected_checkpoint = Path(best_rollout["path"])
-        model.load_checkpoint(str(selected_checkpoint))
-        if verbose:
-            print(
-                f"[run] selected best rollout checkpoint epoch={best_rollout['epoch']} "
-                f"r2={_fmt3g(best_rollout['rollout_r2'])}",
-                flush=True,
-            )
-    elif verbose:
-        print("[run] no rollout checkpoints available; using last training state.", flush=True)
+    if cfg.model_type == "cv_transformer":
+        best_rollout = _select_best_cv_checkpoint(rollout_checkpoints, stats)
+        selection_metric = "cv_fit_r2"
+        selection_score = float(best_rollout["cv_fit_r2"])
+    else:
+        best_rollout = _select_best_rollout_checkpoint(rollout_checkpoints)
+        selection_metric = "rollout_r2"
+        selection_score = float(best_rollout["rollout_r2"])
+
+    selected_checkpoint = Path(best_rollout["path"])
+    model.load_checkpoint(str(selected_checkpoint))
+    if verbose:
+        print(
+            f"[run] selected best rollout checkpoint epoch={best_rollout['epoch']} "
+            f"{selection_metric}={_fmt3g(selection_score)}",
+            flush=True,
+        )
 
     final_ckpt_path = run_dir / "final_checkpoint.pt"
     torch.save(
@@ -223,6 +216,8 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             "model_state_dict": model.state_dict(),
             "cfg": cfg_dict,
             "selected_best_rollout": best_rollout,
+            "selected_checkpoint_metric": selection_metric,
+            "selected_checkpoint_score": selection_score,
         },
         final_ckpt_path,
     )
@@ -256,7 +251,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             node_features=cfg.node_features,
             target_kind=getattr(cfg, "cv_pratio_target", "box"),
         )
-        if had_freeze and prev_freeze is not None:
+        if had_freeze:
             model.freeze_normalizers = prev_freeze
         model.train(was_training)
 
@@ -268,7 +263,6 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         rollout_rows,
         run_dir / "rollout_pratio_scatter.png",
         title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})",
-        verbose=verbose,
     )
 
     torch.save(stats, run_dir / "train_stats.pt")
@@ -278,9 +272,11 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         "run_name": cfg.run_name,
         "model_type": cfg.model_type,
         "device": device,
-        "selected_checkpoint": None if selected_checkpoint is None else str(selected_checkpoint),
-        "best_rollout_epoch": None if best_rollout is None else int(best_rollout["epoch"]),
-        "best_rollout_r2": None if best_rollout is None else float(best_rollout["rollout_r2"]),
+        "selected_checkpoint": str(selected_checkpoint),
+        "selected_checkpoint_metric": selection_metric,
+        "selected_checkpoint_score": float(selection_score),
+        "best_rollout_epoch": int(best_rollout["epoch"]),
+        "best_rollout_r2": float(best_rollout.get("rollout_r2", float("nan"))),
         **rollout_metrics,
         **cv_metrics,
     }
@@ -290,7 +286,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
     if verbose:
         print(
             f"[run] done rollout_r2={_fmt3g(metrics['rollout_r2'])} "
-            f"rollout_pos_mse={_fmt3g(metrics.get('rollout_pos_mse'))}",
+            f"rollout_pos_mse={_fmt3g(metrics['rollout_pos_mse'])}",
             flush=True,
         )
     return metrics

@@ -1,27 +1,23 @@
 from __future__ import annotations
 
-import math
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.data import Data
-from torch_geometric.utils import to_dense_batch
 
 from .base import BaseModelInputs, BaseSimulator
 from .common import build_mlp, get_correct_edge_vec
-from .components import LocalGNNBackbone, Normalizer, TokenGlobalDecoder
+from .components import LocalGNNBackbone, Normalizer
+from .cv_transformer_simulator import Model as CVTransformerModel
 
 ModelInputs = BaseModelInputs
 torch.set_default_dtype(torch.float32)
 
 
 class Model(BaseSimulator):
-    """
-    Hybrid simulator:
-    - local node features from GNN backbone
-    - global node context from token bottleneck transformer branch
-    - residual dV combination: dV_local + dV_global (gated)
-    """
+    """Spatial simulator with frozen CV encoder injection."""
 
     def __init__(
         self,
@@ -37,6 +33,10 @@ class Model(BaseSimulator):
         transformer_heads: int,
         transformer_dropout: float,
         k2_hidden_size: int,
+        cv_checkpoint_path: str,
+        cv_inject_scale_init: float = 1.0,
+        cv_edge_aggr: str = "mean",
+        cv_use_local_skip: bool = False,
     ):
         super().__init__(pos_dim=pos_dim)
         self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
@@ -55,45 +55,106 @@ class Model(BaseSimulator):
         self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=dev)
         self.output_normalizer = Normalizer(size=pos_dim, name="OutputNormalizer", device=dev)
 
-        self.local_backbone = LocalGNNBackbone(
+        self.backbone = LocalGNNBackbone(
             in_node_dim=data.num_features,
             in_edge_dim=data.num_edge_features,
             hidden_size=hidden_size,
             n_layers=n_layers,
             num_mlp=num_mlp,
         )
-        self._n_local_layers = int(n_layers)
-        self._n_pre_global_layers = 1 if self._n_local_layers >= 2 else self._n_local_layers
-        self._n_post_global_layers = self._n_local_layers - self._n_pre_global_layers
-        self.global_decoder = TokenGlobalDecoder(
+        self.decoder = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
+
+        self.cv_checkpoint_path = str(cv_checkpoint_path)
+        self.cv_encoder = self._load_frozen_cv_encoder(
+            data=data,
             hidden_size=hidden_size,
+            n_layers=n_layers,
+            pos_dim=pos_dim,
+            num_mlp=num_mlp,
             K1=K1,
             K2=K2,
-            k2_hidden_size=k2_hidden_size,
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             transformer_dropout=transformer_dropout,
+            cv_edge_aggr=cv_edge_aggr,
+            cv_use_local_skip=cv_use_local_skip,
         )
-        # Per-channel residual gate for global context injection.
-        # Initialize to a mild positive global contribution: tanh(raw) ~= 0.3.
-        self.global_gate = torch.nn.Parameter(
-            torch.full((hidden_size,), math.atanh(0.3), dtype=torch.float32)
+        self.cv_dim = int(getattr(self.cv_encoder, "k_cv", K2))
+        self.cv_injector = build_mlp(
+            self.cv_dim,
+            hidden_size,
+            hidden_size,
+            num_mlp=max(2, num_mlp - 1),
+            lay_norm=False,
         )
-        self.local_out = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
-        self.global_out = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
+        self.cv_inject_scale = torch.nn.Parameter(
+            torch.tensor(float(cv_inject_scale_init), dtype=torch.float32)
+        )
 
         self.last_cv = None
-        self.last_global_ratio = None
         self.freeze_normalizers = False
 
-    def _norm_training(self, is_training: bool) -> bool:
-        return bool(self.training) and bool(is_training) and (not self.freeze_normalizers)
+        self.cv_encoder.eval()
+        for p in self.cv_encoder.parameters():
+            p.requires_grad = False
+
+    def _load_frozen_cv_encoder(
+        self,
+        *,
+        data: Data,
+        hidden_size: int,
+        n_layers: int,
+        pos_dim: int,
+        num_mlp: int,
+        K1: int,
+        K2: int,
+        transformer_layers: int,
+        transformer_heads: int,
+        transformer_dropout: float,
+        cv_edge_aggr: str,
+        cv_use_local_skip: bool,
+    ) -> CVTransformerModel:
+        payload = torch.load(str(Path(self.cv_checkpoint_path)), map_location="cpu", weights_only=False)
+        cfg = payload["model_config"] if "model_config" in payload else payload["cfg"]
+        extras = cfg["model_extras"]
+
+        cv_hidden = int(cfg.get("hidden_size", hidden_size))
+        cv_layers = int(cfg.get("n_layers", n_layers))
+        cv_num_mlp = int(extras.get("num_mlp", num_mlp))
+        cv_k1 = int(extras.get("K1", K1))
+        cv_cv = int(extras.get("CV", K2))
+        cv_t_layers = int(extras.get("transformer_layers", transformer_layers))
+        cv_t_heads = int(extras.get("transformer_heads", transformer_heads))
+        cv_t_drop = float(extras.get("transformer_dropout", transformer_dropout))
+        edge_aggr = extras.get("edge_aggr", cv_edge_aggr)
+        use_local_skip = bool(extras.get("use_local_skip", cv_use_local_skip))
+
+        encoder = CVTransformerModel(
+            data=data,
+            hidden_size=cv_hidden,
+            n_layers=cv_layers,
+            pos_dim=pos_dim,
+            num_mlp=cv_num_mlp,
+            K1=cv_k1,
+            CV=cv_cv,
+            transformer_layers=cv_t_layers,
+            transformer_heads=cv_t_heads,
+            transformer_dropout=cv_t_drop,
+            edge_aggr=edge_aggr,
+            use_local_skip=use_local_skip,
+        ).to(self.device)
+        state = payload["model"] if "model" in payload else payload["model_state_dict"]
+        encoder.load_state_dict(state, strict=False)
+        return encoder
 
     @staticmethod
     def _current_velocity(inputs: ModelInputs) -> Tensor:
         if hasattr(inputs.cur_graph, "vel_state"):
             return inputs.cur_graph.vel_state
         return inputs.cur_position - inputs.prev_position
+
+    def _norm_training(self, is_training: bool) -> bool:
+        return bool(self.training) and bool(is_training) and (not self.freeze_normalizers)
 
     def normalize_graph(self, graph: Data, is_training: bool = True) -> Data:
         norm_training = self._norm_training(is_training)
@@ -108,94 +169,53 @@ class Model(BaseSimulator):
             dtype=torch.float,
         )
 
-    def _predict_dense(self, data: Data):
-        local_data = Data(
-            x=self.local_backbone.node_encoder(data.x),
-            edge_index=data.edge_index,
-            edge_attr=self.local_backbone.edge_encoder(data.edge_attr),
-            box=data.box if hasattr(data, "box") else None,
-            batch=data.batch if hasattr(data, "batch") else None,
-            dtype=torch.float,
-        )
+    def _encode_with_cv(self, norm_graph: Data, raw_graph: Data) -> Data:
+        latent = self.backbone(norm_graph)
 
-        for layer in self.local_backbone.layers[: self._n_pre_global_layers]:
-            local_data = layer(local_data)
-
-        local_dense, global_dense, mask = self.global_decoder(
-            local_data.x,
-            local_data.batch if hasattr(local_data, "batch") else None,
-        )
-        # Global branch taps after early local message passing.
-        gate = torch.tanh(self.global_gate).view(1, 1, -1)
-        gated_global = gate * global_dense
-
-        injected_sparse = Data(
-            x=local_dense[mask],
-            edge_index=local_data.edge_index,
-            edge_attr=local_data.edge_attr,
-            box=local_data.box if hasattr(local_data, "box") else None,
-            batch=local_data.batch if hasattr(local_data, "batch") else None,
-            dtype=torch.float,
-        )
-        for layer in self.local_backbone.layers[self._n_pre_global_layers :]:
-            injected_sparse = layer(injected_sparse)
-
-        out_dense, out_mask = to_dense_batch(
-            injected_sparse.x,
-            injected_sparse.batch if hasattr(injected_sparse, "batch") else None,
-        )
-        if not torch.equal(out_mask, mask):
-            raise RuntimeError("Hybrid mask mismatch after post-global message passing.")
-        dv_local_dense = self.local_out(out_dense)
-        dv_global_dense = self.global_out(gated_global)
-        dv_dense = dv_local_dense + dv_global_dense
         with torch.no_grad():
-            local_mag = dv_local_dense[mask].abs().mean()
-            global_mag = dv_global_dense[mask].abs().mean()
-            ratio = global_mag / (local_mag + 1e-8)
-            self.last_global_ratio = float(ratio.detach().cpu().item())
-        return dv_dense, mask
+            self.cv_encoder.eval()
+            cv = self.cv_encoder.extract_cv(raw_graph, is_training=False)
+        self.last_cv = cv.detach()
 
-    def get_global_gate_stats(self) -> dict:
-        with torch.no_grad():
-            gate = torch.tanh(self.global_gate)
-            return {
-                "mean": float(gate.mean().detach().cpu().item()),
-                "abs_mean": float(gate.abs().mean().detach().cpu().item()),
-                "max_abs": float(gate.abs().max().detach().cpu().item()),
-                "global_ratio": self.last_global_ratio,
-            }
+        if hasattr(latent, "batch") and latent.batch is not None:
+            batch = latent.batch
+        else:
+            batch = torch.zeros(latent.x.size(0), dtype=torch.long, device=latent.x.device)
+
+        cv_hidden = self.cv_injector(cv)
+        latent.x = latent.x + self.cv_inject_scale * cv_hidden[batch]
+        return latent
 
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
-        data = self.normalize_graph(data, is_training=is_training)
-        dv_dense, mask = self._predict_dense(data)
-        self.last_cv = self.global_decoder.last_cv.detach()
-        return dv_dense[mask]
+        norm_graph = self.normalize_graph(data, is_training=is_training)
+        latent = self._encode_with_cv(norm_graph, data)
+        return self.decoder(latent.x)
 
     def extract_cv(self, data: Data, *, is_training: bool = False) -> Tensor:
-        data = self.normalize_graph(data, is_training=is_training)
-        _dv_dense, _mask = self._predict_dense(data)
-        return self.global_decoder.last_cv.detach()
+        with torch.no_grad():
+            self.cv_encoder.eval()
+            return self.cv_encoder.extract_cv(data, is_training=False).detach()
 
     @classmethod
-    def _recalc_edges(cls, data: Data, dummy_sep: bool = False, pos_dim: int | None = None) -> Tensor:
+    def _recalc_edges(
+        cls,
+        data: Data,
+        dummy_sep: bool = False,
+        pos_dim: int | None = None,
+    ) -> Tensor:
         edge_vectors = get_correct_edge_vec(data, pos_dim=pos_dim)
         distances = torch.norm(edge_vectors, dim=1)
         bond_coeffs = data.edge_attr[:, -1] if not dummy_sep else data.edge_attr[:, -2]
-        new_edge_attr = (
+        return (
             torch.column_stack([edge_vectors, distances, bond_coeffs])
             if not dummy_sep
             else torch.column_stack([edge_vectors, distances, bond_coeffs, data.edge_attr[:, -1]])
         )
-        return new_edge_attr
 
     def update(self, inputs: ModelInputs, model_output: Tensor, dummy_sep: bool = False) -> Data:
         predicted = self.output_normalizer.inverse(model_output)
         cur_velocity = self._current_velocity(inputs)
-        if hasattr(inputs.cur_graph, "vel_state"):
-            updated_velocity = cur_velocity + predicted
-        else:
-            updated_velocity = predicted
+        updated_velocity = cur_velocity + predicted
         predicted_position = inputs.cur_position + updated_velocity
 
         tmp = Data(
@@ -207,13 +227,15 @@ class Model(BaseSimulator):
         )
         new_edge_attr = self._recalc_edges(tmp, dummy_sep, self.pos_dim)
 
-        return Data(
+        predicted_graph = Data(
             x=predicted_position.float(),
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=new_edge_attr.float(),
             box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
             dtype=torch.float32,
         )
+        predicted_graph.vel_state = updated_velocity.detach()
+        return predicted_graph
 
     def loss(
         self,
@@ -229,21 +251,16 @@ class Model(BaseSimulator):
         )
         target_velocity_change = target_velocity - cur_velocity
         target_velocity_change_normalized = self.output_normalizer(
-            target_velocity_change, is_training=norm_training
+            target_velocity_change,
+            is_training=norm_training,
         )
-        dv_loss = F.mse_loss(model_output, target_velocity_change_normalized)
-        return dv_loss
+        return F.mse_loss(model_output, target_velocity_change_normalized)
 
     def save_checkpoint(self, savedir: str, *, training_state: dict):
         model = self.state_dict()
         _output_normalizer = self.output_normalizer.get_variable()
         _node_normalizer = self.node_normalizer.get_variable()
         _edge_normalizer = self.edge_normalizer.get_variable()
-
-        if not hasattr(self, "cfg"):
-            raise ValueError("Model config is required; set model.cfg before saving.")
-        if training_state is None:
-            raise ValueError("training_state is required when saving checkpoints.")
 
         to_save = {
             "model": model,
@@ -258,21 +275,22 @@ class Model(BaseSimulator):
     def load_checkpoint(self, ckpdir: str):
         dicts = torch.load(ckpdir, weights_only=False, map_location="cpu")
         self.load_state_dict(dicts["model"], strict=False)
-
-        if "model_config" not in dicts:
-            raise ValueError("Checkpoint missing model_config; unsupported format.")
         self.cfg = dicts["model_config"]
-
-        for key in ("output_normalizer", "node_normalizer", "edge_normalizer"):
-            if key not in dicts:
-                continue
-            values = dicts[key]
-            obj = getattr(self, key, None)
-            if obj is None:
-                continue
-            for para, value in values.items():
-                cur = getattr(obj, para, None)
-                if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
-                    cur.copy_(value)
-                else:
-                    setattr(obj, para, value)
+        for para, value in dicts["output_normalizer"].items():
+            cur = getattr(self.output_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.output_normalizer, para, value)
+        for para, value in dicts["node_normalizer"].items():
+            cur = getattr(self.node_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.node_normalizer, para, value)
+        for para, value in dicts["edge_normalizer"].items():
+            cur = getattr(self.edge_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.edge_normalizer, para, value)

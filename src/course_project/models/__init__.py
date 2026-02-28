@@ -7,6 +7,7 @@ from torch_geometric.data import Data
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
+from .latent_space_simulator import Model as LatentSpaceModel
 from .spatial_simulator import Model as SpatialModel
 from .spatial_transformer_simulator import Model as SpatialTransformerModel
 
@@ -14,6 +15,7 @@ MODEL_REGISTRY = {
     "spatial": SpatialModel,
     "spatial_transformer": SpatialTransformerModel,
     "cv_transformer": CVTransformerModel,
+    "latent_space": LatentSpaceModel,
     "hybrid": HybridModel,
 }
 
@@ -21,6 +23,7 @@ MODEL_INPUTS_REGISTRY = {
     "spatial": BaseModelInputs,
     "spatial_transformer": BaseModelInputs,
     "cv_transformer": BaseModelInputs,
+    "latent_space": BaseModelInputs,
     "hybrid": BaseModelInputs,
 }
 
@@ -49,6 +52,16 @@ MODEL_EXTRAS_REQUIRED = {
         "edge_aggr",
         "use_local_skip",
     },
+    "latent_space": {
+        "num_mlp",
+        "K1",
+        "CV",
+        "transformer_layers",
+        "transformer_heads",
+        "transformer_dropout",
+        "edge_aggr",
+        "use_local_skip",
+    },
     "hybrid": {
         "num_mlp",
         "K1",
@@ -57,6 +70,19 @@ MODEL_EXTRAS_REQUIRED = {
         "transformer_heads",
         "transformer_dropout",
         "k2_hidden_size",
+        "cv_checkpoint_path",
+    },
+}
+
+MODEL_EXTRAS_OPTIONAL = {
+    "spatial": set(),
+    "spatial_transformer": set(),
+    "cv_transformer": set(),
+    "latent_space": set(),
+    "hybrid": {
+        "cv_edge_aggr",
+        "cv_use_local_skip",
+        "cv_inject_scale_init",
     },
 }
 
@@ -66,6 +92,7 @@ def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
         required = MODEL_EXTRAS_REQUIRED[model_type]
     except KeyError as exc:
         raise ValueError(f"Unknown model_type '{model_type}' for extras lookup.") from exc
+    optional = MODEL_EXTRAS_OPTIONAL.get(model_type, set())
 
     if extras is None:
         raise ValueError(
@@ -78,7 +105,7 @@ def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
     extras = dict(extras)
     provided = set(extras.keys())
     missing = sorted(required - provided)
-    unexpected = sorted(provided - required)
+    unexpected = sorted(provided - required - optional)
     if missing or unexpected:
         parts = []
         if missing:
@@ -127,6 +154,7 @@ __all__ = [
     "BaseModelInputs",
     "HybridModel",
     "CVTransformerModel",
+    "LatentSpaceModel",
     "SpatialModel",
     "SpatialTransformerModel",
     "MODEL_REGISTRY",
