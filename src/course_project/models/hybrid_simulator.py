@@ -27,16 +27,8 @@ class Model(BaseSimulator):
         pos_dim: int,
         *,
         num_mlp: int,
-        K1: int,
-        K2: int,
-        transformer_layers: int,
-        transformer_heads: int,
-        transformer_dropout: float,
-        k2_hidden_size: int,
         cv_checkpoint_path: str,
         cv_inject_scale_init: float = 1.0,
-        cv_edge_aggr: str = "mean",
-        cv_use_local_skip: bool = False,
     ):
         super().__init__(pos_dim=pos_dim)
         self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
@@ -67,19 +59,9 @@ class Model(BaseSimulator):
         self.cv_checkpoint_path = str(cv_checkpoint_path)
         self.cv_encoder = self._load_frozen_cv_encoder(
             data=data,
-            hidden_size=hidden_size,
-            n_layers=n_layers,
             pos_dim=pos_dim,
-            num_mlp=num_mlp,
-            K1=K1,
-            K2=K2,
-            transformer_layers=transformer_layers,
-            transformer_heads=transformer_heads,
-            transformer_dropout=transformer_dropout,
-            cv_edge_aggr=cv_edge_aggr,
-            cv_use_local_skip=cv_use_local_skip,
         )
-        self.cv_dim = int(getattr(self.cv_encoder, "k_cv", K2))
+        self.cv_dim = int(self.cv_encoder.k_cv)
         self.cv_injector = build_mlp(
             self.cv_dim,
             hidden_size,
@@ -87,47 +69,53 @@ class Model(BaseSimulator):
             num_mlp=max(2, num_mlp - 1),
             lay_norm=False,
         )
+        self.cv_node_gate = build_mlp(
+            hidden_size + hidden_size,
+            hidden_size,
+            1,
+            num_mlp=2,
+            lay_norm=False,
+        )
         self.cv_inject_scale = torch.nn.Parameter(
             torch.tensor(float(cv_inject_scale_init), dtype=torch.float32)
         )
 
         self.last_cv = None
+        self._gate_mean_sum = 0.0
+        self._gate_mean_count = 0
+        self._last_gate_mean = 0.0
         self.freeze_normalizers = False
 
         self.cv_encoder.eval()
         for p in self.cv_encoder.parameters():
             p.requires_grad = False
 
+    def set_epoch(self, epoch: int):
+        super().set_epoch(epoch)
+        self._gate_mean_sum = 0.0
+        self._gate_mean_count = 0
+        self._last_gate_mean = 0.0
+
     def _load_frozen_cv_encoder(
         self,
         *,
         data: Data,
-        hidden_size: int,
-        n_layers: int,
         pos_dim: int,
-        num_mlp: int,
-        K1: int,
-        K2: int,
-        transformer_layers: int,
-        transformer_heads: int,
-        transformer_dropout: float,
-        cv_edge_aggr: str,
-        cv_use_local_skip: bool,
     ) -> CVTransformerModel:
         payload = torch.load(str(Path(self.cv_checkpoint_path)), map_location="cpu", weights_only=False)
         cfg = payload["model_config"] if "model_config" in payload else payload["cfg"]
         extras = cfg["model_extras"]
 
-        cv_hidden = int(cfg.get("hidden_size", hidden_size))
-        cv_layers = int(cfg.get("n_layers", n_layers))
-        cv_num_mlp = int(extras.get("num_mlp", num_mlp))
-        cv_k1 = int(extras.get("K1", K1))
-        cv_cv = int(extras.get("CV", K2))
-        cv_t_layers = int(extras.get("transformer_layers", transformer_layers))
-        cv_t_heads = int(extras.get("transformer_heads", transformer_heads))
-        cv_t_drop = float(extras.get("transformer_dropout", transformer_dropout))
-        edge_aggr = extras.get("edge_aggr", cv_edge_aggr)
-        use_local_skip = bool(extras.get("use_local_skip", cv_use_local_skip))
+        cv_hidden = int(cfg["hidden_size"])
+        cv_layers = int(cfg["n_layers"])
+        cv_num_mlp = int(extras["num_mlp"])
+        cv_k1 = int(extras["K1"])
+        cv_cv = int(extras["CV"])
+        cv_t_layers = int(extras["transformer_layers"])
+        cv_t_heads = int(extras["transformer_heads"])
+        cv_t_drop = float(extras["transformer_dropout"])
+        edge_aggr = extras["edge_aggr"]
+        use_local_skip = bool(extras["use_local_skip"])
 
         encoder = CVTransformerModel(
             data=data,
@@ -183,8 +171,20 @@ class Model(BaseSimulator):
             batch = torch.zeros(latent.x.size(0), dtype=torch.long, device=latent.x.device)
 
         cv_hidden = self.cv_injector(cv)
-        latent.x = latent.x + self.cv_inject_scale * cv_hidden[batch]
+        cv_nodes = cv_hidden[batch]
+        node_gate = torch.sigmoid(self.cv_node_gate(torch.cat([latent.x, cv_nodes], dim=1)))
+        latent.x = latent.x + self.cv_inject_scale * node_gate * cv_nodes
+        if self.training:
+            self._last_gate_mean = float(node_gate.detach().mean().cpu().item())
+            self._gate_mean_sum += self._last_gate_mean
+            self._gate_mean_count += 1
         return latent
+
+    def get_global_gate_stats(self) -> dict:
+        return {
+            "mean": self._gate_mean_sum / self._gate_mean_count,
+            "last": self._last_gate_mean,
+        }
 
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
         norm_graph = self.normalize_graph(data, is_training=is_training)

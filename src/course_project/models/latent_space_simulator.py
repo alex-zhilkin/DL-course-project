@@ -49,6 +49,7 @@ class LatentSpacePredictorCore(nn.Module):
         *,
         K1: int,
         cv_count: int,
+        cv_hidden_size: int,
         transformer_layers: int,
         transformer_heads: int,
         transformer_dropout: float,
@@ -59,7 +60,10 @@ class LatentSpacePredictorCore(nn.Module):
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.cv_count = max(1, int(cv_count))
-        self.use_local_skip = False
+        self.cv_hidden_size = max(1, int(cv_hidden_size))
+        self.latent_dim = int(self.cv_count * self.cv_hidden_size)
+        self.use_local_skip = bool(use_local_skip)
+        # If true, we also pass local node features directly (identity signal).
         self._requested_use_local_skip = bool(use_local_skip)
 
         self.frontend = NodeEdgeFusionEncoder(
@@ -73,17 +77,18 @@ class LatentSpacePredictorCore(nn.Module):
             hidden_size=self.hidden_size,
             K1=K1,
             cv_count=self.cv_count,
+            cv_hidden_size=self.cv_hidden_size,
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             transformer_dropout=transformer_dropout,
         )
         self.latent_dynamics = LatentSpaceDynamics(
-            latent_dim=self.cv_count,
+            latent_dim=self.latent_dim,
             hidden_size=max(8, self.hidden_size // 2),
             num_mlp=max(2, num_mlp - 1),
             delta_scale=0.1,
         )
-        self.global_from_latent = nn.Linear(self.cv_count, self.hidden_size)
+        self.global_from_latent = nn.Linear(self.latent_dim, self.hidden_size)
 
         out_in_dim = self.hidden_size * 2 if self.use_local_skip else self.hidden_size
         self.out = nn.Linear(out_in_dim, pos_dim)
@@ -123,6 +128,7 @@ class LatentSpacePredictorCore(nn.Module):
             latent = latent.unsqueeze(0)
         h_from_latent = self.global_from_latent(latent).unsqueeze(1).expand(-1, h_dense.size(1), -1)
         if self.use_local_skip:
+            # Keep local node identity hint together with latent global context.
             h_fused = torch.cat([h_dense, h_from_latent], dim=-1)
         else:
             h_fused = h_from_latent
@@ -194,6 +200,7 @@ class Model(SpatialTransformerModel):
         transformer_dropout: float,
         edge_aggr: str,
         use_local_skip: bool,
+        cv_hidden_size: int = 1,
     ):
         super().__init__(
             data=data,
@@ -207,7 +214,7 @@ class Model(SpatialTransformerModel):
             transformer_heads=transformer_heads,
             transformer_dropout=transformer_dropout,
             edge_aggr=edge_aggr,
-            k2_hidden_size=1,
+            k2_hidden_size=cv_hidden_size,
             use_local_skip=use_local_skip,
         )
         self.core = LatentSpacePredictorCore(
@@ -217,6 +224,7 @@ class Model(SpatialTransformerModel):
             pos_dim=pos_dim,
             K1=K1,
             cv_count=CV,
+            cv_hidden_size=cv_hidden_size,
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             transformer_dropout=transformer_dropout,
@@ -225,6 +233,8 @@ class Model(SpatialTransformerModel):
             use_local_skip=use_local_skip,
         )
         self.k_cv = int(CV)
+        self.cv_hidden_size = int(cv_hidden_size)
+        self.latent_dim = int(self.k_cv * self.cv_hidden_size)
 
     def normalize_graph(self, graph: Data, is_training: bool = True) -> Data:
         return graph

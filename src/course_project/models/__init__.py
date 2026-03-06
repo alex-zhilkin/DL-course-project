@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from torch_geometric.data import Data
 
+from .autoencoder import Model as AutoencoderModel
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
@@ -12,6 +13,7 @@ from .spatial_simulator import Model as SpatialModel
 from .spatial_transformer_simulator import Model as SpatialTransformerModel
 
 MODEL_REGISTRY = {
+    "autoencoder": AutoencoderModel,
     "spatial": SpatialModel,
     "spatial_transformer": SpatialTransformerModel,
     "cv_transformer": CVTransformerModel,
@@ -19,15 +21,17 @@ MODEL_REGISTRY = {
     "hybrid": HybridModel,
 }
 
-MODEL_INPUTS_REGISTRY = {
-    "spatial": BaseModelInputs,
-    "spatial_transformer": BaseModelInputs,
-    "cv_transformer": BaseModelInputs,
-    "latent_space": BaseModelInputs,
-    "hybrid": BaseModelInputs,
-}
-
 MODEL_EXTRAS_REQUIRED = {
+    "autoencoder": {
+        "num_mlp",
+        "K1",
+        "CV",
+        "transformer_layers",
+        "transformer_heads",
+        "transformer_dropout",
+        "edge_aggr",
+        "use_local_skip",
+    },
     "spatial": {
         "num_mlp",
     },
@@ -64,34 +68,28 @@ MODEL_EXTRAS_REQUIRED = {
     },
     "hybrid": {
         "num_mlp",
-        "K1",
-        "K2",
-        "transformer_layers",
-        "transformer_heads",
-        "transformer_dropout",
-        "k2_hidden_size",
         "cv_checkpoint_path",
     },
 }
 
 MODEL_EXTRAS_OPTIONAL = {
+    "autoencoder": {
+        "cv_hidden_size",
+    },
     "spatial": set(),
     "spatial_transformer": set(),
     "cv_transformer": set(),
-    "latent_space": set(),
+    "latent_space": {
+        "cv_hidden_size",
+    },
     "hybrid": {
-        "cv_edge_aggr",
-        "cv_use_local_skip",
         "cv_inject_scale_init",
     },
 }
 
 
 def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
-    try:
-        required = MODEL_EXTRAS_REQUIRED[model_type]
-    except KeyError as exc:
-        raise ValueError(f"Unknown model_type '{model_type}' for extras lookup.") from exc
+    required = MODEL_EXTRAS_REQUIRED[model_type]
     optional = MODEL_EXTRAS_OPTIONAL.get(model_type, set())
 
     if extras is None:
@@ -119,13 +117,9 @@ def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
 
 
 def resolve_model_inputs(model_type: str):
-    if model_type in MODEL_INPUTS_REGISTRY:
-        return MODEL_INPUTS_REGISTRY[model_type]
-    if model_type in MODEL_REGISTRY:
-        # All current simulators use BaseModelInputs; keep this as a safe default
-        # if a registry entry is missing.
-        return BaseModelInputs
-    raise ValueError(f"Unknown model_type '{model_type}' for inputs lookup.")
+    if model_type not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model_type '{model_type}' for inputs lookup.")
+    return BaseModelInputs
 
 
 def create_model(
@@ -136,10 +130,7 @@ def create_model(
     n_layers: int,
     extras: dict,
 ):
-    try:
-        cls = MODEL_REGISTRY[model_type]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported model_type: {model_type}") from exc
+    cls = MODEL_REGISTRY[model_type]
     validated_extras = resolve_model_extras(model_type, extras)
     return cls(
         data=init_graph,
@@ -151,6 +142,7 @@ def create_model(
 
 
 __all__ = [
+    "AutoencoderModel",
     "BaseModelInputs",
     "HybridModel",
     "CVTransformerModel",
@@ -158,7 +150,6 @@ __all__ = [
     "SpatialModel",
     "SpatialTransformerModel",
     "MODEL_REGISTRY",
-    "MODEL_INPUTS_REGISTRY",
     "MODEL_EXTRAS_REQUIRED",
     "resolve_model_extras",
     "resolve_model_inputs",

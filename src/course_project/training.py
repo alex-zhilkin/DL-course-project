@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import time
 from typing import Callable
 
@@ -24,65 +23,38 @@ def _weighted_rollout_loss(losses: list[torch.Tensor], decay: float) -> torch.Te
     return (stacked * weights).sum()
 
 
-_HYBRID_GLOBAL_PARAM_PREFIXES = (
-    "global_decoder.",
-    "global_out.",
-    "local_film.",
-)
-_HYBRID_GLOBAL_PARAM_NAMES = {
-    "global_gate",
-    "global_to_local_scale",
-}
-
-
 def _build_optimizer(model, cfg):
-    base_lr = float(cfg.learning_rate)
-    global_lr = getattr(cfg, "global_learning_rate", None)
-    weight_decay = float(getattr(cfg, "weight_decay", 0.0))
-    model_type = str(getattr(cfg, "model_type", "")).strip().lower()
-
-    use_split = (
-        model_type == "hybrid_legacy"
-        and global_lr is not None
-        and math.isfinite(float(global_lr))
-        and float(global_lr) > 0.0
-        and abs(float(global_lr) - base_lr) > 1e-20
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(
+        params,
+        lr=float(cfg.learning_rate),
+        weight_decay=float(cfg.weight_decay),
     )
-    if not use_split:
-        optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
-        optimizer.param_groups[0]["name"] = "main"
-        return optimizer
-
-    global_params = []
-    local_params = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        is_global = (name in _HYBRID_GLOBAL_PARAM_NAMES) or any(
-            name.startswith(prefix) for prefix in _HYBRID_GLOBAL_PARAM_PREFIXES
-        )
-        if is_global:
-            global_params.append(p)
-        else:
-            local_params.append(p)
-
-    groups = []
-    if local_params:
-        groups.append({"params": local_params, "lr": base_lr, "name": "local"})
-    if global_params:
-        groups.append({"params": global_params, "lr": float(global_lr), "name": "global"})
-    optimizer = torch.optim.Adam(groups, weight_decay=weight_decay)
+    optimizer.param_groups[0]["name"] = "main"
     return optimizer
 
 
 def _lr_text(optimizer) -> str:
-    if len(optimizer.param_groups) == 1:
-        return _fmt3g(optimizer.param_groups[0]["lr"])
-    parts = []
-    for i, group in enumerate(optimizer.param_groups):
-        name = str(group.get("name", f"g{i}"))
-        parts.append(f"{name}:{_fmt3g(group['lr'])}")
-    return ",".join(parts)
+    return _fmt3g(optimizer.param_groups[0]["lr"])
+
+
+def _set_hybrid_stage(model, stage: str):
+    if stage == "global_only":
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.cv_encoder.parameters():
+            p.requires_grad = False
+        for p in model.cv_injector.parameters():
+            p.requires_grad = True
+        for p in model.cv_node_gate.parameters():
+            p.requires_grad = True
+        model.cv_inject_scale.requires_grad = True
+        return
+
+    for p in model.parameters():
+        p.requires_grad = True
+    for p in model.cv_encoder.parameters():
+        p.requires_grad = False
 
 
 def _sample_autoregressive_loss(
@@ -101,13 +73,10 @@ def _sample_autoregressive_loss(
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
 
     losses = []
-    loss_decay = float(getattr(cfg, "train_rollout_loss_decay", 1.0))
+    loss_decay = float(cfg.train_rollout_loss_decay)
     for step in range(1, rollout_steps + 1):
         allow_norm_accum = bool(is_train and step == 1)
-        input_graph = build_graph(
-            input_graphs=frames[-(cfg.history + 1) :],
-            node_features=cfg.node_features,
-        ).to(device)
+        input_graph = build_graph(input_graphs=frames[-(cfg.history + 1) :]).to(device)
 
         cur_graph = clone_graph(frames[-1]).to(device)
         prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
@@ -136,7 +105,7 @@ def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None)
 
     loss_sum = 0.0
     steps = 0
-    train_rollout_steps = max(int(getattr(cfg, "train_rollout_steps", 1)), 1)
+    train_rollout_steps = max(int(cfg.train_rollout_steps), 1)
 
     for sim in sims:
         sim_len = min(len(sim), cfg.limit)
@@ -181,7 +150,17 @@ def train_model(
     cv_eval_fn: Callable | None = None,
     rollout_checkpoint_fn: Callable | None = None,
 ):
+    hybrid_global_only_epochs = int(cfg.hybrid_global_only_epochs)
+    if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0:
+        _set_hybrid_stage(model, "global_only")
+        stage_lr = float(cfg.global_learning_rate or cfg.learning_rate)
+    else:
+        if cfg.model_type == "hybrid":
+            _set_hybrid_stage(model, "full")
+        stage_lr = float(cfg.learning_rate)
+
     optimizer = _build_optimizer(model, cfg)
+    optimizer.param_groups[0]["lr"] = stage_lr
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer,
         gamma=cfg.learning_rate_decay,
@@ -201,14 +180,16 @@ def train_model(
         "cv_abs_pearson_r": [],
         "cv_fit_r2": [],
         "cv_used": [],
+        "cv_gate": [],
+        "cv_node_gate_mean": [],
     }
-    rollout_every = max(int(getattr(cfg, "rollout_every", 0)), 0)
-    cv_eval_every = max(int(getattr(cfg, "cv_eval_every", 0)), 0)
-    val_every = max(int(getattr(cfg, "val_every", 0)), 0)
-    train_rollout_steps = max(int(getattr(cfg, "train_rollout_steps", 1)), 1)
-    train_rollout_loss_decay = float(getattr(cfg, "train_rollout_loss_decay", 1.0))
-    freeze_norm_after = max(int(getattr(cfg, "freeze_normalizers_after_epoch", 0)), 0)
-    verbose = bool(getattr(cfg, "verbose", True))
+    rollout_every = max(int(cfg.rollout_every), 0)
+    cv_eval_every = max(int(cfg.cv_eval_every), 0)
+    val_every = max(int(cfg.val_every), 0)
+    train_rollout_steps = max(int(cfg.train_rollout_steps), 1)
+    train_rollout_loss_decay = float(cfg.train_rollout_loss_decay)
+    freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
+    verbose = bool(cfg.verbose)
     train_start = time.perf_counter()
     if verbose:
         print(
@@ -216,10 +197,27 @@ def train_model(
             f"decay={train_rollout_loss_decay:.3g}",
             flush=True,
         )
-        if len(optimizer.param_groups) > 1:
-            print(f"[train] optimizer groups lr={_lr_text(optimizer)}", flush=True)
+        if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0:
+            print(
+                f"[train] hybrid stages global_only_epochs={hybrid_global_only_epochs} "
+                f"global_lr={_fmt3g(float(cfg.global_learning_rate or cfg.learning_rate))} "
+                f"full_lr={_fmt3g(float(cfg.learning_rate))}",
+                flush=True,
+            )
 
     for epoch in range(cfg.epochs):
+        if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0 and epoch == hybrid_global_only_epochs:
+            _set_hybrid_stage(model, "full")
+            optimizer = _build_optimizer(model, cfg)
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=cfg.learning_rate_decay,
+            )
+            if verbose:
+                print(
+                    f"[train] stage switch epoch={epoch + 1} -> full lr={_fmt3g(float(cfg.learning_rate))}",
+                    flush=True,
+                )
         epoch_start = time.perf_counter()
         if hasattr(model, "freeze_normalizers"):
             model.freeze_normalizers = bool(freeze_norm_after > 0 and (epoch + 1) > freeze_norm_after)
@@ -305,6 +303,13 @@ def train_model(
         cv_abs_pearson_r = float(cv_metrics["cv_abs_pearson_r"])
         cv_fit_r2 = float(cv_metrics["cv_fit_r2"])
         cv_used = int(cv_metrics["cv_used"])
+        cv_gate = float("nan")
+        cv_node_gate_mean = float("nan")
+        if hasattr(model, "cv_inject_scale"):
+            cv_gate = float(model.cv_inject_scale.detach().cpu().item())
+        if hasattr(model, "get_global_gate_stats"):
+            g = model.get_global_gate_stats()
+            cv_node_gate_mean = float(g["mean"])
         stats["epoch"].append(epoch + 1)
         stats["loss"].append(train_loss)
         stats["val_loss"].append(val_loss)
@@ -318,6 +323,8 @@ def train_model(
         stats["cv_abs_pearson_r"].append(cv_abs_pearson_r)
         stats["cv_fit_r2"].append(cv_fit_r2)
         stats["cv_used"].append(cv_used)
+        stats["cv_gate"].append(cv_gate)
+        stats["cv_node_gate_mean"].append(cv_node_gate_mean)
 
         should_log = (
             (epoch + 1 == cfg.epochs)
@@ -333,14 +340,11 @@ def train_model(
             )
             cv_text = f"|p|={_fmt3g(cv_abs_pearson_r)} r2={_fmt3g(cv_fit_r2)} (n={cv_used})"
             gate_text = ""
+            if hasattr(model, "cv_inject_scale"):
+                gate_text += f"cv_gate={_fmt3g(model.cv_inject_scale.detach().cpu().item())} "
             if hasattr(model, "get_global_gate_stats"):
                 g = model.get_global_gate_stats()
-                if isinstance(g, dict) and ("abs_mean" in g) and ("max_abs" in g):
-                    gate_text = (
-                        f"gabs={_fmt3g(g['abs_mean'])} "
-                        f"gmax={_fmt3g(g['max_abs'])} "
-                        f"g_over_l={_fmt3g(g['global_ratio'])} "
-                    )
+                gate_text += f"gmean={_fmt3g(g['mean'])} "
             line = (
                 f"[ep {epoch + 1:>3}/{cfg.epochs}] "
                 f"tr={_fmt3g(train_loss)} va={val_text} lr={lr_text} "

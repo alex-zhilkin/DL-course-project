@@ -14,7 +14,6 @@ class ExperimentConfig:
     pos_dim: int = 2
     history: int = 1
     limit: int = 20
-    node_features: str = "velocity"
 
     hidden_size: int = 64
     n_layers: int = 2

@@ -36,7 +36,6 @@ def evaluate_rollout_pratio_sides(
     rollout_steps: int,
     pos_dim: int,
     device: str,
-    node_features: str,
     model_inputs_cls,
 ) -> dict:
     preds: list[float] = []
@@ -57,7 +56,6 @@ def evaluate_rollout_pratio_sides(
             history=history,
             pos_dim=pos_dim,
             device=device,
-            node_features=node_features,
             model_inputs_cls=model_inputs_cls,
         )
 
@@ -100,7 +98,6 @@ def evaluate_cv_vs_global_pratio(
     pos_dim: int,
     device: str,
     max_steps: int,
-    node_features: str,
     target_kind: str = "box",
 ) -> dict:
     if not hasattr(model, "extract_cv"):
@@ -128,7 +125,7 @@ def evaluate_cv_vs_global_pratio(
             frames = [sim[i].to(device) for i in range(t - history, t + 1)]
             if t > 0:
                 frames[-1].vel_state = frames[-1].x[:, :pos_dim] - sim[t - 1].to(device).x[:, :pos_dim]
-            input_graph = build_graph(frames, node_features=node_features).to(device)
+            input_graph = build_graph(frames).to(device)
             cv = model.extract_cv(input_graph, is_training=False).squeeze(0).detach().cpu().numpy()
             cv2_values.append(float(cv[1] if len(cv) > 1 else cv[0]))
 

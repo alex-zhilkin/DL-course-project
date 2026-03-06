@@ -80,7 +80,7 @@ def _write_rollout_scatter(rows: list[dict], out_path: Path, title: str) -> None
 def run_experiment(cfg: ExperimentConfig) -> dict:
     _set_seed(cfg.seed)
     device = resolve_device(cfg.device)
-    verbose = bool(getattr(cfg, "verbose", True))
+    verbose = bool(cfg.verbose)
     cfg_dict = cfg.to_dict()
 
     train_data = load_dataset(cfg.train_dataset)
@@ -96,7 +96,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         )
 
     init_frames = [train_data[0][i].to(device) for i in range(cfg.history + 1)]
-    init_graph = build_graph(input_graphs=init_frames, node_features=cfg.node_features).to(device)
+    init_graph = build_graph(input_graphs=init_frames).to(device)
     model_inputs_cls = resolve_model_inputs(cfg.model_type)
 
     model = create_model(
@@ -117,7 +117,6 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             rollout_steps=cfg.rollout_steps,
             pos_dim=cfg.pos_dim,
             device=device,
-            node_features=cfg.node_features,
             model_inputs_cls=model_inputs_cls,
         )
 
@@ -129,8 +128,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             pos_dim=cfg.pos_dim,
             device=device,
             max_steps=cfg.rollout_steps,
-            node_features=cfg.node_features,
-            target_kind=getattr(cfg, "cv_pratio_target", "box"),
+            target_kind=cfg.cv_pratio_target,
         )
 
     rollout_checkpoints_dir = run_dir / "rollout_checkpoints"
@@ -238,7 +236,6 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             rollout_steps=cfg.rollout_steps,
             pos_dim=cfg.pos_dim,
             device=device,
-            node_features=cfg.node_features,
             model_inputs_cls=model_inputs_cls,
         )
         cv_metrics = evaluate_cv_vs_global_pratio(
@@ -248,8 +245,7 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
             pos_dim=cfg.pos_dim,
             device=device,
             max_steps=cfg.rollout_steps,
-            node_features=cfg.node_features,
-            target_kind=getattr(cfg, "cv_pratio_target", "box"),
+            target_kind=cfg.cv_pratio_target,
         )
         if had_freeze:
             model.freeze_normalizers = prev_freeze

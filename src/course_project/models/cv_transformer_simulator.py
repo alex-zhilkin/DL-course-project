@@ -20,6 +20,7 @@ class CVBottleneckGlobalBlock(nn.Module):
         hidden_size: int,
         K1: int,
         cv_count: int,
+        cv_hidden_size: int = 1,
         transformer_layers: int,
         transformer_heads: int,
         transformer_dropout: float,
@@ -27,8 +28,8 @@ class CVBottleneckGlobalBlock(nn.Module):
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.Kcv = max(1, int(cv_count))
-        # Keep the intermediate K2 token width scalar for CV-focused training.
-        self.k2_hidden_size = 1
+        self.k2_hidden_size = max(1, int(cv_hidden_size))
+        self.latent_dim = int(self.Kcv * self.k2_hidden_size)
 
         self.token_sizes = self._resolve_token_sizes(K1=int(K1), cv_count=int(cv_count))
 
@@ -63,7 +64,7 @@ class CVBottleneckGlobalBlock(nn.Module):
             dropout=transformer_dropout,
             num_layers=transformer_layers,
         )
-        self.global_from_cv = nn.Linear(self.Kcv, self.hidden_size)
+        self.global_from_cv = nn.Linear(self.latent_dim, self.hidden_size)
 
         self.last_cv: Tensor | None = None
         self.init_weights()
@@ -133,9 +134,7 @@ class CVBottleneckGlobalBlock(nn.Module):
             average_attn_weights=False,
         )
 
-        # Match the modular-network-simulator CV setup: expose the deepest scalar
-        # bottleneck tokens directly as the learned CVs.
-        self.last_cv = z2.squeeze(-1)  # [B, Kcv]
+        self.last_cv = z2.reshape(B, -1)  # [B, Kcv * cv_hidden_size]
         hg = self.global_from_cv(self.last_cv).unsqueeze(1).expand(-1, Nmax, -1)  # [B, Nmax, H]
 
         if not return_attn and not return_z2:
@@ -152,6 +151,7 @@ class CVBottleneckGlobalBlock(nn.Module):
                 "unpools": [],
                 "token_sizes": list(self.token_sizes),
                 "cv_token_size": self.Kcv,
+                "cv_hidden_size": self.k2_hidden_size,
                 "node_mask": mask,
             }
 
@@ -182,8 +182,7 @@ class CVPredictorCore(nn.Module):
         super().__init__()
         self.hidden_size = int(hidden_size)
         self.last_cv: Tensor | None = None
-        # Intentionally bottleneck-only to force prediction signal through learned CVs.
-        self.use_local_skip = False
+        self.use_local_skip = bool(use_local_skip)
         self._requested_use_local_skip = bool(use_local_skip)
 
         self.frontend = NodeEdgeFusionEncoder(
@@ -197,11 +196,13 @@ class CVPredictorCore(nn.Module):
             hidden_size=self.hidden_size,
             K1=K1,
             cv_count=cv_count,
+            cv_hidden_size=1,
             transformer_layers=transformer_layers,
             transformer_heads=transformer_heads,
             transformer_dropout=transformer_dropout,
         )
-        self.out = nn.Linear(self.hidden_size, pos_dim)
+        out_in_dim = self.hidden_size * 2 if self.use_local_skip else self.hidden_size
+        self.out = nn.Linear(out_in_dim, pos_dim)
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -241,7 +242,12 @@ class CVPredictorCore(nn.Module):
             zcv = None
 
         self.last_cv = self.global_block.last_cv
-        dv_dense = self.out(hg)
+        if self.use_local_skip:
+            # Adds the local node identity signal on top of global CV context.
+            h_fused = torch.cat([h_dense, hg], dim=-1)
+        else:
+            h_fused = hg
+        dv_dense = self.out(h_fused)
         dv = dv_dense[mask]
 
         if return_context and return_attn:
@@ -258,9 +264,9 @@ class CVPredictorCore(nn.Module):
 
 
 class Model(SpatialTransformerModel):
-    """Dedicated CV simulator with explicit scalar-CV bottleneck pressure.
+    """Simulator with a CV learning as a side effect.
 
-    `CV` is the number of scalar CVs.
+    `CV` is the number of scalar Collective Variables
     """
 
     def __init__(

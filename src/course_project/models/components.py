@@ -71,19 +71,31 @@ class Normalizer(nn.Module):
         }
 
 
-class LocalMessagePassingBlock(MessagePassing):
+class BasicMeshGNNLayer(MessagePassing):
+    """Basic message-passing layer inspired by mesh graph networks."""
+
     def __init__(self, hidden_size: int, num_mlp: int):
         super().__init__(aggr="add")
-        self.node_layer = build_mlp(hidden_size * 4, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
-        self.edge_layer = build_mlp(hidden_size * 3, hidden_size, hidden_size * 3, num_mlp=num_mlp, lay_norm=False)
+        self.message_mlp = build_mlp(
+            hidden_size * 3,
+            hidden_size,
+            hidden_size * 3,
+            num_mlp=num_mlp,
+            lay_norm=False,
+        )
+        self.node_mlp = build_mlp(
+            hidden_size * 4,
+            hidden_size,
+            hidden_size,
+            num_mlp=num_mlp,
+            lay_norm=False,
+        )
 
     def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Tensor) -> Tensor:
-        message_block = torch.cat([x_i, x_j, edge_attr], dim=1)
-        return self.edge_layer(message_block)
+        return self.message_mlp(torch.cat([x_i, x_j, edge_attr], dim=1))
 
-    def update(self, agg: Tensor, x: Tensor) -> Tensor:
-        new_nodes = torch.cat([agg, x], dim=1)
-        return self.node_layer(new_nodes)
+    def update(self, aggr_out: Tensor, x: Tensor) -> Tensor:
+        return self.node_mlp(torch.cat([aggr_out, x], dim=1))
 
     def forward(self, data: Data) -> Data:
         x = self.propagate(edge_index=data.edge_index, x=data.x, edge_attr=data.edge_attr)
@@ -97,14 +109,18 @@ class LocalMessagePassingBlock(MessagePassing):
         )
 
 
+class LocalMessagePassingBlock(BasicMeshGNNLayer):
+    """Backward-compatible alias for older references."""
+
+
 class LocalGNNBackbone(nn.Module):
-    """Local graph encoder + message-passing stack reused by spatial and hybrid models."""
+    """Simple local GNN: encode nodes/edges, then run N basic message-passing layers."""
 
     def __init__(self, in_node_dim: int, in_edge_dim: int, hidden_size: int, n_layers: int, num_mlp: int):
         super().__init__()
         self.node_encoder = build_mlp(in_node_dim, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
         self.edge_encoder = build_mlp(in_edge_dim, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
-        self.layers = nn.ModuleList([LocalMessagePassingBlock(hidden_size, num_mlp=num_mlp) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([BasicMeshGNNLayer(hidden_size, num_mlp=num_mlp) for _ in range(n_layers)])
 
     def forward(self, data: Data) -> Data:
         out = Data(

@@ -2,5 +2,6 @@ numpy
 pandas
 matplotlib
 torch
+optuna
 torch_geometric
 graph_utils @ git+ssh://git@github.com/MendelsResearchGroup/graph_utils.git

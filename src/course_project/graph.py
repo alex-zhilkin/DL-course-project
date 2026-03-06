@@ -18,64 +18,20 @@ def clone_graph(graph: Data) -> Data:
     return out
 
 
-def build_graph(input_graphs: list[Data], node_features: str) -> Data:
+def build_graph(input_graphs: list[Data]) -> Data:
+    """Build model input graph using positions as node features."""
     if len(input_graphs) < 1:
         raise ValueError("no graphs provided")
     if not all(isinstance(obj, Data) for obj in input_graphs):
         raise TypeError("all input_graphs must be torch_geometric.data.Data")
 
     base_graph = input_graphs[-1]
-
-    if node_features == "positions":
-        data = clone_graph(base_graph)
-        if not hasattr(data, "t"):
-            data.t = None
-        if hasattr(base_graph, "vel_state"):
-            data.vel_state = base_graph.vel_state
-        return data
-    if node_features == "velocity":
-        if len(input_graphs) == 1:
-            velocity = base_graph.x.new_zeros(base_graph.x.shape)
-        else:
-            chunks = [
-                input_graphs[i].x - input_graphs[i - 1].x
-                for i in range(len(input_graphs) - 1, 0, -1)
-            ]
-            velocity = chunks[0] if len(chunks) == 1 else torch.column_stack(chunks)
-        data = Data(
-            x=velocity,
-            edge_index=base_graph.edge_index,
-            edge_attr=base_graph.edge_attr,
-            box=base_graph.box if hasattr(base_graph, "box") else None,
-            t=base_graph.t if hasattr(base_graph, "t") else None,
-            dtype=base_graph.x.dtype,
-        )
-        if hasattr(base_graph, "vel_state"):
-            data.vel_state = base_graph.vel_state
-        return data
-    if node_features == "combined":
-        if len(input_graphs) == 1:
-            velocity = base_graph.x.new_zeros(base_graph.x.shape)
-            x = torch.column_stack([velocity, base_graph.x])
-        else:
-            chunks = [
-                input_graphs[i].x - input_graphs[i - 1].x
-                for i in range(len(input_graphs) - 1, 0, -1)
-            ]
-            velocity = chunks[0] if len(chunks) == 1 else torch.column_stack(chunks)
-            x = torch.column_stack([velocity, base_graph.x])
-        data = Data(
-            x=x,
-            edge_index=base_graph.edge_index,
-            edge_attr=base_graph.edge_attr,
-            box=base_graph.box if hasattr(base_graph, "box") else None,
-            t=base_graph.t if hasattr(base_graph, "t") else None,
-            dtype=base_graph.x.dtype,
-        )
-        if hasattr(base_graph, "vel_state"):
-            data.vel_state = base_graph.vel_state
-        return data
-    raise ValueError("node_features must be one of: velocity, positions, combined")
+    data = clone_graph(base_graph)
+    if not hasattr(data, "t"):
+        data.t = None
+    if hasattr(base_graph, "vel_state"):
+        data.vel_state = base_graph.vel_state
+    return data
 
 
 def rollout(
@@ -85,7 +41,6 @@ def rollout(
     history: int,
     pos_dim: int,
     device: str,
-    node_features: str,
     model_inputs_cls,
 ):
     rollout_graphs = [clone_graph(g).cpu() for g in input_graphs]
@@ -93,7 +48,7 @@ def rollout(
     with torch.no_grad():
         for _ in range(num_steps):
             frames = [clone_graph(g).to(device) for g in rollout_graphs[-(history + 1) :]]
-            input_graph = build_graph(input_graphs=frames, node_features=node_features).to(device)
+            input_graph = build_graph(input_graphs=frames).to(device)
             cur_graph = clone_graph(frames[-1]).to(device)
             prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
             if len(frames) > 1:

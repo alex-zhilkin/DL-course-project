@@ -38,6 +38,7 @@ class TwoStageDownUpTransformer(nn.Module):
         self.hidden_size = int(hidden_size)
         self.k2_hidden_size = int(k2_hidden_size)
         self.use_local_skip = bool(use_local_skip)
+        # If true, we also pass local node features directly (identity signal).
         self.token_sizes = [self.K1, self.K2]
         self.last_cv = None
 
@@ -105,6 +106,7 @@ class TwoStageDownUpTransformer(nn.Module):
 
         self.last_cv = self.global_decoder.last_cv
         if self.use_local_skip:
+            # Keep local node identity hint together with global context.
             h_fused = torch.cat([h_dense, h_from_bottleneck], dim=-1)
         else:
             h_fused = h_from_bottleneck
@@ -277,11 +279,6 @@ class Model(BaseSimulator):
         _node_normalizer = self.node_normalizer.get_variable()
         _edge_normalizer = self.edge_normalizer.get_variable()
 
-        if not hasattr(self, "cfg"):
-            raise ValueError("Model config is required; set model.cfg before saving.")
-        if training_state is None:
-            raise ValueError("training_state is required when saving checkpoints.")
-
         to_save = {
             "model": model,
             "output_normalizer": _output_normalizer,
@@ -295,21 +292,22 @@ class Model(BaseSimulator):
     def load_checkpoint(self, ckpdir: str):
         dicts = torch.load(ckpdir, weights_only=False, map_location="cpu")
         self.load_state_dict(dicts["model"], strict=False)
-
-        if "model_config" not in dicts:
-            raise ValueError("Checkpoint missing model_config; unsupported format.")
         self.cfg = dicts["model_config"]
-
-        for key in ("output_normalizer", "node_normalizer", "edge_normalizer"):
-            if key not in dicts:
-                continue
-            values = dicts[key]
-            obj = getattr(self, key, None)
-            if obj is None:
-                continue
-            for para, value in values.items():
-                cur = getattr(obj, para, None)
-                if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
-                    cur.copy_(value)
-                else:
-                    setattr(obj, para, value)
+        for para, value in dicts["output_normalizer"].items():
+            cur = getattr(self.output_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.output_normalizer, para, value)
+        for para, value in dicts["node_normalizer"].items():
+            cur = getattr(self.node_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.node_normalizer, para, value)
+        for para, value in dicts["edge_normalizer"].items():
+            cur = getattr(self.edge_normalizer, para)
+            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                cur.copy_(value)
+            else:
+                setattr(self.edge_normalizer, para, value)
