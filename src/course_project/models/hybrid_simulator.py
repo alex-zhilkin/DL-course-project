@@ -54,7 +54,6 @@ class Model(BaseSimulator):
             n_layers=n_layers,
             num_mlp=num_mlp,
         )
-        self.decoder = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
 
         self.cv_checkpoint_path = str(cv_checkpoint_path)
         self.cv_encoder = self._load_frozen_cv_encoder(
@@ -76,6 +75,7 @@ class Model(BaseSimulator):
             num_mlp=2,
             lay_norm=False,
         )
+        self.decoder = build_mlp(hidden_size + hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
         self.cv_inject_scale = torch.nn.Parameter(
             torch.tensor(float(cv_inject_scale_init), dtype=torch.float32)
         )
@@ -157,7 +157,7 @@ class Model(BaseSimulator):
             dtype=torch.float,
         )
 
-    def _encode_with_cv(self, norm_graph: Data, raw_graph: Data) -> Data:
+    def _encode_with_cv(self, norm_graph: Data, raw_graph: Data) -> tuple[Data, Tensor]:
         latent = self.backbone(norm_graph)
 
         with torch.no_grad():
@@ -178,7 +178,7 @@ class Model(BaseSimulator):
             self._last_gate_mean = float(node_gate.detach().mean().cpu().item())
             self._gate_mean_sum += self._last_gate_mean
             self._gate_mean_count += 1
-        return latent
+        return latent, cv_nodes
 
     def get_global_gate_stats(self) -> dict:
         return {
@@ -188,8 +188,8 @@ class Model(BaseSimulator):
 
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
         norm_graph = self.normalize_graph(data, is_training=is_training)
-        latent = self._encode_with_cv(norm_graph, data)
-        return self.decoder(latent.x)
+        latent, cv_nodes = self._encode_with_cv(norm_graph, data)
+        return self.decoder(torch.cat([latent.x, cv_nodes], dim=1))
 
     def extract_cv(self, data: Data, *, is_training: bool = False) -> Tensor:
         with torch.no_grad():

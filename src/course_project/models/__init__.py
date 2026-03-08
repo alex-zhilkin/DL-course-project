@@ -8,7 +8,6 @@ from .autoencoder import Model as AutoencoderModel
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
-from .latent_space_simulator import Model as LatentSpaceModel
 from .spatial_simulator import Model as SpatialModel
 from .spatial_transformer_simulator import Model as SpatialTransformerModel
 
@@ -17,7 +16,6 @@ MODEL_REGISTRY = {
     "spatial": SpatialModel,
     "spatial_transformer": SpatialTransformerModel,
     "cv_transformer": CVTransformerModel,
-    "latent_space": LatentSpaceModel,
     "hybrid": HybridModel,
 }
 
@@ -56,16 +54,6 @@ MODEL_EXTRAS_REQUIRED = {
         "edge_aggr",
         "use_local_skip",
     },
-    "latent_space": {
-        "num_mlp",
-        "K1",
-        "CV",
-        "transformer_layers",
-        "transformer_heads",
-        "transformer_dropout",
-        "edge_aggr",
-        "use_local_skip",
-    },
     "hybrid": {
         "num_mlp",
         "cv_checkpoint_path",
@@ -78,9 +66,9 @@ MODEL_EXTRAS_OPTIONAL = {
     },
     "spatial": set(),
     "spatial_transformer": set(),
-    "cv_transformer": set(),
-    "latent_space": {
-        "cv_hidden_size",
+    "cv_transformer": {
+        "time_lag_steps",
+        "time_lag_weight",
     },
     "hybrid": {
         "cv_inject_scale_init",

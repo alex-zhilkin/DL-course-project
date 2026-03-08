@@ -4,6 +4,7 @@ import time
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 
 from .graph import build_graph, clone_graph
 
@@ -12,15 +13,11 @@ def _fmt3g(value) -> str:
     return f"{float(value):.3g}"
 
 
-def _weighted_rollout_loss(losses: list[torch.Tensor], decay: float) -> torch.Tensor:
-    if len(losses) == 1:
-        return losses[0]
-    stacked = torch.stack(losses)
-    if abs(decay - 1.0) <= 1e-12:
-        return stacked.mean()
-    weights = stacked.new_tensor([decay**i for i in range(len(losses))])
-    weights = weights / weights.sum()
-    return (stacked * weights).sum()
+def _build_graph_at_index(sim, index: int, cfg, device: str):
+    frames = [clone_graph(sim[i]).to(device) for i in range(index - cfg.history, index + 1)]
+    if len(frames) > 1:
+        frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
+    return build_graph(input_graphs=frames).to(device)
 
 
 def _build_optimizer(model, cfg):
@@ -73,7 +70,6 @@ def _sample_autoregressive_loss(
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
 
     losses = []
-    loss_decay = float(cfg.train_rollout_loss_decay)
     for step in range(1, rollout_steps + 1):
         allow_norm_accum = bool(is_train and step == 1)
         input_graph = build_graph(input_graphs=frames[-(cfg.history + 1) :]).to(device)
@@ -93,7 +89,29 @@ def _sample_autoregressive_loss(
             predicted_graph = model.update(model_inputs, pred)
             frames.append(predicted_graph)
 
-    return _weighted_rollout_loss(losses, decay=loss_decay)
+    total_loss = torch.stack(losses).mean()
+
+    lag_steps = int(getattr(model, "time_lag_steps", 0))
+    lag_weight = float(getattr(model, "time_lag_weight", 0.0))
+    if hasattr(model, "predict_time_lag_acc") and lag_steps > 0 and lag_weight > 0.0 and index + lag_steps < len(sim):
+        graph_t = _build_graph_at_index(sim, index, cfg, device)
+        pred_tau = model.predict_time_lag_acc(graph_t, is_training=is_train)
+
+        prev_t_pos = clone_graph(sim[index - 1]).to(device).x[:, : cfg.pos_dim]
+        cur_t_pos = clone_graph(sim[index]).to(device).x[:, : cfg.pos_dim]
+        prev_tau_pos = clone_graph(sim[index + lag_steps - 1]).to(device).x[:, : cfg.pos_dim]
+        cur_tau_pos = clone_graph(sim[index + lag_steps]).to(device).x[:, : cfg.pos_dim]
+        cur_t_vel = cur_t_pos - prev_t_pos
+        cur_tau_vel = cur_tau_pos - prev_tau_pos
+        # Trajectory-level lag target: average acceleration over [t, t+tau].
+        target_tau_acc = (cur_tau_vel - cur_t_vel) / float(lag_steps)
+
+        if hasattr(model, "output_normalizer"):
+            target_tau_acc = model.output_normalizer(target_tau_acc, is_training=bool(is_train))
+        lag_loss = F.mse_loss(pred_tau, target_tau_acc.detach())
+        total_loss = total_loss + lag_weight * lag_loss
+
+    return total_loss
 
 
 def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None):
@@ -185,18 +203,20 @@ def train_model(
     }
     rollout_every = max(int(cfg.rollout_every), 0)
     cv_eval_every = max(int(cfg.cv_eval_every), 0)
+    checkpoint_every = cv_eval_every if cfg.model_type == "cv_transformer" else rollout_every
     val_every = max(int(cfg.val_every), 0)
     train_rollout_steps = max(int(cfg.train_rollout_steps), 1)
-    train_rollout_loss_decay = float(cfg.train_rollout_loss_decay)
     freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
     verbose = bool(cfg.verbose)
     train_start = time.perf_counter()
     if verbose:
-        print(
-            f"[train] autoregressive loss steps={train_rollout_steps} "
-            f"decay={train_rollout_loss_decay:.3g}",
-            flush=True,
-        )
+        print(f"[train] autoregressive loss steps={train_rollout_steps}", flush=True)
+        if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
+            print(
+                f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
+                f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
+                flush=True,
+            )
         if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0:
             print(
                 f"[train] hybrid stages global_only_epochs={hybrid_global_only_epochs} "
@@ -263,16 +283,6 @@ def train_model(
                 if had_freeze:
                     model.freeze_normalizers = prev_freeze
                 model.train(was_training)
-            rollout_checkpoint_fn(
-                epoch + 1,
-                model,
-                optimizer,
-                scheduler,
-                rollout_metrics,
-                train_loss,
-                val_loss,
-            )
-
         cv_metrics = {
             "cv_abs_pearson_r": float("nan"),
             "cv_fit_r2": float("nan"),
@@ -290,6 +300,16 @@ def train_model(
                 if had_freeze:
                     model.freeze_normalizers = prev_freeze
                 model.train(was_training)
+        if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
+            rollout_checkpoint_fn(
+                epoch + 1,
+                model,
+                optimizer,
+                scheduler,
+                rollout_metrics,
+                train_loss,
+                val_loss,
+            )
 
         scheduler.step()
         epoch_seconds = time.perf_counter() - epoch_start
@@ -303,6 +323,7 @@ def train_model(
         cv_abs_pearson_r = float(cv_metrics["cv_abs_pearson_r"])
         cv_fit_r2 = float(cv_metrics["cv_fit_r2"])
         cv_used = int(cv_metrics["cv_used"])
+        cv_text = cv_metrics.get("cv_text")
         cv_gate = float("nan")
         cv_node_gate_mean = float("nan")
         if hasattr(model, "cv_inject_scale"):
@@ -334,11 +355,8 @@ def train_model(
         )
         if verbose and should_log:
             val_text = _fmt3g(val_loss)
-            rollout_text = (
-                f"r2={_fmt3g(rollout_r2)} p={_fmt3g(rollout_pearson_r)} "
-                f"mse={_fmt3g(rollout_pos_mse)} ({rollout_used}/{rollout_total})"
-            )
-            cv_text = f"|p|={_fmt3g(cv_abs_pearson_r)} r2={_fmt3g(cv_fit_r2)} (n={cv_used})"
+            if not isinstance(cv_text, str) or len(cv_text) == 0:
+                cv_text = f"|p|={_fmt3g(cv_abs_pearson_r)} r2={_fmt3g(cv_fit_r2)} (n={cv_used})"
             gate_text = ""
             if hasattr(model, "cv_inject_scale"):
                 gate_text += f"cv_gate={_fmt3g(model.cv_inject_scale.detach().cpu().item())} "
@@ -348,9 +366,14 @@ def train_model(
             line = (
                 f"[ep {epoch + 1:>3}/{cfg.epochs}] "
                 f"tr={_fmt3g(train_loss)} va={val_text} lr={lr_text} "
-                f"roll={rollout_text} "
                 f"{gate_text}"
             )
+            if cfg.model_type != "cv_transformer":
+                rollout_text = (
+                    f"r2={_fmt3g(rollout_r2)} p={_fmt3g(rollout_pearson_r)} "
+                    f"mse={_fmt3g(rollout_pos_mse)} ({rollout_used}/{rollout_total})"
+                )
+                line += f"roll={rollout_text} "
             line += f"cv={cv_text} "
             line += f"t={_fmt3g(epoch_seconds)}s"
             print(line, flush=True)

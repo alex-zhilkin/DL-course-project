@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .config import ExperimentConfig
-from .data import load_dataset
+from .data import split_dataset
 from .graph import build_graph
 from .metrics import (
     evaluate_cv_vs_global_pratio,
@@ -83,8 +83,11 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
     verbose = bool(cfg.verbose)
     cfg_dict = cfg.to_dict()
 
-    train_data = load_dataset(cfg.train_dataset)
-    val_data = load_dataset(cfg.val_dataset)
+    train_data, val_data, _test_data = split_dataset(
+        cfg.dataset_path,
+        train_count=cfg.train_count,
+        val_count=cfg.val_count,
+    )
 
     run_dir = Path(cfg.output_root) / cfg.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -110,6 +113,15 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
     model.cfg = cfg_dict
 
     def _rollout_eval(current_model):
+        if cfg.model_type == "cv_transformer":
+            return {
+                "rollout_r2": float("nan"),
+                "rollout_pearson_r": float("nan"),
+                "rollout_pos_mse": float("nan"),
+                "used": 0,
+                "total": 0,
+                "rows": [],
+            }
         return evaluate_rollout_pratio_sides(
             model=current_model,
             sims=val_data,
@@ -121,14 +133,14 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         )
 
     def _cv_eval(current_model):
+        cv_max_steps = None if cfg.model_type == "cv_transformer" else cfg.rollout_steps
         return evaluate_cv_vs_global_pratio(
             model=current_model,
             sims=val_data,
             history=cfg.history,
             pos_dim=cfg.pos_dim,
             device=device,
-            max_steps=cfg.rollout_steps,
-            target_kind=cfg.cv_pratio_target,
+            max_steps=cv_max_steps,
         )
 
     rollout_checkpoints_dir = run_dir / "rollout_checkpoints"
@@ -229,23 +241,32 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
         model.eval()
         if had_freeze:
             model.freeze_normalizers = True
-        rollout_metrics = evaluate_rollout_pratio_sides(
-            model=model,
-            sims=val_data,
-            history=cfg.history,
-            rollout_steps=cfg.rollout_steps,
-            pos_dim=cfg.pos_dim,
-            device=device,
-            model_inputs_cls=model_inputs_cls,
-        )
+        if cfg.model_type == "cv_transformer":
+            rollout_metrics = {
+                "rollout_r2": float("nan"),
+                "rollout_pearson_r": float("nan"),
+                "rollout_pos_mse": float("nan"),
+                "used": 0,
+                "total": 0,
+                "rows": [],
+            }
+        else:
+            rollout_metrics = evaluate_rollout_pratio_sides(
+                model=model,
+                sims=val_data,
+                history=cfg.history,
+                rollout_steps=cfg.rollout_steps,
+                pos_dim=cfg.pos_dim,
+                device=device,
+                model_inputs_cls=model_inputs_cls,
+            )
         cv_metrics = evaluate_cv_vs_global_pratio(
             model=model,
             sims=val_data,
             history=cfg.history,
             pos_dim=cfg.pos_dim,
             device=device,
-            max_steps=cfg.rollout_steps,
-            target_kind=cfg.cv_pratio_target,
+            max_steps=None if cfg.model_type == "cv_transformer" else cfg.rollout_steps,
         )
         if had_freeze:
             model.freeze_normalizers = prev_freeze
@@ -253,13 +274,14 @@ def run_experiment(cfg: ExperimentConfig) -> dict:
 
     rollout_rows = rollout_metrics.pop("rows")
     cv_rows = cv_metrics.pop("rows")
-    write_csv(run_dir / "rollout_predictions.csv", rollout_rows)
     write_csv(run_dir / "cv_vs_pratio.csv", cv_rows)
-    _write_rollout_scatter(
-        rollout_rows,
-        run_dir / "rollout_pratio_scatter.png",
-        title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})",
-    )
+    if cfg.model_type != "cv_transformer":
+        write_csv(run_dir / "rollout_predictions.csv", rollout_rows)
+        _write_rollout_scatter(
+            rollout_rows,
+            run_dir / "rollout_pratio_scatter.png",
+            title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})",
+        )
 
     torch.save(stats, run_dir / "train_stats.pt")
     (run_dir / "rollout_checkpoints.json").write_text(json.dumps(rollout_checkpoints, indent=2))

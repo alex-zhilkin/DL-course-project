@@ -7,8 +7,9 @@ from dataclasses import asdict, dataclass, field
 class ExperimentConfig:
     run_name: str
     model_type: str
-    train_dataset: str
-    val_dataset: str
+    dataset_path: str
+    train_count: int
+    val_count: int
     output_root: str = "course_project/results"
 
     pos_dim: int = 2
@@ -32,7 +33,6 @@ class ExperimentConfig:
     rollout_steps: int = 50
     cv_pratio_target: str = "box"
     train_rollout_steps: int = 1
-    train_rollout_loss_decay: float = 1.0
     freeze_normalizers_after_epoch: int = 5
 
     device: str = "cuda"

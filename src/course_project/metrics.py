@@ -97,8 +97,7 @@ def evaluate_cv_vs_global_pratio(
     history: int,
     pos_dim: int,
     device: str,
-    max_steps: int,
-    target_kind: str = "box",
+    max_steps: int | None = None,
 ) -> dict:
     if not hasattr(model, "extract_cv"):
         return {
@@ -111,12 +110,9 @@ def evaluate_cv_vs_global_pratio(
     cv2_means = []
     targets = []
     rows = []
-    target_kind = str(target_kind).strip().lower()
-    if target_kind not in {"box", "rollout_sides"}:
-        raise ValueError(f"target_kind must be 'box' or 'rollout_sides', got {target_kind!r}")
 
     for sim_idx, sim in enumerate(sims):
-        n_local = min(max_steps, len(sim) - 1)
+        n_local = len(sim) - 1 if max_steps is None else min(int(max_steps), len(sim) - 1)
         if n_local <= history:
             continue
 
@@ -132,10 +128,7 @@ def evaluate_cv_vs_global_pratio(
         if len(cv2_values) < 3:
             continue
 
-        if target_kind == "rollout_sides":
-            target_pr = float(calc_p_ratio_rollout_sides(sim, -1))
-        else:
-            target_pr = float(calc_p_ratio_box(sim, -1))
+        target_pr = float(calc_p_ratio_box(sim, -1))
         cv2_mean = float(np.mean(cv2_values))
         if not np.isfinite(target_pr) or not np.isfinite(cv2_mean):
             continue
@@ -147,7 +140,6 @@ def evaluate_cv_vs_global_pratio(
                 "sim_idx": sim_idx,
                 "mean_cv2": cv2_mean,
                 "target_global_p_ratio": target_pr,
-                "cv_target_kind": target_kind,
             }
         )
 
@@ -167,7 +159,6 @@ def evaluate_cv_vs_global_pratio(
         "cv_abs_pearson_r": cv_abs_r,
         "cv_fit_r2": fit_r2,
         "cv_used": len(cv2_means),
-        "cv_target_kind": target_kind,
         "rows": rows,
     }
 
