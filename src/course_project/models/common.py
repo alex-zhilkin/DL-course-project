@@ -5,33 +5,6 @@ from torch import Tensor, nn
 from torch_geometric.data import Data
 
 
-def _coerce_box_dict(box):
-    if box is None:
-        return None
-    if isinstance(box, dict):
-        out = {k: float(v) for k, v in box.items() if isinstance(v, (int, float))}
-    else:
-        out = {}
-        for key in ("x", "y", "z", "x1", "x2", "y1", "y2", "z1", "z2"):
-            if hasattr(box, key):
-                out[key] = float(getattr(box, key))
-    if "x" not in out and "x1" in out and "x2" in out:
-        out["x"] = out["x2"] - out["x1"]
-    if "y" not in out and "y1" in out and "y2" in out:
-        out["y"] = out["y2"] - out["y1"]
-    if "z" not in out and "z1" in out and "z2" in out:
-        out["z"] = out["z2"] - out["z1"]
-    return out if out else None
-
-
-def _require_box_dict(graph: Data, context: str = "") -> dict[str, float]:
-    box = _coerce_box_dict(getattr(graph, "box", None))
-    if box is None:
-        where = f" ({context})" if context else ""
-        raise ValueError(f"Graph is missing usable box metadata{where}.")
-    return box
-
-
 def _box_dim(box: dict[str, float], axis: int) -> float:
     key = ("x", "y", "z")[axis]
     if key in box:
@@ -63,7 +36,14 @@ def get_correct_edge_vec(original_graph: Data, pos_dim: int | None = None) -> Te
     source_pos = positions[edge_index[0]]
     target_pos = positions[edge_index[1]]
 
-    box = _require_box_dict(original_graph, context="get_correct_edge_vec")
+    raw_box = getattr(original_graph, "box")
+    if isinstance(raw_box, dict):
+        box = raw_box
+    else:
+        box = {}
+        for key in ("x", "y", "z", "x1", "x2", "y1", "y2", "z1", "z2"):
+            if hasattr(raw_box, key):
+                box[key] = float(getattr(raw_box, key))
     box_dims = torch.tensor(
         [_box_dim(box, 0), _box_dim(box, 1), _box_dim(box, 2)],
         device=original_graph.x.device,

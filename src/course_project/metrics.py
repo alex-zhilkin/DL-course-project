@@ -12,32 +12,16 @@ from .graph import build_graph, rollout
 
 
 def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    if y_true.size < 2:
-        return float("nan")
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    if ss_tot <= 1e-12:
-        return float("nan")
     return float(1.0 - ss_res / ss_tot)
 
 
 def _pearson_r(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    if y_true.size < 2 or y_pred.size < 2:
-        return float("nan")
-    if np.std(y_true) <= 1e-12 or np.std(y_pred) <= 1e-12:
-        return float("nan")
     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
-def evaluate_rollout_pratio_sides(
-    model,
-    sims: list,
-    history: int,
-    rollout_steps: int,
-    pos_dim: int,
-    device: str,
-    model_inputs_cls,
-) -> dict:
+def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps: int, pos_dim: int, device: str, model_inputs_cls) -> dict:
     preds: list[float] = []
     targets: list[float] = []
     pos_mse_values: list[float] = []
@@ -49,15 +33,7 @@ def evaluate_rollout_pratio_sides(
             continue
 
         input_graphs = [sim[i] for i in range(history + 1)]
-        roll = rollout(
-            model=model,
-            input_graphs=input_graphs,
-            num_steps=rollout_steps,
-            history=history,
-            pos_dim=pos_dim,
-            device=device,
-            model_inputs_cls=model_inputs_cls,
-        )
+        roll = rollout(model=model, input_graphs=input_graphs, num_steps=rollout_steps, history=history, pos_dim=pos_dim, device=device, model_inputs_cls=model_inputs_cls)
 
         pred_pr = float(calc_p_ratio_rollout_sides(roll, -1))
         target_pr = float(calc_p_ratio_rollout_sides(sim, target_index))
@@ -71,15 +47,13 @@ def evaluate_rollout_pratio_sides(
         preds.append(pred_pr)
         targets.append(target_pr)
         pos_mse_values.append(pos_mse)
-        rows.append(
-            {
-                "sim_idx": sim_idx,
-                "target_index": target_index,
-                "pred_rollout_p_ratio": pred_pr,
-                "target_rollout_sides_p_ratio": target_pr,
-                "rollout_pos_mse": pos_mse,
-            }
-        )
+        rows.append({
+            "sim_idx": sim_idx,
+            "target_index": target_index,
+            "pred_rollout_p_ratio": pred_pr,
+            "target_rollout_sides_p_ratio": target_pr,
+            "rollout_pos_mse": pos_mse,
+        })
 
     return {
         "rollout_r2": _r2(np.asarray(targets, dtype=float), np.asarray(preds, dtype=float)),
@@ -91,23 +65,8 @@ def evaluate_rollout_pratio_sides(
     }
 
 
-def evaluate_cv_vs_global_pratio(
-    model,
-    sims: list,
-    history: int,
-    pos_dim: int,
-    device: str,
-    max_steps: int | None = None,
-) -> dict:
-    if not hasattr(model, "extract_cv"):
-        return {
-            "cv_abs_pearson_r": float("nan"),
-            "cv_fit_r2": float("nan"),
-            "cv_used": 0,
-            "rows": [],
-        }
-
-    cv2_means = []
+def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, device: str, max_steps: int | None = None) -> dict:
+    cv_means_by_sim = []
     targets = []
     rows = []
 
@@ -116,49 +75,56 @@ def evaluate_cv_vs_global_pratio(
         if n_local <= history:
             continue
 
-        cv2_values = []
+        cv_values = []
         for t in range(history, n_local):
             frames = [sim[i].to(device) for i in range(t - history, t + 1)]
             if t > 0:
                 frames[-1].vel_state = frames[-1].x[:, :pos_dim] - sim[t - 1].to(device).x[:, :pos_dim]
             input_graph = build_graph(frames).to(device)
             cv = model.extract_cv(input_graph, is_training=False).squeeze(0).detach().cpu().numpy()
-            cv2_values.append(float(cv[1] if len(cv) > 1 else cv[0]))
+            cv_values.append(np.asarray(cv, dtype=float).reshape(-1))
 
-        if len(cv2_values) < 3:
+        if len(cv_values) < 3:
             continue
 
         target_pr = float(calc_p_ratio_box(sim, -1))
-        cv2_mean = float(np.mean(cv2_values))
-        if not np.isfinite(target_pr) or not np.isfinite(cv2_mean):
+        cv_mean = np.mean(np.stack(cv_values, axis=0), axis=0)
+        if not np.isfinite(target_pr) or not np.all(np.isfinite(cv_mean)):
             continue
 
-        cv2_means.append(cv2_mean)
+        cv_means_by_sim.append(cv_mean)
         targets.append(target_pr)
-        rows.append(
-            {
-                "sim_idx": sim_idx,
-                "mean_cv2": cv2_mean,
-                "target_global_p_ratio": target_pr,
-            }
-        )
+        row = {"sim_idx": sim_idx, "target_global_p_ratio": target_pr}
+        for i, value in enumerate(cv_mean, start=1):
+            row[f"mean_cv{i}"] = float(value)
+        rows.append(row)
 
     cv_abs_r = float("nan")
     fit_r2 = float("nan")
-    if len(cv2_means) >= 3:
-        x = np.asarray(cv2_means, dtype=float)
+    best_cv_idx = None
+    best_cv_name = None
+    if len(cv_means_by_sim) >= 3:
+        x_all = np.asarray(cv_means_by_sim, dtype=float)
         y = np.asarray(targets, dtype=float)
-        if np.std(x) > 1e-12 and np.std(y) > 1e-12:
+        for i in range(x_all.shape[1]):
+            x = x_all[:, i]
             corr = float(np.corrcoef(x, y)[0, 1])
-            cv_abs_r = abs(corr)
             slope, intercept = np.polyfit(x, y, 1)
             yhat = slope * x + intercept
-            fit_r2 = _r2(y, yhat)
+            r2 = _r2(y, yhat)
+            if best_cv_idx is None or r2 > fit_r2:
+                best_cv_idx = i
+                best_cv_name = f"cv_{i + 1}"
+                cv_abs_r = abs(corr)
+                fit_r2 = r2
 
     return {
         "cv_abs_pearson_r": cv_abs_r,
         "cv_fit_r2": fit_r2,
-        "cv_used": len(cv2_means),
+        "cv_used": len(cv_means_by_sim),
+        "best_cv_idx": best_cv_idx,
+        "best_cv_name": best_cv_name,
+        "cv_text": None if best_cv_name is None else f"{best_cv_name} |p|={cv_abs_r:.3g} r2={fit_r2:.3g}",
         "rows": rows,
     }
 

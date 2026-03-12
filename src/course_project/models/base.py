@@ -6,24 +6,17 @@ import torch
 from torch_geometric.data import Data
 
 class BaseSimulator(torch.nn.Module, ABC):
-    """Abstract base class for simulators to keep a consistent interface."""
-
     def __init__(self, pos_dim: int, *args, **kwargs):
         super().__init__()
         self._validate_pos_dim(pos_dim)
         self.pos_dim = pos_dim
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        """Update current training epoch for the model."""
-        self.epoch = int(epoch)
 
     @abstractmethod
     def forward(self, data: Data, is_training: bool = True, *args, **kwargs):
         raise NotImplementedError
 
     @abstractmethod
-    def update(self, inputs, model_output, dummy_sep: bool = False) -> Data:
+    def update(self, inputs, model_output) -> Data:
         raise NotImplementedError
 
     @abstractmethod
@@ -59,9 +52,31 @@ class BaseSimulator(torch.nn.Module, ABC):
                 f"Expected at least {min_edge_features} edge features, got {data.num_edge_features}"
             )
 
+    def _checkpoint_payload(self, training_state: dict) -> dict:
+        return {
+            "model": self.state_dict(),
+            "output_normalizer": self.output_normalizer.get_variable(),
+            "node_normalizer": self.node_normalizer.get_variable(),
+            "edge_normalizer": self.edge_normalizer.get_variable(),
+            "model_config": self.cfg,
+            **training_state,
+        }
+
+    def _load_checkpoint_payload(self, payload: dict) -> None:
+        self.load_state_dict(payload["model"])
+        self.cfg = payload["model_config"]
+        for normalizer_name in ("output_normalizer", "node_normalizer", "edge_normalizer"):
+            normalizer = getattr(self, normalizer_name)
+            for key, value in payload[normalizer_name].items():
+                cur = getattr(normalizer, key)
+                if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
+                    cur.copy_(value)
+                else:
+                    setattr(normalizer, key, value)
+
 
 class BaseModelInputs:
-    """Shared input container that applies the base pos_dim handling."""
+    """Shared input container"""
 
     prev_graph: Data
     cur_graph: Data

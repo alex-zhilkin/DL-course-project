@@ -35,61 +35,47 @@ def _lr_text(optimizer) -> str:
     return _fmt3g(optimizer.param_groups[0]["lr"])
 
 
-def _set_hybrid_stage(model, stage: str):
-    if stage == "global_only":
-        for p in model.parameters():
-            p.requires_grad = False
-        for p in model.cv_encoder.parameters():
-            p.requires_grad = False
-        for p in model.cv_injector.parameters():
-            p.requires_grad = True
-        for p in model.cv_node_gate.parameters():
-            p.requires_grad = True
-        model.cv_inject_scale.requires_grad = True
-        return
-
-    for p in model.parameters():
-        p.requires_grad = True
-    for p in model.cv_encoder.parameters():
-        p.requires_grad = False
+def _with_frozen_normalizers(model, fn: Callable):
+    was_training = model.training
+    prev_freeze = getattr(model, "freeze_normalizers", None)
+    model.eval()
+    if hasattr(model, "freeze_normalizers"):
+        model.freeze_normalizers = True
+    try:
+        return fn(model)
+    finally:
+        if hasattr(model, "freeze_normalizers"):
+            model.freeze_normalizers = prev_freeze
+        model.train(was_training)
 
 
-def _sample_autoregressive_loss(
-    model,
-    sim,
-    index: int,
-    rollout_steps: int,
-    cfg,
-    device: str,
-    model_inputs_cls,
-    *,
-    is_train: bool,
-):
+def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_inputs_cls, *, is_train: bool):
     frames = [clone_graph(sim[i]).to(device) for i in range(index - cfg.history, index + 1)]
     if len(frames) > 1:
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
 
-    losses = []
-    for step in range(1, rollout_steps + 1):
-        allow_norm_accum = bool(is_train and step == 1)
-        input_graph = build_graph(input_graphs=frames[-(cfg.history + 1) :]).to(device)
+    allow_norm_accum = bool(is_train)
+    input_graph = build_graph(input_graphs=frames[-(cfg.history + 1):]).to(device)
+    cur_graph = clone_graph(frames[-1]).to(device)
+    prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
+    if len(frames) > 1:
+        cur_graph.vel_state = cur_graph.x[:, : cfg.pos_dim] - prev_graph.x[:, : cfg.pos_dim]
+    target_graph = clone_graph(sim[index + 1]).to(device)
+    model_inputs = model_inputs_cls(prev_graph, cur_graph, target_graph, cfg.pos_dim)
 
-        cur_graph = clone_graph(frames[-1]).to(device)
-        prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
-        if len(frames) > 1:
-            cur_graph.vel_state = cur_graph.x[:, : cfg.pos_dim] - prev_graph.x[:, : cfg.pos_dim]
-        target_graph = clone_graph(sim[index + step]).to(device)
-        model_inputs = model_inputs_cls(prev_graph, cur_graph, target_graph, cfg.pos_dim)
+    pred = model(input_graph, is_training=allow_norm_accum)
+    total_loss = model.loss(pred, model_inputs, accumulate_norm_stats=allow_norm_accum)
+    parts = {
+        "cv_consistency_loss": torch.zeros((), device=total_loss.device),
+        "lag_loss": torch.zeros((), device=total_loss.device),
+    }
 
-        pred = model(input_graph, is_training=allow_norm_accum)
-        loss = model.loss(pred, model_inputs, accumulate_norm_stats=allow_norm_accum)
-        losses.append(loss)
-
-        if step < rollout_steps:
-            predicted_graph = model.update(model_inputs, pred)
-            frames.append(predicted_graph)
-
-    total_loss = torch.stack(losses).mean()
+    cv_consistency_weight = float(getattr(model, "cv_consistency_weight", 0.0))
+    if hasattr(model, "cv_consistency_loss") and cv_consistency_weight > 0.0:
+        pred_graph = model.update(model_inputs, pred)
+        cv_loss = model.cv_consistency_loss(pred_graph, target_graph)
+        parts["cv_consistency_loss"] = cv_loss.detach()
+        total_loss = total_loss + cv_consistency_weight * cv_loss
 
     lag_steps = int(getattr(model, "time_lag_steps", 0))
     lag_weight = float(getattr(model, "time_lag_weight", 0.0))
@@ -103,15 +89,14 @@ def _sample_autoregressive_loss(
         cur_tau_pos = clone_graph(sim[index + lag_steps]).to(device).x[:, : cfg.pos_dim]
         cur_t_vel = cur_t_pos - prev_t_pos
         cur_tau_vel = cur_tau_pos - prev_tau_pos
-        # Trajectory-level lag target: average acceleration over [t, t+tau].
         target_tau_acc = (cur_tau_vel - cur_t_vel) / float(lag_steps)
-
         if hasattr(model, "output_normalizer"):
             target_tau_acc = model.output_normalizer(target_tau_acc, is_training=bool(is_train))
         lag_loss = F.mse_loss(pred_tau, target_tau_acc.detach())
+        parts["lag_loss"] = lag_loss.detach()
         total_loss = total_loss + lag_weight * lag_loss
 
-    return total_loss
+    return total_loss, parts
 
 
 def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None):
@@ -122,264 +107,194 @@ def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None)
         model.freeze_normalizers = True
 
     loss_sum = 0.0
+    cv_consistency_loss_sum = 0.0
+    lag_loss_sum = 0.0
     steps = 0
-    train_rollout_steps = max(int(cfg.train_rollout_steps), 1)
-
     for sim in sims:
         sim_len = min(len(sim), cfg.limit)
         for index in range(sim_len):
-            # Match the legacy modular-network-simulator indexing used in the
-            # CV-discovery notebook (skip the earliest nominally-valid index).
-            if index < (cfg.history + 1) or index + train_rollout_steps >= sim_len:
+            if index < (cfg.history + 1) or index + 1 >= sim_len:
                 continue
-            loss = _sample_autoregressive_loss(
-                model,
-                sim,
-                index,
-                train_rollout_steps,
-                cfg,
-                device,
-                model_inputs_cls,
-                is_train=is_train,
-            )
-
+            loss, parts = _sample_autoregressive_loss(model, sim, index, cfg, device, model_inputs_cls, is_train=is_train)
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
             loss_sum += float(loss.detach().cpu().item())
+            cv_consistency_loss_sum += float(parts["cv_consistency_loss"].cpu().item())
+            lag_loss_sum += float(parts["lag_loss"].cpu().item())
             steps += 1
 
-    out = loss_sum / max(steps, 1), steps
+    denom = max(steps, 1)
+    out = {
+        "loss": loss_sum / denom,
+        "cv_consistency_loss": cv_consistency_loss_sum / denom,
+        "lag_loss": lag_loss_sum / denom,
+        "steps": steps,
+    }
     if not is_train and hasattr(model, "freeze_normalizers"):
         model.freeze_normalizers = prev_freeze
     return out
 
 
-def train_model(
-    model,
-    model_inputs_cls,
-    train_data,
-    val_data,
-    cfg,
-    device: str,
-    rollout_eval_fn: Callable | None = None,
-    cv_eval_fn: Callable | None = None,
-    rollout_checkpoint_fn: Callable | None = None,
-):
-    hybrid_global_only_epochs = int(cfg.hybrid_global_only_epochs)
-    if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0:
-        _set_hybrid_stage(model, "global_only")
-        stage_lr = float(cfg.global_learning_rate or cfg.learning_rate)
-    else:
-        if cfg.model_type == "hybrid":
-            _set_hybrid_stage(model, "full")
-        stage_lr = float(cfg.learning_rate)
-
-    optimizer = _build_optimizer(model, cfg)
-    optimizer.param_groups[0]["lr"] = stage_lr
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer,
-        gamma=cfg.learning_rate_decay,
-    )
-
-    stats = {
+def _init_stats():
+    return {
         "epoch": [],
         "loss": [],
         "val_loss": [],
+        "cv_consistency_loss": [],
+        "val_cv_consistency_loss": [],
+        "lag_loss": [],
+        "val_lag_loss": [],
         "lr": [],
         "epoch_seconds": [],
+        "cv_scale": [],
+        "cv_film_mean": [],
+    }
+
+
+def _append_common_stats(stats, epoch, train_info, val_info, val_loss, optimizer, epoch_seconds, model):
+    stats["epoch"].append(epoch)
+    stats["loss"].append(float(train_info["loss"]))
+    stats["val_loss"].append(val_loss)
+    stats["cv_consistency_loss"].append(float(train_info["cv_consistency_loss"]))
+    stats["val_cv_consistency_loss"].append(float("nan") if val_info is None else float(val_info["cv_consistency_loss"]))
+    stats["lag_loss"].append(float(train_info["lag_loss"]))
+    stats["val_lag_loss"].append(float("nan") if val_info is None else float(val_info["lag_loss"]))
+    stats["lr"].append(float(optimizer.param_groups[0]["lr"]))
+    stats["epoch_seconds"].append(epoch_seconds)
+    cv_scale = float("nan")
+    cv_film_mean = float("nan")
+    if hasattr(model, "cv_inject_scale"):
+        cv_scale = float(model.cv_inject_scale.detach().cpu().item())
+    if hasattr(model, "get_global_film_stats"):
+        cv_film_mean = float(model.get_global_film_stats()["mean"])
+    stats["cv_scale"].append(cv_scale)
+    stats["cv_film_mean"].append(cv_film_mean)
+
+
+def train_graph_model(model, model_inputs_cls, train_data, val_data, cfg, device: str, *, rollout_eval_fn: Callable, rollout_checkpoint_fn: Callable):
+    optimizer = _build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.learning_rate_decay)
+    stats = _init_stats()
+    stats.update({
         "rollout_r2": [],
         "rollout_pearson_r": [],
         "rollout_pos_mse": [],
         "rollout_used": [],
         "rollout_total": [],
-        "cv_abs_pearson_r": [],
-        "cv_fit_r2": [],
-        "cv_used": [],
-        "cv_gate": [],
-        "cv_node_gate_mean": [],
-    }
+    })
     rollout_every = max(int(cfg.rollout_every), 0)
-    cv_eval_every = max(int(cfg.cv_eval_every), 0)
-    checkpoint_every = cv_eval_every if cfg.model_type == "cv_transformer" else rollout_every
     val_every = max(int(cfg.val_every), 0)
-    train_rollout_steps = max(int(cfg.train_rollout_steps), 1)
     freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
-    verbose = bool(cfg.verbose)
     train_start = time.perf_counter()
-    if verbose:
-        print(f"[train] autoregressive loss steps={train_rollout_steps}", flush=True)
-        if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
-            print(
-                f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
-                f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
-                flush=True,
-            )
-        if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0:
-            print(
-                f"[train] hybrid stages global_only_epochs={hybrid_global_only_epochs} "
-                f"global_lr={_fmt3g(float(cfg.global_learning_rate or cfg.learning_rate))} "
-                f"full_lr={_fmt3g(float(cfg.learning_rate))}",
-                flush=True,
-            )
+    if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
+        print(
+            f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
+            f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
+            flush=True,
+        )
 
-    for epoch in range(cfg.epochs):
-        if cfg.model_type == "hybrid" and hybrid_global_only_epochs > 0 and epoch == hybrid_global_only_epochs:
-            _set_hybrid_stage(model, "full")
-            optimizer = _build_optimizer(model, cfg)
-            scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                optimizer,
-                gamma=cfg.learning_rate_decay,
-            )
-            if verbose:
-                print(
-                    f"[train] stage switch epoch={epoch + 1} -> full lr={_fmt3g(float(cfg.learning_rate))}",
-                    flush=True,
-                )
+    for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
         if hasattr(model, "freeze_normalizers"):
-            model.freeze_normalizers = bool(freeze_norm_after > 0 and (epoch + 1) > freeze_norm_after)
-        if hasattr(model, "set_epoch"):
-            model.set_epoch(epoch)
-        train_loss, train_steps = _epoch_loss(
-            model,
-            train_data,
-            cfg,
-            device,
-            model_inputs_cls,
-            optimizer=optimizer,
-        )
+            model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
+        train_info = _epoch_loss(model, train_data, cfg, device, model_inputs_cls, optimizer=optimizer)
+        val_info = None
         val_loss = None
-        val_steps = 0
-        if val_every > 0 and (epoch + 1) % val_every == 0:
+        if val_every > 0 and epoch % val_every == 0:
             with torch.no_grad():
-                val_loss, val_steps = _epoch_loss(
-                    model,
-                    val_data,
-                    cfg,
-                    device,
-                    model_inputs_cls,
-                    optimizer=None,
-                )
+                val_info = _epoch_loss(model, val_data, cfg, device, model_inputs_cls, optimizer=None)
+                val_loss = float(val_info["loss"])
 
-        rollout_metrics = {
-            "rollout_r2": float("nan"),
-            "rollout_pearson_r": float("nan"),
-            "rollout_pos_mse": float("nan"),
-            "used": 0,
-            "total": 0,
-        }
-        if rollout_every > 0 and (epoch + 1) % rollout_every == 0:
+        rollout_metrics = {"rollout_r2": float("nan"), "rollout_pearson_r": float("nan"), "rollout_pos_mse": float("nan"), "used": 0, "total": 0}
+        if rollout_every > 0 and epoch % rollout_every == 0:
             with torch.no_grad():
-                was_training = model.training
-                had_freeze = hasattr(model, "freeze_normalizers")
-                prev_freeze = getattr(model, "freeze_normalizers", None) if had_freeze else None
-                model.eval()
-                if had_freeze:
-                    model.freeze_normalizers = True
-                rollout_metrics = rollout_eval_fn(model)
-                if had_freeze:
-                    model.freeze_normalizers = prev_freeze
-                model.train(was_training)
-        cv_metrics = {
-            "cv_abs_pearson_r": float("nan"),
-            "cv_fit_r2": float("nan"),
-            "cv_used": 0,
-        }
-        if cv_eval_every > 0 and (epoch + 1) % cv_eval_every == 0:
-            with torch.no_grad():
-                was_training = model.training
-                had_freeze = hasattr(model, "freeze_normalizers")
-                prev_freeze = getattr(model, "freeze_normalizers", None) if had_freeze else None
-                model.eval()
-                if had_freeze:
-                    model.freeze_normalizers = True
-                cv_metrics = cv_eval_fn(model)
-                if had_freeze:
-                    model.freeze_normalizers = prev_freeze
-                model.train(was_training)
-        if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
-            rollout_checkpoint_fn(
-                epoch + 1,
-                model,
-                optimizer,
-                scheduler,
-                rollout_metrics,
-                train_loss,
-                val_loss,
-            )
+                rollout_metrics = _with_frozen_normalizers(model, rollout_eval_fn)
+            rollout_checkpoint_fn(epoch, model, optimizer, scheduler, rollout_metrics, float(train_info["loss"]), val_loss)
 
         scheduler.step()
         epoch_seconds = time.perf_counter() - epoch_start
-        lr = float(optimizer.param_groups[0]["lr"])
-        lr_text = _lr_text(optimizer)
-        rollout_r2 = float(rollout_metrics["rollout_r2"])
-        rollout_pearson_r = float(rollout_metrics["rollout_pearson_r"])
-        rollout_pos_mse = float(rollout_metrics["rollout_pos_mse"])
-        rollout_used = int(rollout_metrics["used"])
-        rollout_total = int(rollout_metrics["total"])
-        cv_abs_pearson_r = float(cv_metrics["cv_abs_pearson_r"])
-        cv_fit_r2 = float(cv_metrics["cv_fit_r2"])
-        cv_used = int(cv_metrics["cv_used"])
-        cv_text = cv_metrics.get("cv_text")
-        cv_gate = float("nan")
-        cv_node_gate_mean = float("nan")
-        if hasattr(model, "cv_inject_scale"):
-            cv_gate = float(model.cv_inject_scale.detach().cpu().item())
-        if hasattr(model, "get_global_gate_stats"):
-            g = model.get_global_gate_stats()
-            cv_node_gate_mean = float(g["mean"])
-        stats["epoch"].append(epoch + 1)
-        stats["loss"].append(train_loss)
-        stats["val_loss"].append(val_loss)
-        stats["lr"].append(lr)
-        stats["epoch_seconds"].append(epoch_seconds)
-        stats["rollout_r2"].append(rollout_r2)
-        stats["rollout_pearson_r"].append(rollout_pearson_r)
-        stats["rollout_pos_mse"].append(rollout_pos_mse)
-        stats["rollout_used"].append(rollout_used)
-        stats["rollout_total"].append(rollout_total)
-        stats["cv_abs_pearson_r"].append(cv_abs_pearson_r)
-        stats["cv_fit_r2"].append(cv_fit_r2)
-        stats["cv_used"].append(cv_used)
-        stats["cv_gate"].append(cv_gate)
-        stats["cv_node_gate_mean"].append(cv_node_gate_mean)
+        _append_common_stats(stats, epoch, train_info, val_info, val_loss, optimizer, epoch_seconds, model)
+        stats["rollout_r2"].append(float(rollout_metrics["rollout_r2"]))
+        stats["rollout_pearson_r"].append(float(rollout_metrics["rollout_pearson_r"]))
+        stats["rollout_pos_mse"].append(float(rollout_metrics["rollout_pos_mse"]))
+        stats["rollout_used"].append(int(rollout_metrics["used"]))
+        stats["rollout_total"].append(int(rollout_metrics["total"]))
 
-        should_log = (
-            (epoch + 1 == cfg.epochs)
-            or (val_every > 0 and (epoch + 1) % val_every == 0)
-            or (rollout_every > 0 and (epoch + 1) % rollout_every == 0)
-            or (cv_eval_every > 0 and (epoch + 1) % cv_eval_every == 0)
-        )
-        if verbose and should_log:
-            val_text = _fmt3g(val_loss)
-            if not isinstance(cv_text, str) or len(cv_text) == 0:
-                cv_text = f"|p|={_fmt3g(cv_abs_pearson_r)} r2={_fmt3g(cv_fit_r2)} (n={cv_used})"
-            gate_text = ""
+        if (epoch == cfg.epochs) or (val_every > 0 and epoch % val_every == 0) or (rollout_every > 0 and epoch % rollout_every == 0):
+            line = f"[ep {epoch:>3}/{cfg.epochs}] tr={_fmt3g(train_info['loss'])} va={_fmt3g(val_loss)} lr={_lr_text(optimizer)} "
             if hasattr(model, "cv_inject_scale"):
-                gate_text += f"cv_gate={_fmt3g(model.cv_inject_scale.detach().cpu().item())} "
-            if hasattr(model, "get_global_gate_stats"):
-                g = model.get_global_gate_stats()
-                gate_text += f"gmean={_fmt3g(g['mean'])} "
-            line = (
-                f"[ep {epoch + 1:>3}/{cfg.epochs}] "
-                f"tr={_fmt3g(train_loss)} va={val_text} lr={lr_text} "
-                f"{gate_text}"
+                line += f"cv_scale={_fmt3g(model.cv_inject_scale.detach().cpu().item())} "
+            if hasattr(model, "get_global_film_stats"):
+                line += f"film={_fmt3g(model.get_global_film_stats()['mean'])} "
+            line += (
+                f"roll=r2={_fmt3g(rollout_metrics['rollout_r2'])} "
+                f"p={_fmt3g(rollout_metrics['rollout_pearson_r'])} "
+                f"mse={_fmt3g(rollout_metrics['rollout_pos_mse'])} "
+                f"({int(rollout_metrics['used'])}/{int(rollout_metrics['total'])}) "
+                f"t={_fmt3g(epoch_seconds)}s"
             )
-            if cfg.model_type != "cv_transformer":
-                rollout_text = (
-                    f"r2={_fmt3g(rollout_r2)} p={_fmt3g(rollout_pearson_r)} "
-                    f"mse={_fmt3g(rollout_pos_mse)} ({rollout_used}/{rollout_total})"
-                )
-                line += f"roll={rollout_text} "
-            line += f"cv={cv_text} "
-            line += f"t={_fmt3g(epoch_seconds)}s"
             print(line, flush=True)
 
-    if verbose:
-        total_seconds = time.perf_counter() - train_start
-        print(f"[train] complete in {_fmt3g(total_seconds)}s", flush=True)
+    total_seconds = time.perf_counter() - train_start
+    print(f"[train] complete in {_fmt3g(total_seconds)}s", flush=True)
+    return stats
 
+
+def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, device: str, *, cv_eval_fn: Callable, checkpoint_fn: Callable):
+    optimizer = _build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.learning_rate_decay)
+    stats = _init_stats()
+    stats.update({
+        "cv_abs_pearson_r": [],
+        "cv_fit_r2": [],
+        "cv_used": [],
+    })
+    cv_eval_every = max(int(cfg.cv_eval_every), 0)
+    val_every = max(int(cfg.val_every), 0)
+    freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
+    train_start = time.perf_counter()
+    if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
+        print(
+            f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
+            f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
+            flush=True,
+        )
+
+    for epoch in range(1, cfg.epochs + 1):
+        epoch_start = time.perf_counter()
+        if hasattr(model, "freeze_normalizers"):
+            model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
+        train_info = _epoch_loss(model, train_data, cfg, device, model_inputs_cls, optimizer=optimizer)
+        val_info = None
+        val_loss = None
+        if val_every > 0 and epoch % val_every == 0:
+            with torch.no_grad():
+                val_info = _epoch_loss(model, val_data, cfg, device, model_inputs_cls, optimizer=None)
+                val_loss = float(val_info["loss"])
+
+        cv_metrics = {"cv_abs_pearson_r": float("nan"), "cv_fit_r2": float("nan"), "cv_used": 0, "cv_text": "|p|=nan r2=nan"}
+        if cv_eval_every > 0 and epoch % cv_eval_every == 0:
+            with torch.no_grad():
+                cv_metrics = _with_frozen_normalizers(model, cv_eval_fn)
+            checkpoint_fn(epoch, model, optimizer, scheduler, cv_metrics, float(train_info["loss"]), val_loss)
+
+        scheduler.step()
+        epoch_seconds = time.perf_counter() - epoch_start
+        _append_common_stats(stats, epoch, train_info, val_info, val_loss, optimizer, epoch_seconds, model)
+        stats["cv_abs_pearson_r"].append(float(cv_metrics["cv_abs_pearson_r"]))
+        stats["cv_fit_r2"].append(float(cv_metrics["cv_fit_r2"]))
+        stats["cv_used"].append(int(cv_metrics["cv_used"]))
+
+        if (epoch == cfg.epochs) or (val_every > 0 and epoch % val_every == 0) or (cv_eval_every > 0 and epoch % cv_eval_every == 0):
+            line = (
+                f"[ep {epoch:>3}/{cfg.epochs}] tr={_fmt3g(train_info['loss'])} va={_fmt3g(val_loss)} "
+                f"lr={_lr_text(optimizer)} cv={cv_metrics.get('cv_text', '|p|=nan r2=nan')} (n={int(cv_metrics['cv_used'])}) "
+                f"t={_fmt3g(epoch_seconds)}s"
+            )
+            print(line, flush=True)
+
+    total_seconds = time.perf_counter() - train_start
+    print(f"[train] complete in {_fmt3g(total_seconds)}s", flush=True)
     return stats

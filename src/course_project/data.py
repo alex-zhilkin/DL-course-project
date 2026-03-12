@@ -4,25 +4,12 @@ from pathlib import Path
 
 import torch
 
-from .compat import install_legacy_pickle_aliases
-
 
 def load_dataset(path: str | Path) -> list:
-    p = Path(path)
-    try:
-        data = torch.load(p, weights_only=False)
-    except ModuleNotFoundError:
-        install_legacy_pickle_aliases()
-        data = torch.load(p, weights_only=False)
-    return list(data)
+    return list(torch.load(Path(path), weights_only=False))
 
 
-def split_dataset(
-    path: str | Path,
-    *,
-    train_count: int,
-    val_count: int,
-) -> tuple[list, list, list]:
+def split_dataset(path: str | Path, *, train_count: int, val_count: int) -> tuple[list, list, list]:
     sims = load_dataset(path)
     train_count = int(train_count)
     val_count = int(val_count)

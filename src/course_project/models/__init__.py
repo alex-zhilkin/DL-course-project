@@ -4,55 +4,28 @@ from __future__ import annotations
 
 from torch_geometric.data import Data
 
-from .autoencoder import Model as AutoencoderModel
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
 from .spatial_simulator import Model as SpatialModel
-from .spatial_transformer_simulator import Model as SpatialTransformerModel
 
 MODEL_REGISTRY = {
-    "autoencoder": AutoencoderModel,
     "spatial": SpatialModel,
-    "spatial_transformer": SpatialTransformerModel,
     "cv_transformer": CVTransformerModel,
     "hybrid": HybridModel,
 }
 
 MODEL_EXTRAS_REQUIRED = {
-    "autoencoder": {
-        "num_mlp",
-        "K1",
-        "CV",
-        "transformer_layers",
-        "transformer_heads",
-        "transformer_dropout",
-        "edge_aggr",
-        "use_local_skip",
-    },
     "spatial": {
         "num_mlp",
     },
-    "spatial_transformer": {
-        "num_mlp",
-        "K1",
-        "K2",
-        "transformer_layers",
-        "transformer_heads",
-        "transformer_dropout",
-        "edge_aggr",
-        "k2_hidden_size",
-        "use_local_skip",
-    },
     "cv_transformer": {
         "num_mlp",
-        "K1",
-        "CV",
         "transformer_layers",
         "transformer_heads",
         "transformer_dropout",
-        "edge_aggr",
         "use_local_skip",
+        "token_sizes",
     },
     "hybrid": {
         "num_mlp",
@@ -61,17 +34,16 @@ MODEL_EXTRAS_REQUIRED = {
 }
 
 MODEL_EXTRAS_OPTIONAL = {
-    "autoencoder": {
-        "cv_hidden_size",
-    },
     "spatial": set(),
-    "spatial_transformer": set(),
     "cv_transformer": {
         "time_lag_steps",
         "time_lag_weight",
     },
     "hybrid": {
         "cv_inject_scale_init",
+        "cv_consistency_weight",
+        "time_lag_steps",
+        "time_lag_weight",
     },
 }
 
@@ -130,13 +102,10 @@ def create_model(
 
 
 __all__ = [
-    "AutoencoderModel",
     "BaseModelInputs",
     "HybridModel",
     "CVTransformerModel",
-    "LatentSpaceModel",
     "SpatialModel",
-    "SpatialTransformerModel",
     "MODEL_REGISTRY",
     "MODEL_EXTRAS_REQUIRED",
     "resolve_model_extras",

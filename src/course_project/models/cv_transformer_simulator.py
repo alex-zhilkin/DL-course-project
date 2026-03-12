@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.data import Data
 from torch_geometric.utils import to_dense_batch
 
-from .components import NodeEdgeFusionEncoder
+from ..utils import resolve_device
+from .base import BaseModelInputs, BaseSimulator
+from .common import get_correct_edge_vec
+from .components import NodeEdgeFusionEncoder, Normalizer
 from .cv_core import CVCoreConfig, CVCoreInput, SharedCVCore
-from .spatial_transformer_simulator import Model as SpatialTransformerModel
+
+ModelInputs = BaseModelInputs
 
 
-class GraphTokenAdapter(nn.Module):
+class GraphTokenAdapter(torch.nn.Module):
     def __init__(
         self,
         *,
@@ -19,7 +23,6 @@ class GraphTokenAdapter(nn.Module):
         in_edge_dim: int,
         hidden_size: int,
         num_mlp: int,
-        edge_aggr: str,
         use_local_skip: bool,
     ):
         super().__init__()
@@ -29,7 +32,6 @@ class GraphTokenAdapter(nn.Module):
             in_edge_dim=in_edge_dim,
             hidden_size=hidden_size,
             num_mlp=num_mlp,
-            edge_aggr=edge_aggr,
         )
 
     def build_core_input(self, data: Data) -> CVCoreInput:
@@ -40,7 +42,7 @@ class GraphTokenAdapter(nn.Module):
         return CVCoreInput(tokens=dense_tokens, mask=mask, local_skip=local_skip)
 
 
-class Model(SpatialTransformerModel):
+class Model(BaseSimulator):
     """Graph CV model with a shared transformer bottleneck core."""
 
     def __init__(
@@ -51,85 +53,80 @@ class Model(SpatialTransformerModel):
         pos_dim: int,
         *,
         num_mlp: int,
-        K1: int,
-        CV: int,
         transformer_layers: int,
         transformer_heads: int,
         transformer_dropout: float,
-        edge_aggr: str,
         use_local_skip: bool,
+        token_sizes: tuple[int, ...],
         time_lag_steps: int = 0,
         time_lag_weight: float = 0.0,
     ):
-        super().__init__(
-            data=data,
-            hidden_size=hidden_size,
-            n_layers=n_layers,
-            pos_dim=pos_dim,
-            num_mlp=num_mlp,
-            K1=K1,
-            K2=CV,
-            transformer_layers=transformer_layers,
-            transformer_heads=transformer_heads,
-            transformer_dropout=transformer_dropout,
-            edge_aggr=edge_aggr,
-            k2_hidden_size=1,
-            use_local_skip=use_local_skip,
-        )
+        super().__init__(pos_dim=pos_dim)
+        self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
+
+        self.device = data.x.device if hasattr(data, "x") and data.x is not None else resolve_device("auto")
+        self._expected_node_dim = int(data.num_features)
+        self.node_normalizer = Normalizer(size=self._expected_node_dim, name="NodeNormalizer", device=self.device)
+        self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=self.device)
+        self.output_normalizer = Normalizer(size=pos_dim, name="OutputNormalizer", device=self.device)
+
         self.adapter = GraphTokenAdapter(
             in_node_dim=self._expected_node_dim,
             in_edge_dim=data.num_edge_features,
             hidden_size=hidden_size,
             num_mlp=num_mlp,
-            edge_aggr=edge_aggr,
             use_local_skip=use_local_skip,
         )
         self.core = SharedCVCore(
             CVCoreConfig(
                 hidden_size=hidden_size,
-                K1=K1,
-                cv_count=CV,
                 output_dim=pos_dim,
                 transformer_layers=transformer_layers,
                 transformer_heads=transformer_heads,
                 transformer_dropout=transformer_dropout,
-                decode_mode="per_token",
+                token_sizes=token_sizes,
                 use_local_skip=use_local_skip,
             )
         )
-        self.k_cv = int(CV)
+        self.k_cv = int(token_sizes[-1])
         self.time_lag_steps = int(time_lag_steps)
         self.time_lag_weight = float(time_lag_weight)
+        self.freeze_normalizers = False
+
+    @staticmethod
+    def _current_velocity(inputs: ModelInputs) -> Tensor:
+        if hasattr(inputs.cur_graph, "vel_state"):
+            return inputs.cur_graph.vel_state
+        return inputs.cur_position - inputs.prev_position
+
+    def _norm_training(self, is_training: bool) -> bool:
+        return bool(self.training) and bool(is_training) and (not self.freeze_normalizers)
+
+    def normalize_graph(self, graph: Data, is_training: bool = True) -> Data:
+        norm_training = self._norm_training(is_training)
+        norm_nodes = self.node_normalizer(graph.x, is_training=norm_training)
+        norm_edges = self.edge_normalizer(graph.edge_attr, is_training=norm_training)
+        return Data(
+            x=norm_nodes,
+            edge_index=graph.edge_index,
+            edge_attr=norm_edges,
+            box=graph.box if hasattr(graph, "box") else None,
+            batch=graph.batch if hasattr(graph, "batch") else None,
+            dtype=torch.float,
+        )
 
     def _forward_core(
         self,
         data: Data,
-        *,
-        return_context: bool = False,
-        return_attn: bool = False,
-        return_z2: bool = False,
         use_tau_head: bool = False,
     ):
         core_input = self.adapter.build_core_input(data)
         if use_tau_head:
             pred_dense = self.core.predict_tau(core_input)
-            self.last_cv = self.core.last_cv.detach()
             return pred_dense[core_input.mask]
 
-        output = self.core(core_input, return_attn=return_attn, return_z2=return_z2)
-        self.last_cv = output.cv.detach()
+        output = self.core(core_input)
         pred = output.prediction[core_input.mask]
-
-        if return_context and return_attn:
-            if return_z2:
-                return pred, output.global_context[core_input.mask], output.attn, output.token_state
-            return pred, output.global_context[core_input.mask], output.attn
-        if return_context:
-            if return_z2:
-                return pred, output.global_context[core_input.mask], output.token_state
-            return pred, output.global_context[core_input.mask]
-        if return_z2:
-            return pred, output.token_state
         return pred
 
     def predict_time_lag_acc(self, data: Data, *, is_training: bool = True) -> Tensor:
@@ -139,21 +136,67 @@ class Model(SpatialTransformerModel):
     def forward(
         self,
         data: Data,
-        *,
-        return_context: bool = False,
-        return_attn: bool = False,
-        return_z2: bool = False,
         is_training: bool = True,
     ):
         data = self.normalize_graph(data, is_training=is_training)
-        return self._forward_core(
-            data,
-            return_context=return_context,
-            return_attn=return_attn,
-            return_z2=return_z2,
-        )
+        return self._forward_core(data)
 
     def extract_cv(self, data: Data, *, is_training: bool = False) -> Tensor:
         data = self.normalize_graph(data, is_training=is_training)
-        _pred, _z2 = self._forward_core(data, return_z2=True)
-        return self.last_cv
+        self._forward_core(data)
+        return self.core.last_cv.detach()
+
+    @classmethod
+    def _recalc_edges(cls, data: Data, pos_dim: int | None = None) -> Tensor:
+        edge_vectors = get_correct_edge_vec(data, pos_dim=pos_dim)
+        distances = torch.norm(edge_vectors, dim=1)
+        bond_coeffs = data.edge_attr[:, -1]
+        return torch.column_stack([edge_vectors, distances, bond_coeffs])
+
+    def update(self, inputs: ModelInputs, model_output: Tensor) -> Data:
+        predicted = self.output_normalizer.inverse(model_output)
+        cur_velocity = self._current_velocity(inputs)
+        if hasattr(inputs.cur_graph, "vel_state"):
+            updated_velocity = cur_velocity + predicted
+        else:
+            updated_velocity = predicted
+        predicted_position = inputs.cur_position + updated_velocity
+
+        tmp = Data(
+            x=predicted_position.clone().float(),
+            edge_index=inputs.cur_graph.edge_index,
+            edge_attr=inputs.cur_graph.edge_attr.float(),
+            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
+            dtype=torch.float32,
+        )
+        new_edge_attr = self._recalc_edges(tmp, self.pos_dim)
+
+        predicted_graph = Data(
+            x=predicted_position.float(),
+            edge_index=inputs.cur_graph.edge_index,
+            edge_attr=new_edge_attr.float(),
+            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
+            dtype=torch.float32,
+        )
+        predicted_graph.vel_state = updated_velocity.detach()
+        return predicted_graph
+
+    def loss(
+        self,
+        model_output: Tensor,
+        inputs: ModelInputs,
+        *,
+        accumulate_norm_stats: bool | None = None,
+    ) -> Tensor:
+        cur_velocity = self._current_velocity(inputs)
+        target_velocity = inputs.target_position - inputs.cur_position
+        norm_training = self._norm_training(self.training if accumulate_norm_stats is None else accumulate_norm_stats)
+        target_velocity_change = target_velocity - cur_velocity
+        target_velocity_change_normalized = self.output_normalizer(target_velocity_change, is_training=norm_training)
+        return F.mse_loss(model_output, target_velocity_change_normalized)
+
+    def save_checkpoint(self, savedir: str, *, training_state: dict):
+        torch.save(self._checkpoint_payload(training_state), savedir)
+
+    def load_checkpoint(self, ckpdir: str):
+        self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))

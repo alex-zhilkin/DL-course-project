@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "course-project"
+version = "0.1.0"
+description = "Course project models for collective variables and elastic network dynamics."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "torch",
+    "optuna",
+    "torch_geometric",
+    "graph_utils @ git+https://github.com/MendelsResearchGroup/graph_utils.git",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -20,11 +20,6 @@ def clone_graph(graph: Data) -> Data:
 
 def build_graph(input_graphs: list[Data]) -> Data:
     """Build model input graph using positions as node features."""
-    if len(input_graphs) < 1:
-        raise ValueError("no graphs provided")
-    if not all(isinstance(obj, Data) for obj in input_graphs):
-        raise TypeError("all input_graphs must be torch_geometric.data.Data")
-
     base_graph = input_graphs[-1]
     data = clone_graph(base_graph)
     if not hasattr(data, "t"):

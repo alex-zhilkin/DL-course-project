@@ -8,6 +8,7 @@ from torch import Tensor
 from torch_geometric.data import Data
 
 from .base import BaseModelInputs, BaseSimulator
+from ..utils import resolve_device
 from .common import build_mlp, get_correct_edge_vec
 from .components import LocalGNNBackbone, Normalizer
 from .cv_transformer_simulator import Model as CVTransformerModel
@@ -29,23 +30,18 @@ class Model(BaseSimulator):
         num_mlp: int,
         cv_checkpoint_path: str,
         cv_inject_scale_init: float = 1.0,
+        cv_consistency_weight: float = 0.0,
+        time_lag_steps: int = 0,
+        time_lag_weight: float = 0.0,
     ):
         super().__init__(pos_dim=pos_dim)
         self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
 
-        if hasattr(data, "x") and data.x is not None:
-            dev = data.x.device
-        elif torch.cuda.is_available():
-            dev = "cuda"
-        elif torch.backends.mps.is_available():
-            dev = "mps"
-        else:
-            dev = "cpu"
-        self.device = dev
+        self.device = data.x.device if hasattr(data, "x") and data.x is not None else resolve_device("auto")
 
-        self.node_normalizer = Normalizer(size=data.num_features, name="NodeNormalizer", device=dev)
-        self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=dev)
-        self.output_normalizer = Normalizer(size=pos_dim, name="OutputNormalizer", device=dev)
+        self.node_normalizer = Normalizer(size=data.num_features, name="NodeNormalizer", device=self.device)
+        self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=self.device)
+        self.output_normalizer = Normalizer(size=pos_dim, name="OutputNormalizer", device=self.device)
 
         self.backbone = LocalGNNBackbone(
             in_node_dim=data.num_features,
@@ -61,40 +57,37 @@ class Model(BaseSimulator):
             pos_dim=pos_dim,
         )
         self.cv_dim = int(self.cv_encoder.k_cv)
-        self.cv_injector = build_mlp(
+        self.cv_film = build_mlp(
             self.cv_dim,
             hidden_size,
-            hidden_size,
-            num_mlp=max(2, num_mlp - 1),
-            lay_norm=False,
-        )
-        self.cv_node_gate = build_mlp(
-            hidden_size + hidden_size,
-            hidden_size,
-            1,
+            hidden_size * 2,
             num_mlp=2,
             lay_norm=False,
         )
-        self.decoder = build_mlp(hidden_size + hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
+        self.decoder = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
+        self.decoder_tau = build_mlp(
+            hidden_size,
+            hidden_size,
+            pos_dim,
+            num_mlp=num_mlp,
+            lay_norm=False,
+        )
         self.cv_inject_scale = torch.nn.Parameter(
             torch.tensor(float(cv_inject_scale_init), dtype=torch.float32)
         )
+        self.cv_consistency_weight = float(cv_consistency_weight)
+        self.time_lag_steps = int(time_lag_steps)
+        self.time_lag_weight = float(time_lag_weight)
 
         self.last_cv = None
-        self._gate_mean_sum = 0.0
-        self._gate_mean_count = 0
-        self._last_gate_mean = 0.0
+        self._film_mean_sum = 0.0
+        self._film_mean_count = 0
+        self._last_film_mean = 0.0
         self.freeze_normalizers = False
 
         self.cv_encoder.eval()
         for p in self.cv_encoder.parameters():
             p.requires_grad = False
-
-    def set_epoch(self, epoch: int):
-        super().set_epoch(epoch)
-        self._gate_mean_sum = 0.0
-        self._gate_mean_count = 0
-        self._last_gate_mean = 0.0
 
     def _load_frozen_cv_encoder(
         self,
@@ -103,19 +96,19 @@ class Model(BaseSimulator):
         pos_dim: int,
     ) -> CVTransformerModel:
         payload = torch.load(str(Path(self.cv_checkpoint_path)), map_location="cpu", weights_only=False)
-        cfg = payload["model_config"] if "model_config" in payload else payload["cfg"]
+        cfg = payload["model_config"]
         extras = cfg["model_extras"]
 
         cv_hidden = int(cfg["hidden_size"])
         cv_layers = int(cfg["n_layers"])
         cv_num_mlp = int(extras["num_mlp"])
-        cv_k1 = int(extras["K1"])
-        cv_cv = int(extras["CV"])
         cv_t_layers = int(extras["transformer_layers"])
         cv_t_heads = int(extras["transformer_heads"])
         cv_t_drop = float(extras["transformer_dropout"])
-        edge_aggr = extras["edge_aggr"]
         use_local_skip = bool(extras["use_local_skip"])
+        token_sizes = tuple(int(v) for v in extras["token_sizes"])
+        time_lag_steps = int(extras.get("time_lag_steps", 0))
+        time_lag_weight = float(extras.get("time_lag_weight", 0.0))
 
         encoder = CVTransformerModel(
             data=data,
@@ -123,16 +116,15 @@ class Model(BaseSimulator):
             n_layers=cv_layers,
             pos_dim=pos_dim,
             num_mlp=cv_num_mlp,
-            K1=cv_k1,
-            CV=cv_cv,
             transformer_layers=cv_t_layers,
             transformer_heads=cv_t_heads,
             transformer_dropout=cv_t_drop,
-            edge_aggr=edge_aggr,
             use_local_skip=use_local_skip,
+            token_sizes=token_sizes,
+            time_lag_steps=time_lag_steps,
+            time_lag_weight=time_lag_weight,
         ).to(self.device)
-        state = payload["model"] if "model" in payload else payload["model_state_dict"]
-        encoder.load_state_dict(state, strict=False)
+        encoder.load_state_dict(payload["model"])
         return encoder
 
     @staticmethod
@@ -157,62 +149,88 @@ class Model(BaseSimulator):
             dtype=torch.float,
         )
 
-    def _encode_with_cv(self, norm_graph: Data, raw_graph: Data) -> tuple[Data, Tensor]:
-        latent = self.backbone(norm_graph)
+    @staticmethod
+    def _node_batch(data: Data) -> Tensor:
+        if hasattr(data, "batch") and data.batch is not None:
+            return data.batch
+        return torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
 
+    def _apply_film(self, x: Tensor, cv: Tensor, batch: Tensor) -> tuple[Tensor, Tensor]:
+        gamma_beta = self.cv_film(cv)[batch]
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+        out = x * (1.0 + self.cv_inject_scale * gamma) + self.cv_inject_scale * beta
+        strength = 0.5 * (gamma.abs().mean() + beta.abs().mean())
+        return out, strength
+
+    def _encode_with_cv(self, norm_graph: Data, raw_graph: Data) -> Data:
         with torch.no_grad():
             self.cv_encoder.eval()
             cv = self.cv_encoder.extract_cv(raw_graph, is_training=False)
         self.last_cv = cv.detach()
+        batch = self._node_batch(norm_graph)
 
-        if hasattr(latent, "batch") and latent.batch is not None:
-            batch = latent.batch
-        else:
-            batch = torch.zeros(latent.x.size(0), dtype=torch.long, device=latent.x.device)
-
-        cv_hidden = self.cv_injector(cv)
-        cv_nodes = cv_hidden[batch]
-        node_gate = torch.sigmoid(self.cv_node_gate(torch.cat([latent.x, cv_nodes], dim=1)))
-        latent.x = latent.x + self.cv_inject_scale * node_gate * cv_nodes
+        latent = Data(
+            x=self.backbone.node_encoder(norm_graph.x),
+            edge_index=norm_graph.edge_index,
+            edge_attr=self.backbone.edge_encoder(norm_graph.edge_attr),
+            box=norm_graph.box if hasattr(norm_graph, "box") else None,
+            batch=batch,
+            dtype=torch.float,
+        )
+        split_idx = max(1, len(self.backbone.layers) // 2)
+        for layer in self.backbone.layers[:split_idx]:
+            latent = layer(latent)
+        latent.x, film_strength = self._apply_film(latent.x, cv, batch)
+        for layer in self.backbone.layers[split_idx:]:
+            latent = layer(latent)
         if self.training:
-            self._last_gate_mean = float(node_gate.detach().mean().cpu().item())
-            self._gate_mean_sum += self._last_gate_mean
-            self._gate_mean_count += 1
-        return latent, cv_nodes
+            self._last_film_mean = float(film_strength.detach().cpu().item())
+            self._film_mean_sum += self._last_film_mean
+            self._film_mean_count += 1
+        return latent
 
-    def get_global_gate_stats(self) -> dict:
+    def get_global_film_stats(self) -> dict:
         return {
-            "mean": self._gate_mean_sum / self._gate_mean_count,
-            "last": self._last_gate_mean,
+            "mean": self._film_mean_sum / self._film_mean_count,
+            "last": self._last_film_mean,
         }
 
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
         norm_graph = self.normalize_graph(data, is_training=is_training)
-        latent, cv_nodes = self._encode_with_cv(norm_graph, data)
-        return self.decoder(torch.cat([latent.x, cv_nodes], dim=1))
+        latent = self._encode_with_cv(norm_graph, data)
+        return self.decoder(latent.x)
+
+    def predict_time_lag_acc(self, data: Data, *, is_training: bool = True) -> Tensor:
+        norm_graph = self.normalize_graph(data, is_training=is_training)
+        latent = self._encode_with_cv(norm_graph, data)
+        return self.decoder_tau(latent.x)
 
     def extract_cv(self, data: Data, *, is_training: bool = False) -> Tensor:
         with torch.no_grad():
             self.cv_encoder.eval()
             return self.cv_encoder.extract_cv(data, is_training=False).detach()
 
-    @classmethod
+    def cv_consistency_loss(self, pred_graph: Data, target_graph: Data) -> Tensor:
+        with torch.no_grad():
+            self.cv_encoder.eval()
+            target_cv = self.cv_encoder.extract_cv(target_graph, is_training=False).detach()
+        pred_cv = self.cv_encoder.extract_cv(pred_graph, is_training=False)
+        return F.mse_loss(pred_cv, target_cv)
+
+
     def _recalc_edges(
         cls,
         data: Data,
-        dummy_sep: bool = False,
         pos_dim: int | None = None,
     ) -> Tensor:
         edge_vectors = get_correct_edge_vec(data, pos_dim=pos_dim)
         distances = torch.norm(edge_vectors, dim=1)
-        bond_coeffs = data.edge_attr[:, -1] if not dummy_sep else data.edge_attr[:, -2]
-        return (
-            torch.column_stack([edge_vectors, distances, bond_coeffs])
-            if not dummy_sep
-            else torch.column_stack([edge_vectors, distances, bond_coeffs, data.edge_attr[:, -1]])
-        )
+        bond_coeffs = data.edge_attr[:, -1]
+        return torch.column_stack([edge_vectors, distances, bond_coeffs])
 
-    def update(self, inputs: ModelInputs, model_output: Tensor, dummy_sep: bool = False) -> Data:
+    def update(self, inputs: ModelInputs, model_output: Tensor) -> Data:
         predicted = self.output_normalizer.inverse(model_output)
         cur_velocity = self._current_velocity(inputs)
         updated_velocity = cur_velocity + predicted
@@ -225,7 +243,7 @@ class Model(BaseSimulator):
             box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
             dtype=torch.float32,
         )
-        new_edge_attr = self._recalc_edges(tmp, dummy_sep, self.pos_dim)
+        new_edge_attr = self._recalc_edges(tmp, self.pos_dim)
 
         predicted_graph = Data(
             x=predicted_position.float(),
@@ -257,40 +275,7 @@ class Model(BaseSimulator):
         return F.mse_loss(model_output, target_velocity_change_normalized)
 
     def save_checkpoint(self, savedir: str, *, training_state: dict):
-        model = self.state_dict()
-        _output_normalizer = self.output_normalizer.get_variable()
-        _node_normalizer = self.node_normalizer.get_variable()
-        _edge_normalizer = self.edge_normalizer.get_variable()
-
-        to_save = {
-            "model": model,
-            "output_normalizer": _output_normalizer,
-            "node_normalizer": _node_normalizer,
-            "edge_normalizer": _edge_normalizer,
-            "model_config": self.cfg,
-        }
-        to_save.update(training_state)
-        torch.save(to_save, savedir)
+        torch.save(self._checkpoint_payload(training_state), savedir)
 
     def load_checkpoint(self, ckpdir: str):
-        dicts = torch.load(ckpdir, weights_only=False, map_location="cpu")
-        self.load_state_dict(dicts["model"], strict=False)
-        self.cfg = dicts["model_config"]
-        for para, value in dicts["output_normalizer"].items():
-            cur = getattr(self.output_normalizer, para)
-            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
-                cur.copy_(value)
-            else:
-                setattr(self.output_normalizer, para, value)
-        for para, value in dicts["node_normalizer"].items():
-            cur = getattr(self.node_normalizer, para)
-            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
-                cur.copy_(value)
-            else:
-                setattr(self.node_normalizer, para, value)
-        for para, value in dicts["edge_normalizer"].items():
-            cur = getattr(self.edge_normalizer, para)
-            if isinstance(cur, torch.Tensor) and isinstance(value, torch.Tensor):
-                cur.copy_(value)
-            else:
-                setattr(self.edge_normalizer, para, value)
+        self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))
