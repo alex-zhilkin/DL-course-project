@@ -6,8 +6,7 @@ Install the dependencies first:
 pip install -e .
 ```
 
-Download the data and put it in `data/`.
-Add the download link here later.
+Download [the data](https://drive.google.com/file/d/1KTWN1Rp-vs5eKmip4tH5tS77y5HUX_CH/view?usp=sharing) and put it in `data/`.
 
 Then run the notebooks in `notebooks/`.
 The main ones are:
