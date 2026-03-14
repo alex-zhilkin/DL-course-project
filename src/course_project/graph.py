@@ -5,13 +5,14 @@ from torch_geometric.data import Data
 
 
 def clone_graph(graph: Data) -> Data:
+    batch = graph.batch.clone() if getattr(graph, 'batch', None) is not None else torch.zeros(graph.x.size(0), dtype=torch.long, device=graph.x.device)
     out = Data(
         x=graph.x.clone(),
         edge_index=graph.edge_index.clone(),
-        edge_attr=graph.edge_attr.clone() if graph.edge_attr is not None else None,
-        box=graph.box if hasattr(graph, "box") else None,
-        t=graph.t if hasattr(graph, "t") else None,
-        batch=graph.batch.clone() if hasattr(graph, "batch") and graph.batch is not None else None,
+        edge_attr=graph.edge_attr.clone(),
+        box=graph.box,
+        t=getattr(graph, 't', None),
+        batch=batch,
     )
     if hasattr(graph, "vel_state"):
         out.vel_state = graph.vel_state.clone()
@@ -20,13 +21,7 @@ def clone_graph(graph: Data) -> Data:
 
 def build_graph(input_graphs: list[Data]) -> Data:
     """Build model input graph using positions as node features."""
-    base_graph = input_graphs[-1]
-    data = clone_graph(base_graph)
-    if not hasattr(data, "t"):
-        data.t = None
-    if hasattr(base_graph, "vel_state"):
-        data.vel_state = base_graph.vel_state
-    return data
+    return clone_graph(input_graphs[-1])
 
 
 def rollout(

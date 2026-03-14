@@ -8,7 +8,6 @@ from torch import Tensor
 from torch_geometric.data import Data
 
 from .base import BaseModelInputs, BaseSimulator
-from ..utils import resolve_device
 from .common import build_mlp, get_correct_edge_vec
 from .components import LocalGNNBackbone, Normalizer
 from .cv_transformer_simulator import Model as CVTransformerModel
@@ -18,7 +17,7 @@ torch.set_default_dtype(torch.float32)
 
 
 class Model(BaseSimulator):
-    """Spatial simulator with frozen CV encoder injection."""
+    """Local GNN with a frozen CV model (global context) injected in the middle"""
 
     def __init__(
         self,
@@ -37,7 +36,7 @@ class Model(BaseSimulator):
         super().__init__(pos_dim=pos_dim)
         self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
 
-        self.device = data.x.device if hasattr(data, "x") and data.x is not None else resolve_device("auto")
+        self.device = data.x.device
 
         self.node_normalizer = Normalizer(size=data.num_features, name="NodeNormalizer", device=self.device)
         self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=self.device)
@@ -73,7 +72,7 @@ class Model(BaseSimulator):
             lay_norm=False,
         )
         self.cv_inject_scale = torch.nn.Parameter(
-            torch.tensor(float(cv_inject_scale_init), dtype=torch.float32)
+            torch.tensor(float(cv_inject_scale_init))
         )
         self.cv_consistency_weight = float(cv_consistency_weight)
         self.time_lag_steps = int(time_lag_steps)
@@ -129,9 +128,7 @@ class Model(BaseSimulator):
 
     @staticmethod
     def _current_velocity(inputs: ModelInputs) -> Tensor:
-        if hasattr(inputs.cur_graph, "vel_state"):
-            return inputs.cur_graph.vel_state
-        return inputs.cur_position - inputs.prev_position
+        return inputs.cur_graph.vel_state
 
     def _norm_training(self, is_training: bool) -> bool:
         return bool(self.training) and bool(is_training) and (not self.freeze_normalizers)
@@ -144,16 +141,13 @@ class Model(BaseSimulator):
             x=norm_nodes,
             edge_index=graph.edge_index,
             edge_attr=norm_edges,
-            box=graph.box if hasattr(graph, "box") else None,
-            batch=graph.batch if hasattr(graph, "batch") else None,
-            dtype=torch.float,
+            box=graph.box,
+            batch=graph.batch,
         )
 
     @staticmethod
     def _node_batch(data: Data) -> Tensor:
-        if hasattr(data, "batch") and data.batch is not None:
-            return data.batch
-        return torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        return data.batch
 
     def _apply_film(self, x: Tensor, cv: Tensor, batch: Tensor) -> tuple[Tensor, Tensor]:
         gamma_beta = self.cv_film(cv)[batch]
@@ -175,9 +169,8 @@ class Model(BaseSimulator):
             x=self.backbone.node_encoder(norm_graph.x),
             edge_index=norm_graph.edge_index,
             edge_attr=self.backbone.edge_encoder(norm_graph.edge_attr),
-            box=norm_graph.box if hasattr(norm_graph, "box") else None,
+            box=norm_graph.box,
             batch=batch,
-            dtype=torch.float,
         )
         split_idx = max(1, len(self.backbone.layers) // 2)
         for layer in self.backbone.layers[:split_idx]:
@@ -240,8 +233,7 @@ class Model(BaseSimulator):
             x=predicted_position.clone().float(),
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=inputs.cur_graph.edge_attr.float(),
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            dtype=torch.float32,
+            box=inputs.cur_graph.box,
         )
         new_edge_attr = self._recalc_edges(tmp, self.pos_dim)
 
@@ -249,8 +241,7 @@ class Model(BaseSimulator):
             x=predicted_position.float(),
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=new_edge_attr.float(),
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            dtype=torch.float32,
+            box=inputs.cur_graph.box,
         )
         predicted_graph.vel_state = updated_velocity.detach()
         return predicted_graph
@@ -273,9 +264,3 @@ class Model(BaseSimulator):
             is_training=norm_training,
         )
         return F.mse_loss(model_output, target_velocity_change_normalized)
-
-    def save_checkpoint(self, savedir: str, *, training_state: dict):
-        torch.save(self._checkpoint_payload(training_state), savedir)
-
-    def load_checkpoint(self, ckpdir: str):
-        self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))

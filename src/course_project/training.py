@@ -9,12 +9,13 @@ import torch.nn.functional as F
 from .graph import build_graph, clone_graph
 
 
-def _fmt3g(value) -> str:
+def _3g(value) -> str:
     return f"{float(value):.3g}"
 
 
 def _build_graph_at_index(sim, index: int, cfg, device: str):
     frames = [clone_graph(sim[i]).to(device) for i in range(index - cfg.history, index + 1)]
+    
     if len(frames) > 1:
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
     return build_graph(input_graphs=frames).to(device)
@@ -32,20 +33,18 @@ def _build_optimizer(model, cfg):
 
 
 def _lr_text(optimizer) -> str:
-    return _fmt3g(optimizer.param_groups[0]["lr"])
+    return _3g(optimizer.param_groups[0]["lr"])
 
 
 def _with_frozen_normalizers(model, fn: Callable):
     was_training = model.training
-    prev_freeze = getattr(model, "freeze_normalizers", None)
+    prev_freeze = model.freeze_normalizers
     model.eval()
-    if hasattr(model, "freeze_normalizers"):
-        model.freeze_normalizers = True
+    model.freeze_normalizers = True
     try:
         return fn(model)
     finally:
-        if hasattr(model, "freeze_normalizers"):
-            model.freeze_normalizers = prev_freeze
+        model.freeze_normalizers = prev_freeze
         model.train(was_training)
 
 
@@ -71,7 +70,7 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
     }
 
     cv_consistency_weight = float(getattr(model, "cv_consistency_weight", 0.0))
-    if hasattr(model, "cv_consistency_loss") and cv_consistency_weight > 0.0:
+    if cv_consistency_weight > 0.0:
         pred_graph = model.update(model_inputs, pred)
         cv_loss = model.cv_consistency_loss(pred_graph, target_graph)
         parts["cv_consistency_loss"] = cv_loss.detach()
@@ -79,7 +78,7 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
 
     lag_steps = int(getattr(model, "time_lag_steps", 0))
     lag_weight = float(getattr(model, "time_lag_weight", 0.0))
-    if hasattr(model, "predict_time_lag_acc") and lag_steps > 0 and lag_weight > 0.0 and index + lag_steps < len(sim):
+    if lag_steps > 0 and lag_weight > 0.0 and index + lag_steps < len(sim):
         graph_t = _build_graph_at_index(sim, index, cfg, device)
         pred_tau = model.predict_time_lag_acc(graph_t, is_training=is_train)
 
@@ -90,8 +89,7 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
         cur_t_vel = cur_t_pos - prev_t_pos
         cur_tau_vel = cur_tau_pos - prev_tau_pos
         target_tau_acc = (cur_tau_vel - cur_t_vel) / float(lag_steps)
-        if hasattr(model, "output_normalizer"):
-            target_tau_acc = model.output_normalizer(target_tau_acc, is_training=bool(is_train))
+        target_tau_acc = model.output_normalizer(target_tau_acc, is_training=bool(is_train))
         lag_loss = F.mse_loss(pred_tau, target_tau_acc.detach())
         parts["lag_loss"] = lag_loss.detach()
         total_loss = total_loss + lag_weight * lag_loss
@@ -101,9 +99,9 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
 
 def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None):
     is_train = optimizer is not None
-    prev_freeze = getattr(model, "freeze_normalizers", None) if hasattr(model, "freeze_normalizers") else None
+    prev_freeze = model.freeze_normalizers
     model.train(is_train)
-    if not is_train and hasattr(model, "freeze_normalizers"):
+    if not is_train:
         model.freeze_normalizers = True
 
     loss_sum = 0.0
@@ -125,15 +123,15 @@ def _epoch_loss(model, sims, cfg, device: str, model_inputs_cls, optimizer=None)
             lag_loss_sum += float(parts["lag_loss"].cpu().item())
             steps += 1
 
-    denom = max(steps, 1)
     out = {
-        "loss": loss_sum / denom,
-        "cv_consistency_loss": cv_consistency_loss_sum / denom,
-        "lag_loss": lag_loss_sum / denom,
+        "loss": loss_sum / steps,
+        "cv_consistency_loss": cv_consistency_loss_sum / steps,
+        "lag_loss": lag_loss_sum / steps,
         "steps": steps,
     }
-    if not is_train and hasattr(model, "freeze_normalizers"):
+    if not is_train:
         model.freeze_normalizers = prev_freeze
+        
     return out
 
 
@@ -165,10 +163,11 @@ def _append_common_stats(stats, epoch, train_info, val_info, val_loss, optimizer
     stats["epoch_seconds"].append(epoch_seconds)
     cv_scale = float("nan")
     cv_film_mean = float("nan")
-    if hasattr(model, "cv_inject_scale"):
+    if getattr(model, "cv_inject_scale", None) is not None:
         cv_scale = float(model.cv_inject_scale.detach().cpu().item())
-    if hasattr(model, "get_global_film_stats"):
-        cv_film_mean = float(model.get_global_film_stats()["mean"])
+    get_global_film_stats = getattr(model, "get_global_film_stats", None)
+    if get_global_film_stats is not None:
+        cv_film_mean = float(get_global_film_stats()["mean"])
     stats["cv_scale"].append(cv_scale)
     stats["cv_film_mean"].append(cv_film_mean)
 
@@ -188,17 +187,16 @@ def train_graph_model(model, model_inputs_cls, train_data, val_data, cfg, device
     val_every = max(int(cfg.val_every), 0)
     freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
     train_start = time.perf_counter()
-    if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
+    if getattr(model, "time_lag_steps", None) is not None:
         print(
-            f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
-            f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
+            f"[train] time-lag loss tau={int(model.time_lag_steps)} "
+            f"lambda={float(model.time_lag_weight):.3g}",
             flush=True,
         )
 
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
-        if hasattr(model, "freeze_normalizers"):
-            model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
+        model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
         train_info = _epoch_loss(model, train_data, cfg, device, model_inputs_cls, optimizer=optimizer)
         val_info = None
         val_loss = None
@@ -223,22 +221,23 @@ def train_graph_model(model, model_inputs_cls, train_data, val_data, cfg, device
         stats["rollout_total"].append(int(rollout_metrics["total"]))
 
         if (epoch == cfg.epochs) or (val_every > 0 and epoch % val_every == 0) or (rollout_every > 0 and epoch % rollout_every == 0):
-            line = f"[ep {epoch:>3}/{cfg.epochs}] tr={_fmt3g(train_info['loss'])} va={_fmt3g(val_loss)} lr={_lr_text(optimizer)} "
-            if hasattr(model, "cv_inject_scale"):
-                line += f"cv_scale={_fmt3g(model.cv_inject_scale.detach().cpu().item())} "
-            if hasattr(model, "get_global_film_stats"):
-                line += f"film={_fmt3g(model.get_global_film_stats()['mean'])} "
+            line = f"[ep {epoch:>3}/{cfg.epochs}] tr={_3g(train_info['loss'])} va={_3g(val_loss)} lr={_lr_text(optimizer)} "
+            if getattr(model, "cv_inject_scale", None) is not None:
+                line += f"cv_scale={_3g(model.cv_inject_scale.detach().cpu().item())} "
+            get_global_film_stats = getattr(model, "get_global_film_stats", None)
+            if get_global_film_stats is not None:
+                line += f"film={_3g(get_global_film_stats()['mean'])} "
             line += (
-                f"roll=r2={_fmt3g(rollout_metrics['rollout_r2'])} "
-                f"p={_fmt3g(rollout_metrics['rollout_pearson_r'])} "
-                f"mse={_fmt3g(rollout_metrics['rollout_pos_mse'])} "
+                f"roll=r2={_3g(rollout_metrics['rollout_r2'])} "
+                f"p={_3g(rollout_metrics['rollout_pearson_r'])} "
+                f"mse={_3g(rollout_metrics['rollout_pos_mse'])} "
                 f"({int(rollout_metrics['used'])}/{int(rollout_metrics['total'])}) "
-                f"t={_fmt3g(epoch_seconds)}s"
+                f"t={_3g(epoch_seconds)}s"
             )
             print(line, flush=True)
 
     total_seconds = time.perf_counter() - train_start
-    print(f"[train] complete in {_fmt3g(total_seconds)}s", flush=True)
+    print(f"[train] complete in {_3g(total_seconds)}s", flush=True)
     return stats
 
 
@@ -255,17 +254,16 @@ def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, dev
     val_every = max(int(cfg.val_every), 0)
     freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
     train_start = time.perf_counter()
-    if hasattr(model, "time_lag_steps") and hasattr(model, "time_lag_weight"):
+    if getattr(model, "time_lag_steps", None) is not None:
         print(
-            f"[train] time-lag loss tau={int(getattr(model, 'time_lag_steps', 0))} "
-            f"lambda={float(getattr(model, 'time_lag_weight', 0.0)):.3g}",
+            f"[train] time-lag loss tau={int(model.time_lag_steps)} "
+            f"lambda={float(model.time_lag_weight):.3g}",
             flush=True,
         )
 
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
-        if hasattr(model, "freeze_normalizers"):
-            model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
+        model.freeze_normalizers = bool(freeze_norm_after > 0 and epoch > freeze_norm_after)
         train_info = _epoch_loss(model, train_data, cfg, device, model_inputs_cls, optimizer=optimizer)
         val_info = None
         val_loss = None
@@ -274,7 +272,7 @@ def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, dev
                 val_info = _epoch_loss(model, val_data, cfg, device, model_inputs_cls, optimizer=None)
                 val_loss = float(val_info["loss"])
 
-        cv_metrics = {"cv_abs_pearson_r": float("nan"), "cv_fit_r2": float("nan"), "cv_used": 0, "cv_text": "|p|=nan r2=nan"}
+        cv_metrics = {"cv_abs_pearson_r": float("nan"), "cv_fit_r2": float("nan"), "cv_used": 0, "best_cv_name": None}
         if cv_eval_every > 0 and epoch % cv_eval_every == 0:
             with torch.no_grad():
                 cv_metrics = _with_frozen_normalizers(model, cv_eval_fn)
@@ -288,13 +286,16 @@ def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, dev
         stats["cv_used"].append(int(cv_metrics["cv_used"]))
 
         if (epoch == cfg.epochs) or (val_every > 0 and epoch % val_every == 0) or (cv_eval_every > 0 and epoch % cv_eval_every == 0):
+            best_cv_name = cv_metrics.get("best_cv_name")
+            cv_text = "|p|=nan r2=nan" if best_cv_name is None else f"{best_cv_name} |p|={_3g(cv_metrics['cv_abs_pearson_r'])} r2={_3g(cv_metrics['cv_fit_r2'])}"
             line = (
-                f"[ep {epoch:>3}/{cfg.epochs}] tr={_fmt3g(train_info['loss'])} va={_fmt3g(val_loss)} "
-                f"lr={_lr_text(optimizer)} cv={cv_metrics.get('cv_text', '|p|=nan r2=nan')} (n={int(cv_metrics['cv_used'])}) "
-                f"t={_fmt3g(epoch_seconds)}s"
+                f"[ep {epoch:>3}/{cfg.epochs}] tr={_3g(train_info['loss'])} va={_3g(val_loss)} "
+                f"lr={_lr_text(optimizer)} cv={cv_text} (n={int(cv_metrics['cv_used'])}) "
+                f"t={_3g(epoch_seconds)}s"
             )
             print(line, flush=True)
 
     total_seconds = time.perf_counter() - train_start
-    print(f"[train] complete in {_fmt3g(total_seconds)}s", flush=True)
+    print(f"trainining complete in {_3g(total_seconds)}s", flush=True)
+    
     return stats

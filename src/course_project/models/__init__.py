@@ -60,7 +60,6 @@ def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
     if not isinstance(extras, dict):
         raise TypeError(f"model_extras must be a dict, got {type(extras).__name__}")
 
-    extras = dict(extras)
     provided = set(extras.keys())
     missing = sorted(required - provided)
     unexpected = sorted(provided - required - optional)
@@ -73,7 +72,7 @@ def resolve_model_extras(model_type: str, extras: dict | None) -> dict:
         raise ValueError(
             f"Invalid model_extras for model_type='{model_type}': " + "; ".join(parts)
         )
-    return dict(extras)
+    return extras
 
 
 def resolve_model_inputs(model_type: str):

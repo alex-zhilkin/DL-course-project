@@ -9,6 +9,7 @@ def _box_dim(box: dict[str, float], axis: int) -> float:
     key = ("x", "y", "z")[axis]
     if key in box:
         return float(box[key])
+    
     key1 = f"{key}1"
     key2 = f"{key}2"
     
@@ -67,13 +68,15 @@ def get_correct_edge_vec(original_graph: Data, pos_dim: int | None = None) -> Te
 
 def _gaussian_init_linear(layer: torch.nn.Linear, fan_in: int) -> torch.nn.Linear:
     std = 1.0 / (fan_in**0.5)
+    
     torch.nn.init.normal_(layer.weight, mean=0.0, std=std)
     torch.nn.init.normal_(layer.bias, mean=0.0, std=std)
     return layer
 
 
 def init_transformer_style_weights(module: nn.Module) -> None:
-    """Xavier/zero-bias init for Linear and MultiheadAttention layers."""
+    """Generic Xavier init for torch models"""
+    
     for submodule in module.modules():
         if isinstance(submodule, nn.Linear):
             nn.init.xavier_uniform_(submodule.weight, gain=1.0)
@@ -100,15 +103,6 @@ def init_token_query_params(params, *, std: float = 0.01) -> None:
     for p in params:
         nn.init.normal_(p, mean=0.0, std=std)
 
-
-def init_scaled_linear_head(layer: nn.Linear, *, scale: float = 0.1) -> None:
-    """Modular-style init for final prediction heads."""
-    nn.init.xavier_uniform_(layer.weight, gain=1.0)
-    if layer.bias is not None:
-        nn.init.zeros_(layer.bias)
-    layer.weight.data.mul_(scale)
-
-
 def build_mlp(
     in_size: int,
     hidden_size: int,
@@ -119,7 +113,7 @@ def build_mlp(
     layers: list[torch.nn.Module] = []
 
     def _linear(in_dim: int, out_dim: int) -> torch.nn.Linear:
-        layer = torch.nn.Linear(in_dim, out_dim, dtype=torch.float32)
+        layer = torch.nn.Linear(in_dim, out_dim)
         return _gaussian_init_linear(layer, fan_in=in_dim)
 
     layers.append(_linear(in_size, hidden_size))
@@ -132,6 +126,6 @@ def build_mlp(
     layers.append(_linear(hidden_size, out_size))
 
     if lay_norm:
-        layers.append(torch.nn.LayerNorm(normalized_shape=out_size, dtype=torch.float32))
+        layers.append(torch.nn.LayerNorm(normalized_shape=out_size))
 
     return torch.nn.Sequential(*layers)

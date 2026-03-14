@@ -23,13 +23,11 @@ class BaseSimulator(torch.nn.Module, ABC):
     def loss(self, model_output, inputs, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
-    @abstractmethod
     def save_checkpoint(self, savedir: str, *, training_state: dict):
-        raise NotImplementedError
+        torch.save(self._checkpoint_payload(training_state), savedir)
 
-    @abstractmethod
     def load_checkpoint(self, ckpdir: str):
-        raise NotImplementedError
+        self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))
 
     # --- shared helpers ---
     @staticmethod

@@ -12,7 +12,7 @@ from .data import split_dataset
 from .graph import build_graph
 from .metrics import evaluate_cv_vs_global_pratio, evaluate_rollout_pratio_sides, write_csv
 from .models import create_model, resolve_model_inputs
-from .training import train_model
+from .training import train_graph_cv_model, train_graph_model
 from .utils import resolve_device
 
 
@@ -129,48 +129,39 @@ def run_graph_experiment(cfg: ExperimentConfig) -> dict:
     def _rollout_eval(current_model):
         return evaluate_rollout_pratio_sides(model=current_model, sims=val_data, history=cfg.history, rollout_steps=cfg.rollout_steps, pos_dim=cfg.pos_dim, device=device, model_inputs_cls=model_inputs_cls)
 
-    def _cv_eval(_current_model):
-        return {
-            "cv_abs_pearson_r": float("nan"),
-            "cv_fit_r2": float("nan"),
-            "cv_used": 0,
-            "best_cv_idx": None,
-            "best_cv_name": None,
-            "cv_text": None,
-            "rows": [],
-        }
-
     print("[run] training...", flush=True)
-    stats = train_model(model, model_inputs_cls, train_data, val_data, cfg, device, rollout_eval_fn=_rollout_eval, cv_eval_fn=_cv_eval, rollout_checkpoint_fn=save_checkpoint)
+    stats = train_graph_model(
+        model,
+        model_inputs_cls,
+        train_data,
+        val_data,
+        cfg,
+        device,
+        rollout_eval_fn=_rollout_eval,
+        rollout_checkpoint_fn=save_checkpoint,
+    )
     torch.save({"model_state_dict": model.state_dict(), "cfg": cfg_dict}, run_dir / "last_checkpoint.pt")
 
     selected_checkpoint = _select_best_rollout_checkpoint(rollout_checkpoints)
-    selection_metric = "rollout_r2"
     selection_score = float(selected_checkpoint["rollout_r2"])
     selected_checkpoint_path = Path(selected_checkpoint["path"])
     model.load_checkpoint(str(selected_checkpoint_path))
-    print(f"[run] selected checkpoint epoch={selected_checkpoint['epoch']} {selection_metric}={_3g(selection_score)}", flush=True)
+    print(f"[run] selected checkpoint epoch={selected_checkpoint['epoch']} rollout_r2={_3g(selection_score)}", flush=True)
 
     torch.save({
         "model_state_dict": model.state_dict(),
         "cfg": cfg_dict,
         "selected_checkpoint": selected_checkpoint,
-        "selected_checkpoint_metric": selection_metric,
-        "selected_checkpoint_score": selection_score,
     }, run_dir / "final_checkpoint.pt")
 
     print("[run] evaluating...", flush=True)
     with torch.no_grad():
         was_training = model.training
-        had_freeze = hasattr(model, "freeze_normalizers")
-        prev_freeze = getattr(model, "freeze_normalizers", None) if had_freeze else None
+        prev_freeze = model.freeze_normalizers
         model.eval()
-        if had_freeze:
-            model.freeze_normalizers = True
+        model.freeze_normalizers = True
         rollout_metrics = _rollout_eval(model)
-        cv_metrics = _cv_eval(model)
-        if had_freeze:
-            model.freeze_normalizers = prev_freeze
+        model.freeze_normalizers = prev_freeze
         model.train(was_training)
 
     rollout_rows = rollout_metrics.pop("rows")
@@ -184,8 +175,6 @@ def run_graph_experiment(cfg: ExperimentConfig) -> dict:
         "model_type": cfg.model_type,
         "device": device,
         "selected_checkpoint": str(selected_checkpoint_path),
-        "selected_checkpoint_metric": selection_metric,
-        "selected_checkpoint_score": selection_score,
         "best_epoch": int(selected_checkpoint["epoch"]),
         "best_score": float(selection_score),
         **rollout_metrics,
@@ -204,43 +193,42 @@ def run_graph_cv_experiment(cfg: ExperimentConfig) -> dict:
 
     rollout_checkpoints, save_checkpoint = _make_checkpoint_callback(run_dir, cfg_dict)
 
-    def _rollout_eval(_current_model):
-        return {"rollout_r2": float("nan"), "rollout_pearson_r": float("nan"), "rollout_pos_mse": float("nan"), "used": 0, "total": 0, "rows": []}
-
     def _cv_eval(current_model):
         return evaluate_cv_vs_global_pratio(model=current_model, sims=val_data, history=cfg.history, pos_dim=cfg.pos_dim, device=device, max_steps=None)
 
     print("[run] training...", flush=True)
-    stats = train_model(model, model_inputs_cls, train_data, val_data, cfg, device, rollout_eval_fn=_rollout_eval, cv_eval_fn=_cv_eval, rollout_checkpoint_fn=save_checkpoint)
+    stats = train_graph_cv_model(
+        model,
+        model_inputs_cls,
+        train_data,
+        val_data,
+        cfg,
+        device,
+        cv_eval_fn=_cv_eval,
+        checkpoint_fn=save_checkpoint,
+    )
     torch.save({"model_state_dict": model.state_dict(), "cfg": cfg_dict}, run_dir / "last_checkpoint.pt")
 
     selected_checkpoint = _select_best_cv_checkpoint(rollout_checkpoints, stats)
-    selection_metric = "cv_fit_r2"
     selection_score = float(selected_checkpoint["cv_fit_r2"])
     selected_checkpoint_path = Path(selected_checkpoint["path"])
     model.load_checkpoint(str(selected_checkpoint_path))
-    print(f"[run] selected checkpoint epoch={selected_checkpoint['epoch']} {selection_metric}={_3g(selection_score)}", flush=True)
+    print(f"[run] selected checkpoint epoch={selected_checkpoint['epoch']} cv_fit_r2={_3g(selection_score)}", flush=True)
 
     torch.save({
         "model_state_dict": model.state_dict(),
         "cfg": cfg_dict,
         "selected_checkpoint": selected_checkpoint,
-        "selected_checkpoint_metric": selection_metric,
-        "selected_checkpoint_score": selection_score,
     }, run_dir / "final_checkpoint.pt")
 
     print("[run] evaluating...", flush=True)
     with torch.no_grad():
         was_training = model.training
-        had_freeze = hasattr(model, "freeze_normalizers")
-        prev_freeze = getattr(model, "freeze_normalizers", None) if had_freeze else None
+        prev_freeze = model.freeze_normalizers
         model.eval()
-        if had_freeze:
-            model.freeze_normalizers = True
-        rollout_metrics = _rollout_eval(model)
+        model.freeze_normalizers = True
         cv_metrics = _cv_eval(model)
-        if had_freeze:
-            model.freeze_normalizers = prev_freeze
+        model.freeze_normalizers = prev_freeze
         model.train(was_training)
 
     torch.save(stats, run_dir / "train_stats.pt")
@@ -251,11 +239,12 @@ def run_graph_cv_experiment(cfg: ExperimentConfig) -> dict:
         "model_type": cfg.model_type,
         "device": device,
         "selected_checkpoint": str(selected_checkpoint_path),
-        "selected_checkpoint_metric": selection_metric,
-        "selected_checkpoint_score": selection_score,
         "best_epoch": int(selected_checkpoint["epoch"]),
         "best_score": float(selection_score),
-        **rollout_metrics,
+        "rollout_r2": float("nan"),
+        "rollout_pearson_r": float("nan"),
+        "rollout_pos_mse": float("nan"),
+        **cv_metrics,
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (run_dir / "config.json").write_text(json.dumps(cfg_dict, indent=2))

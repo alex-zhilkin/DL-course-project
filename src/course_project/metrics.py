@@ -94,10 +94,11 @@ def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, 
 
         cv_means_by_sim.append(cv_mean)
         targets.append(target_pr)
-        row = {"sim_idx": sim_idx, "target_global_p_ratio": target_pr}
-        for i, value in enumerate(cv_mean, start=1):
-            row[f"mean_cv{i}"] = float(value)
-        rows.append(row)
+        rows.append({
+            "sim_idx": sim_idx,
+            "target_global_p_ratio": target_pr,
+            **{f"mean_cv{i}": float(value) for i, value in enumerate(cv_mean, start=1)},
+        })
 
     cv_abs_r = float("nan")
     fit_r2 = float("nan")
@@ -124,7 +125,6 @@ def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, 
         "cv_used": len(cv_means_by_sim),
         "best_cv_idx": best_cv_idx,
         "best_cv_name": best_cv_name,
-        "cv_text": None if best_cv_name is None else f"{best_cv_name} |p|={cv_abs_r:.3g} r2={fit_r2:.3g}",
         "rows": rows,
     }
 

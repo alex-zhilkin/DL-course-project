@@ -28,7 +28,6 @@ class ExperimentConfig:
     freeze_normalizers_after_epoch: int
     device: str
     seed: int
-    log_every: int
 
     def to_dict(self) -> dict:
         return asdict(self)

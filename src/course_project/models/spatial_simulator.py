@@ -6,7 +6,6 @@ from torch import Tensor
 from torch_geometric.data import Data
 
 from .base import BaseModelInputs, BaseSimulator
-from ..utils import resolve_device
 from .common import build_mlp, get_correct_edge_vec
 from .components import LocalGNNBackbone, Normalizer
 
@@ -15,6 +14,8 @@ torch.set_default_dtype(torch.float32)
 
 
 class Model(BaseSimulator):
+    """Simple local GNN that predicts per node acceleration (dV) """
+
     def __init__(
         self,
         data: Data,
@@ -26,7 +27,7 @@ class Model(BaseSimulator):
         super().__init__(pos_dim=pos_dim)
         self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
 
-        self.device = data.x.device if hasattr(data, "x") and data.x is not None else resolve_device("auto")
+        self.device = data.x.device
 
         self.node_normalizer = Normalizer(size=data.num_features, name="NodeNormalizer", device=self.device)
         self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer", device=self.device)
@@ -45,9 +46,7 @@ class Model(BaseSimulator):
 
     @staticmethod
     def _current_velocity(inputs: ModelInputs) -> Tensor:
-        if hasattr(inputs.cur_graph, "vel_state"):
-            return inputs.cur_graph.vel_state
-        return inputs.cur_position - inputs.prev_position
+        return inputs.cur_graph.vel_state
 
     def _norm_training(self, is_training: bool) -> bool:
         return bool(self.training) and bool(is_training) and (not self.freeze_normalizers)
@@ -60,9 +59,8 @@ class Model(BaseSimulator):
             x=norm_nodes,
             edge_index=graph.edge_index,
             edge_attr=norm_edges,
-            box=graph.box if hasattr(graph, "box") else None,
-            batch=graph.batch if hasattr(graph, "batch") else None,
-            dtype=torch.float,
+            box=graph.box,
+            batch=graph.batch,
         )
 
     def _encode(self, data: Data) -> Data:
@@ -71,6 +69,7 @@ class Model(BaseSimulator):
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
         data = self.normalize_graph(data, is_training=is_training)
         latent = self._encode(data)
+        
         return self.decoder(latent.x)
 
     @classmethod
@@ -78,6 +77,7 @@ class Model(BaseSimulator):
         edge_vectors = get_correct_edge_vec(data, pos_dim=pos_dim)
         distances = torch.norm(edge_vectors, dim=1)
         bond_coeffs = data.edge_attr[:, -1]
+        
         return torch.column_stack([edge_vectors, distances, bond_coeffs])
 
     def update(self, inputs: ModelInputs, model_output: Tensor) -> Data:
@@ -90,8 +90,7 @@ class Model(BaseSimulator):
             x=predicted_position.clone().float(),
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=inputs.cur_graph.edge_attr.float(),
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            dtype=torch.float32,
+            box=inputs.cur_graph.box,
         )
         new_edge_attr = self._recalc_edges(tmp, self.pos_dim)
 
@@ -99,10 +98,10 @@ class Model(BaseSimulator):
             x=predicted_position.float(),
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=new_edge_attr.float(),
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            dtype=torch.float32,
+            box=inputs.cur_graph.box,
         )
         predicted_graph.vel_state = updated_velocity.detach()
+        
         return predicted_graph
 
     def loss(
@@ -114,6 +113,7 @@ class Model(BaseSimulator):
     ) -> Tensor:
         cur_velocity = self._current_velocity(inputs)
         target_velocity = inputs.target_position - inputs.cur_position
+        
         norm_training = self._norm_training(
             self.training if accumulate_norm_stats is None else accumulate_norm_stats
         )
@@ -124,9 +124,3 @@ class Model(BaseSimulator):
         )
         dv_loss = F.mse_loss(model_output, target_velocity_change_normalized)
         return dv_loss
-
-    def save_checkpoint(self, savedir: str, *, training_state: dict):
-        torch.save(self._checkpoint_payload(training_state), savedir)
-
-    def load_checkpoint(self, ckpdir: str):
-        self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))
