@@ -99,7 +99,7 @@ def _make_checkpoint_callback(run_dir: Path, cfg_dict: dict):
             "scheduler_state_dict": scheduler.state_dict(),
             "rollout_metrics": rollout_summary,
             "train_loss": float(train_loss),
-            "val_loss": float(val_loss),
+            "val_loss": float("nan") if val_loss is None else float(val_loss),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         current_model.cfg = cfg_dict

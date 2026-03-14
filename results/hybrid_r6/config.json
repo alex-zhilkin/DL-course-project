@@ -1,0 +1,31 @@
+{
+  "run_name": "hybrid_r6",
+  "model_type": "hybrid",
+  "dataset_path": "../data/2340_dePablo_networks_OOL_undirected.pt",
+  "train_count": 10,
+  "val_count": 30,
+  "output_root": "../results",
+  "pos_dim": 2,
+  "history": 1,
+  "limit": 20,
+  "hidden_size": 64,
+  "n_layers": 2,
+  "model_extras": {
+    "num_mlp": 3,
+    "cv_checkpoint_path": "../results/cv_transformer_best_cv_checkpoint.pt",
+    "cv_inject_scale_init": 2,
+    "time_lag_steps": 0,
+    "time_lag_weight": 0
+  },
+  "learning_rate": 0.0001,
+  "learning_rate_decay": 1,
+  "weight_decay": 0.0,
+  "epochs": 150,
+  "val_every": 10,
+  "rollout_every": 10,
+  "cv_eval_every": 10,
+  "rollout_steps": 100,
+  "freeze_normalizers_after_epoch": 10,
+  "device": "cuda",
+  "seed": 1839867514
+}

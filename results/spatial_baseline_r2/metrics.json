@@ -1,0 +1,13 @@
+{
+  "run_name": "spatial_baseline_r2",
+  "model_type": "spatial",
+  "device": "cuda",
+  "selected_checkpoint": "../results/spatial_baseline_r2/rollout_checkpoints/epoch_0040.pt",
+  "best_epoch": 40,
+  "best_score": 0.8444375272926027,
+  "rollout_r2": 0.8444375272926027,
+  "rollout_pearson_r": 0.9236619498089745,
+  "rollout_pos_mse": 6.504115499410546e-05,
+  "used": 30,
+  "total": 30
+}

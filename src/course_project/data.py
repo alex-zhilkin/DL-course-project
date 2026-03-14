@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-
 import torch
-
 
 def load_dataset(path: str | Path) -> list:
     return list(torch.load(Path(path), weights_only=False))
-
 
 def split_dataset(path: str | Path, *, train_count: int, val_count: int) -> tuple[list, list, list]:
     sims = load_dataset(path)

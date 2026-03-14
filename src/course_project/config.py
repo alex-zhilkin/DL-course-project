@@ -24,10 +24,10 @@ class ExperimentConfig:
     val_every: int
     rollout_every: int
     cv_eval_every: int
-    rollout_steps: int
     freeze_normalizers_after_epoch: int
     device: str
     seed: int
+    rollout_steps: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

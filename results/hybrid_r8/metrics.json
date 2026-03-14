@@ -1,0 +1,13 @@
+{
+  "run_name": "hybrid_r8",
+  "model_type": "hybrid",
+  "device": "cuda",
+  "selected_checkpoint": "../results/hybrid_r8/rollout_checkpoints/epoch_0010.pt",
+  "best_epoch": 10,
+  "best_score": 0.39014965483431463,
+  "rollout_r2": 0.39014965483431463,
+  "rollout_pearson_r": 0.9184921107689429,
+  "rollout_pos_mse": 8.44923458013606e-05,
+  "used": 30,
+  "total": 30
+}

@@ -1,0 +1,11 @@
+{
+  "run_name": "cv_transformer_single",
+  "best_cv_fit_r2": 0.9821866007601752,
+  "best_cv_epoch": 8,
+  "checkpoint_path": "../results/cv_transformer_single/rollout_checkpoints/epoch_0008.pt",
+  "saved_checkpoint_path": "../results/cv_transformer_best_cv_checkpoint.pt",
+  "fixed_params": {
+    "hidden_size": 160,
+    "learning_rate": 1e-05
+  }
+}
