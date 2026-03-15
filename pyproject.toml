@@ -15,6 +15,7 @@ dependencies = [
     "optuna",
     "torch_geometric",
     "graph_utils @ git+https://github.com/MendelsResearchGroup/graph_utils.git",
+    "scipy"
 ]
 
 [tool.setuptools]

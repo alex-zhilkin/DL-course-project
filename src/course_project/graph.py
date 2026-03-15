@@ -43,7 +43,7 @@ def rollout(
             prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
             if len(frames) > 1:
                 cur_graph.vel_state = cur_graph.x[:, :pos_dim] - prev_graph.x[:, :pos_dim]
-            model_inputs = model_inputs_cls(prev_graph, cur_graph, None, pos_dim)
+            model_inputs = model_inputs_cls(prev_graph, cur_graph, cur_graph, pos_dim)
             model_output = model(input_graph, is_training=False)
             predicted_graph = model.update(model_inputs, model_output)
             rollout_graphs.append(predicted_graph.cpu())

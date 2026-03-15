@@ -91,3 +91,4 @@ results/**
 !results/spatial_baseline_r5/train_stats.pt
 __pycache__/
 *.pyc
+**/course_project.egg-info/

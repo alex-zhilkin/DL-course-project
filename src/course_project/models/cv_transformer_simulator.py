@@ -95,7 +95,10 @@ class Model(BaseSimulator):
         time_lag_weight: float = 0.0,
     ):
         super().__init__(pos_dim=pos_dim)
-        self._validate_input_dims(data, min_node_features=2, min_edge_features=1)
+        if pos_dim not in (2, 3):
+            raise ValueError(f"pos_dim must be 2 or 3, got {pos_dim}")
+        if data.num_node_features < 2 or data.num_edge_features < 1:
+            raise ValueError("cv_transformer expects at least 2 node features and 1 edge feature")
 
         self.device = data.x.device
         self._expected_node_dim = int(data.num_features)

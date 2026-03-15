@@ -5,10 +5,10 @@ from abc import ABC, abstractmethod
 import torch
 from torch_geometric.data import Data
 
+
 class BaseSimulator(torch.nn.Module, ABC):
     def __init__(self, pos_dim: int, *args, **kwargs):
         super().__init__()
-        self._validate_pos_dim(pos_dim)
         self.pos_dim = pos_dim
 
     @abstractmethod
@@ -28,27 +28,6 @@ class BaseSimulator(torch.nn.Module, ABC):
 
     def load_checkpoint(self, ckpdir: str):
         self._load_checkpoint_payload(torch.load(ckpdir, weights_only=False, map_location="cpu"))
-
-    # --- shared helpers ---
-    @staticmethod
-    def _validate_pos_dim(pos_dim: int) -> None:
-        if pos_dim not in (2, 3):
-            raise ValueError(f"pos_dim must be 2 or 3, got {pos_dim}")
-
-    @staticmethod
-    def _validate_input_dims(
-        data: Data,
-        min_node_features: int = 2,
-        min_edge_features: int = 1,
-    ) -> None:
-        if data.num_node_features < min_node_features:
-            raise ValueError(
-                f"Expected at least {min_node_features} node features, got {data.num_node_features}"
-            )
-        if data.num_edge_features < min_edge_features:
-            raise ValueError(
-                f"Expected at least {min_edge_features} edge features, got {data.num_edge_features}"
-            )
 
     def _checkpoint_payload(self, training_state: dict) -> dict:
         return {
@@ -82,24 +61,22 @@ class BaseModelInputs:
 
     prev_position: torch.Tensor
     cur_position: torch.Tensor
-    target_position: torch.Tensor | None
+    target_position: torch.Tensor
 
-    target_edge_attr: torch.Tensor | None
+    target_edge_attr: torch.Tensor
 
     def __init__(
         self,
         prev_data: Data,
         cur_data: Data,
-        target_data: Data | None,
+        target_data: Data,
         pos_dim: int,
     ):
-        BaseSimulator._validate_pos_dim(pos_dim)
-
         self.prev_graph = prev_data
         self.cur_graph = cur_data
-        self.target_graph = target_data if target_data is not None else None
+        self.target_graph = target_data
 
         self.prev_position = prev_data.x[:, :pos_dim]
         self.cur_position = cur_data.x[:, :pos_dim]
-        self.target_position = target_data.x[:, :pos_dim] if target_data is not None else None
-        self.target_edge_attr = target_data.edge_attr if target_data is not None else None
+        self.target_position = target_data.x[:, :pos_dim]
+        self.target_edge_attr = target_data.edge_attr
