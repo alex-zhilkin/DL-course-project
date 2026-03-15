@@ -2,12 +2,12 @@
   "run_name": "spatial_baseline_r1",
   "model_type": "spatial",
   "device": "cuda",
-  "selected_checkpoint": "../results/spatial_baseline_r1/rollout_checkpoints/epoch_0050.pt",
-  "best_epoch": 50,
-  "best_score": 0.8751837569836519,
-  "rollout_r2": 0.8751837569836519,
-  "rollout_pearson_r": 0.9441311261386017,
-  "rollout_pos_mse": 5.3297602274445426e-05,
-  "used": 30,
-  "total": 30
+  "selected_checkpoint": "../results/spatial_baseline_r1/rollout_checkpoints/epoch_0010.pt",
+  "best_epoch": 10,
+  "best_score": 0.3423170435356665,
+  "rollout_r2": 0.3423165910430107,
+  "rollout_pearson_r": 0.9407422105448164,
+  "rollout_pos_mse": 6.147552176116733e-05,
+  "used": 20,
+  "total": 20
 }

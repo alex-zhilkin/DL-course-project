@@ -2,8 +2,8 @@
   "run_name": "spatial_baseline_r2",
   "model_type": "spatial",
   "dataset_path": "../data/2340_dePablo_networks_OOL_undirected.pt",
-  "train_count": 20,
-  "val_count": 30,
+  "train_count": 5,
+  "val_count": 20,
   "output_root": "../results",
   "pos_dim": 2,
   "history": 1,
@@ -13,15 +13,15 @@
   "model_extras": {
     "num_mlp": 3
   },
-  "learning_rate": 0.0001,
+  "learning_rate": 5e-05,
   "learning_rate_decay": 1,
   "weight_decay": 0.0,
-  "epochs": 150,
+  "epochs": 100,
   "val_every": 10,
   "rollout_every": 10,
   "cv_eval_every": 10,
-  "rollout_steps": 100,
   "freeze_normalizers_after_epoch": 10,
   "device": "cuda",
-  "seed": 1172255625
+  "seed": 2112243615,
+  "rollout_steps": 100
 }

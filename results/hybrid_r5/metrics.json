@@ -2,12 +2,12 @@
   "run_name": "hybrid_r5",
   "model_type": "hybrid",
   "device": "cuda",
-  "selected_checkpoint": "../results/hybrid_r5/rollout_checkpoints/epoch_0060.pt",
-  "best_epoch": 60,
-  "best_score": 0.8651486255775327,
-  "rollout_r2": 0.8651486255775327,
-  "rollout_pearson_r": 0.9487796004246875,
-  "rollout_pos_mse": 5.977339584812095e-05,
-  "used": 30,
-  "total": 30
+  "selected_checkpoint": "../results/hybrid_r5/rollout_checkpoints/epoch_0070.pt",
+  "best_epoch": 70,
+  "best_score": 0.8632069776907817,
+  "rollout_r2": 0.8632069776907817,
+  "rollout_pearson_r": 0.960016560025378,
+  "rollout_pos_mse": 6.994640616539983e-05,
+  "used": 20,
+  "total": 20
 }
