@@ -11,6 +11,26 @@ from graph_utils import calc_p_ratio_box, calc_p_ratio_rollout_sides
 from .graph import build_graph, rollout
 
 
+def fit_r2(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    coeff = np.polyfit(y_true, y_pred, deg=1)
+    y_hat = coeff[0] * y_true + coeff[1]
+    return _r2(y_true, y_hat)
+
+
+def rmse(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def mae(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
 def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))

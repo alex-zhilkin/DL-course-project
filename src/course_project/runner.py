@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .config import ExperimentConfig
-from .data import split_dataset
+from .data import resolve_dataset_splits
 from .graph import build_graph
 from .metrics import evaluate_cv_vs_global_pratio, evaluate_rollout_pratio_sides, write_csv
 from .models import create_model, resolve_model_inputs
@@ -69,7 +69,16 @@ def _build_model_and_data(cfg: ExperimentConfig):
     _set_seed(cfg.seed)
     device = resolve_device(cfg.device)
     cfg_dict = cfg.to_dict()
-    train_data, val_data, _test_data = split_dataset(cfg.dataset_path, train_count=cfg.train_count, val_count=cfg.val_count)
+    train_data, val_data, _test_data, split_info = resolve_dataset_splits(
+        cfg.dataset_path,
+        train_count=cfg.train_count,
+        val_count=cfg.val_count,
+        dataset_mixture=cfg.dataset_mixture,
+        split_seed=cfg.split_seed,
+        shuffle_within_source=cfg.shuffle_dataset_within_source,
+        mix_holdout_across_sources=cfg.mix_holdout_across_sources,
+    )
+    cfg_dict["split_info"] = split_info
     init_frames = [train_data[0][i].to(device) for i in range(cfg.history + 1)]
     init_graph = build_graph(input_graphs=init_frames).to(device)
     model_inputs_cls = resolve_model_inputs(cfg.model_type)

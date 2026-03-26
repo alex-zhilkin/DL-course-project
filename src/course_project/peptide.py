@@ -50,14 +50,21 @@ def clip_traj(xt, frames_per_traj):
     return xt[:frames_per_traj]
 
 
-def valid_time_range(xt, history, lag_steps, frames_per_traj):
+def thin_traj(xt, frame_stride):
+    if frame_stride is None or int(frame_stride) <= 1:
+        return xt
+    return xt[:: int(frame_stride)]
+
+
+def valid_time_range(xt, history, lag_steps, frames_per_traj, frame_stride=1):
     xt = clip_traj(xt, frames_per_traj)
+    xt = thin_traj(xt, frame_stride)
     start = max(history - 1, 1)
     end = xt.shape[0] - (lag_steps if lag_steps > 0 else 1)
     return xt, start, end
 
 
-def compute_norm_stats(train_ids, history, lag_steps, frames_per_traj, x_all, time_all, offsets, n_feat):
+def compute_norm_stats(train_ids, history, lag_steps, frames_per_traj, x_all, time_all, offsets, n_feat, frame_stride=1):
     x_sum = torch.zeros(n_feat)
     x_sq = torch.zeros(n_feat)
     x_cnt = 0
@@ -67,7 +74,7 @@ def compute_norm_stats(train_ids, history, lag_steps, frames_per_traj, x_all, ti
 
     for tid in train_ids:
         xt, _ = traj_slice(x_all, time_all, offsets, tid)
-        xt, start, end = valid_time_range(xt, history, lag_steps, frames_per_traj)
+        xt, start, end = valid_time_range(xt, history, lag_steps, frames_per_traj, frame_stride=frame_stride)
         x_sum += xt.sum(dim=0)
         x_sq += (xt * xt).sum(dim=0)
         x_cnt += xt.shape[0]
@@ -103,6 +110,7 @@ def build_split_tensors(
     x_std,
     dv_mean,
     dv_std,
+    frame_stride=1,
 ):
     x_hist_rows = []
     dv_rows = []
@@ -113,7 +121,7 @@ def build_split_tensors(
 
     for tid in traj_ids:
         xt, _ = traj_slice(x_all, time_all, offsets, tid)
-        xt, start, end = valid_time_range(xt, history, lag_steps, frames_per_traj)
+        xt, start, end = valid_time_range(xt, history, lag_steps, frames_per_traj, frame_stride=frame_stride)
         t_idx = torch.arange(start, end, dtype=torch.long)
         if t_idx.numel() == 0:
             continue

@@ -28,6 +28,10 @@ class ExperimentConfig:
     device: str
     seed: int
     rollout_steps: int | None = None
+    dataset_mixture: list[dict] | None = None
+    split_seed: int | None = None
+    shuffle_dataset_within_source: bool = False
+    mix_holdout_across_sources: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
