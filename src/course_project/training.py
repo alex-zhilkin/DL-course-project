@@ -10,6 +10,8 @@ from .graph import build_graph, clone_graph
 
 
 def _3g(value) -> str:
+    if value is None:
+        return "nan"
     return f"{float(value):.3g}"
 
 

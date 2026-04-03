@@ -14,6 +14,8 @@ from .graph import build_graph, rollout
 def fit_r2(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
+    if y_true.size < 2 or not np.all(np.isfinite(y_true)) or np.allclose(np.std(y_true), 0.0):
+        return float("nan")
     coeff = np.polyfit(y_true, y_pred, deg=1)
     y_hat = coeff[0] * y_true + coeff[1]
     return _r2(y_true, y_hat)
@@ -32,8 +34,12 @@ def mae(y_true, y_pred) -> float:
 
 
 def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
     ss_res = float(np.sum((y_true - y_pred) ** 2))
     ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    if ss_tot <= 0.0:
+        return float("nan")
     return float(1.0 - ss_res / ss_tot)
 
 

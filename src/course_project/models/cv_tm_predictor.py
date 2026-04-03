@@ -193,25 +193,29 @@ class MetricHead(nn.Module):
     def __init__(self, cv_dim: int, hidden_size: int, dropout: float, inner_size: int | None = None):
         super().__init__()
         inner = int(inner_size) if inner_size is not None else max(16, hidden_size // 2)
-        self.phi = nn.Sequential(
-            nn.Linear(cv_dim, inner),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(inner, inner),
-            nn.GELU(),
+        self.input_proj = nn.Linear(cv_dim, inner)
+        self.gru = nn.GRU(
+            input_size=inner,
+            hidden_size=inner,
+            num_layers=1,
+            batch_first=True,
         )
-        self.rho = nn.Sequential(
-            nn.Linear(inner, inner),
-            nn.GELU(),
-            nn.Linear(inner, 1),
-        )
+        self.dropout = nn.Dropout(dropout)
+        self.out = nn.Linear(inner, 1)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for module in list(self.phi.modules()) + list(self.rho.modules()):
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        nn.init.xavier_uniform_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        for name, param in self.gru.named_parameters():
+            if "weight" in name:
+                nn.init.xavier_uniform_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
 
     def forward(self, cv_seq: torch.Tensor) -> torch.Tensor:
-        return self.rho(self.phi(cv_seq).mean(dim=0)).squeeze(-1)
+        x = self.input_proj(cv_seq)
+        _, h_n = self.gru(x.unsqueeze(0))
+        return self.out(self.dropout(h_n[-1])).squeeze(-1)

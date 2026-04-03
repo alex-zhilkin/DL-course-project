@@ -309,6 +309,12 @@ def _corr_or_nan(fn, x, y) -> float:
     return float(fn(x, y).statistic)
 
 
+def _corr_pvalue_or_nan(fn, x, y) -> float:
+    if len(x) < 2:
+        return float("nan")
+    return float(fn(x, y).pvalue)
+
+
 def run_metric_head_epoch(
     head,
     metric_dataset,
@@ -376,5 +382,7 @@ def prediction_stats(pred_df: pd.DataFrame, metric_name: str) -> dict[str, float
         "mae": mae(x, y),
         "r2": fit_r2(x, y),
         "pearson": _corr_or_nan(scipy_stats.pearsonr, x, y),
+        "pearson_p": _corr_pvalue_or_nan(scipy_stats.pearsonr, x, y),
         "spearman": _corr_or_nan(scipy_stats.spearmanr, x, y),
+        "spearman_p": _corr_pvalue_or_nan(scipy_stats.spearmanr, x, y),
     }
