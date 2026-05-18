@@ -23,6 +23,8 @@ class Model(BaseSimulator):
         n_layers: int,
         pos_dim: int,
         num_mlp: int,
+        use_skip: bool = False,
+        final_decoder_local_skip: bool = False,
     ):
         super().__init__(pos_dim=pos_dim)
         if pos_dim not in (2, 3):
@@ -42,8 +44,11 @@ class Model(BaseSimulator):
             hidden_size=hidden_size,
             n_layers=n_layers,
             num_mlp=num_mlp,
+            use_skip=use_skip,
         )
-        self.decoder = build_mlp(hidden_size, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
+        self.final_decoder_local_skip = bool(final_decoder_local_skip)
+        decoder_in_dim = hidden_size * 2 if self.final_decoder_local_skip else hidden_size
+        self.decoder = build_mlp(decoder_in_dim, hidden_size, pos_dim, num_mlp=num_mlp, lay_norm=False)
 
         self.freeze_normalizers = False
 
@@ -71,6 +76,9 @@ class Model(BaseSimulator):
 
     def forward(self, data: Data, is_training: bool = True) -> Tensor:
         data = self.normalize_graph(data, is_training=is_training)
+        if self.final_decoder_local_skip:
+            latent, local_skip = self.backbone(data, return_input_embedding=True)
+            return self.decoder(torch.cat([latent.x, local_skip], dim=-1))
         latent = self._encode(data)
         
         return self.decoder(latent.x)

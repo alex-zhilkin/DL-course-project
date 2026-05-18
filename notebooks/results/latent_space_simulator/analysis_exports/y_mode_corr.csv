@@ -1,0 +1,25 @@
+dataset,latent_signal,y_mode,corr
+dePablo CV1,z0,y_mode1,-0.16571457141026089
+dePablo CV1,z0,y_mode2,0.36489383032088185
+dePablo CV1,z0,y_mode3,0.12510006891373335
+dePablo CV1,z0,y_mode4,-0.0326161908947677
+dePablo CV1,latent_pc1,y_mode1,-0.1657145714102609
+dePablo CV1,latent_pc1,y_mode2,0.36489383032088185
+dePablo CV1,latent_pc1,y_mode3,0.12510006891373332
+dePablo CV1,latent_pc1,y_mode4,-0.032616190894767715
+dePablo CV2,z0,y_mode1,0.22709181344725754
+dePablo CV2,z0,y_mode2,-0.586197846161594
+dePablo CV2,z0,y_mode3,-0.15502846399024128
+dePablo CV2,z0,y_mode4,0.03736661456841951
+dePablo CV2,z1,y_mode1,-0.024625037532793055
+dePablo CV2,z1,y_mode2,-0.40494854289359455
+dePablo CV2,z1,y_mode3,0.05453697200646229
+dePablo CV2,z1,y_mode4,-0.013317894260215502
+dePablo CV2,latent_pc1,y_mode1,0.13453002354670726
+dePablo CV2,latent_pc1,y_mode2,0.03712906201325468
+dePablo CV2,latent_pc1,y_mode3,-0.12279213342256602
+dePablo CV2,latent_pc1,y_mode4,0.029738454272129764
+dePablo CV2,latent_pc2,y_mode1,-0.18300899398785245
+dePablo CV2,latent_pc2,y_mode2,0.7435011025280283
+dePablo CV2,latent_pc2,y_mode3,0.10310503802635439
+dePablo CV2,latent_pc2,y_mode4,-0.024751482865322333

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -44,22 +45,30 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def _pearson_r(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if y_true.size < 2 or y_pred.size < 2:
+        return float("nan")
+    if np.allclose(np.std(y_true), 0.0) or np.allclose(np.std(y_pred), 0.0):
+        return float("nan")
     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
-def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps: int, pos_dim: int, device: str, model_inputs_cls) -> dict:
+def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps: int, pos_dim: int, device: str, model_inputs_cls, node_features: str = "positions") -> dict:
     preds: list[float] = []
     targets: list[float] = []
     pos_mse_values: list[float] = []
     rows: list[dict] = []
 
     for sim_idx, sim in enumerate(sims):
-        target_index = history + rollout_steps
+        # Match modular-network-simulator's validation convention: starting from
+        # frames [0..history], it performs one initial prediction plus rollout_steps
+        # loop steps, so the compared ground-truth frame is history + rollout_steps + 1.
+        prediction_steps = rollout_steps + 1
+        target_index = history + prediction_steps
         if len(sim) <= target_index:
             continue
 
         input_graphs = [sim[i] for i in range(history + 1)]
-        roll = rollout(model=model, input_graphs=input_graphs, num_steps=rollout_steps, history=history, pos_dim=pos_dim, device=device, model_inputs_cls=model_inputs_cls)
+        roll = rollout(model=model, input_graphs=input_graphs, num_steps=prediction_steps, history=history, pos_dim=pos_dim, device=device, model_inputs_cls=model_inputs_cls, node_features=node_features)
 
         pred_pr = float(calc_p_ratio_rollout_sides(roll, -1))
         target_pr = float(calc_p_ratio_rollout_sides(sim, target_index))
@@ -67,7 +76,7 @@ def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps
             continue
 
         pred_pos = roll[-1].x[:, :pos_dim]
-        target_pos = sim[target_index].x[:, :pos_dim]
+        target_pos = sim[target_index].x[:, :pos_dim].to(pred_pos.device)
         pos_mse = float(torch.nn.functional.mse_loss(pred_pos, target_pos).item())
 
         preds.append(pred_pr)
@@ -75,6 +84,8 @@ def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps
         pos_mse_values.append(pos_mse)
         rows.append({
             "sim_idx": sim_idx,
+            "rollout_steps": rollout_steps,
+            "prediction_steps": prediction_steps,
             "target_index": target_index,
             "pred_rollout_p_ratio": pred_pr,
             "target_rollout_sides_p_ratio": target_pr,
@@ -91,7 +102,7 @@ def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps
     }
 
 
-def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, device: str, max_steps: int | None = None) -> dict:
+def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, device: str, max_steps: int | None = None, node_features: str = "positions") -> dict:
     cv_means_by_sim = []
     targets = []
     rows = []
@@ -106,7 +117,7 @@ def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, 
             frames = [sim[i].to(device) for i in range(t - history, t + 1)]
             if t > 0:
                 frames[-1].vel_state = frames[-1].x[:, :pos_dim] - sim[t - 1].to(device).x[:, :pos_dim]
-            input_graph = build_graph(frames).to(device)
+            input_graph = build_graph(frames, node_features=node_features).to(device)
             cv = model.extract_cv(input_graph, is_training=False).squeeze(0).detach().cpu().numpy()
             cv_values.append(np.asarray(cv, dtype=float).reshape(-1))
 
@@ -130,6 +141,10 @@ def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, 
     fit_r2 = float("nan")
     best_cv_idx = None
     best_cv_name = None
+    combo_fit_r2 = float("nan")
+    combo_rmse = float("nan")
+    combo_abs_r = float("nan")
+    combo_features: list[str] = []
     if len(cv_means_by_sim) >= 3:
         x_all = np.asarray(cv_means_by_sim, dtype=float)
         y = np.asarray(targets, dtype=float)
@@ -145,9 +160,32 @@ def evaluate_cv_vs_global_pratio(model, sims: list, history: int, pos_dim: int, 
                 cv_abs_r = abs(corr)
                 fit_r2 = r2
 
+        best_combo_key: tuple[float, float] | None = None
+        max_combo_terms = min(5, x_all.shape[1])
+        for subset_size in range(1, max_combo_terms + 1):
+            for subset in itertools.combinations(range(x_all.shape[1]), subset_size):
+                X = x_all[:, subset]
+                X_aug = np.column_stack([np.ones(len(X)), X])
+                coef, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+                yhat = X_aug @ coef
+                r2 = _r2(y, yhat)
+                error = rmse(y, yhat)
+                corr = _pearson_r(y, yhat) if len(y) >= 2 and not np.allclose(np.std(yhat), 0.0) else float("nan")
+                key = (np.nan_to_num(r2, nan=-np.inf), -np.nan_to_num(error, nan=np.inf))
+                if best_combo_key is None or key > best_combo_key:
+                    best_combo_key = key
+                    combo_fit_r2 = r2
+                    combo_rmse = error
+                    combo_abs_r = abs(corr)
+                    combo_features = [f"cv_{i + 1}" for i in subset]
+
     return {
         "cv_abs_pearson_r": cv_abs_r,
         "cv_fit_r2": fit_r2,
+        "cv_combo_abs_pearson_r": combo_abs_r,
+        "cv_combo_fit_r2": combo_fit_r2,
+        "cv_combo_rmse": combo_rmse,
+        "cv_combo_features": combo_features,
         "cv_used": len(cv_means_by_sim),
         "best_cv_idx": best_cv_idx,
         "best_cv_name": best_cv_name,

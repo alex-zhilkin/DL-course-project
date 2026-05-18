@@ -1,0 +1,3 @@
+dataset,signal,source,fit_split,eval_split,val_corr_final_p_ratio,val_r2_final_p_ratio,corr_final_p_ratio,r2_final_p_ratio
+Reid CV1,initial_z0,single_latent_val_selected,val,test,0.6925890523984285,0.4796795955021529,0.8233777234678448,0.6600721969431756
+Reid CV2,initial_z_linear_p_ratio,val_linear_combo,val,test,0.7679498584947815,0.5897469851621552,0.8626748120181554,0.713071921119795

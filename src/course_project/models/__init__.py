@@ -7,12 +7,16 @@ from torch_geometric.data import Data
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
+from .linear_cv_simulator import Model as LinearCVSimulatorModel
 from .spatial_simulator import Model as SpatialModel
+from .transformer_simulator import Model as TransformerSimulatorModel
 
 MODEL_REGISTRY = {
     "spatial": SpatialModel,
     "cv_transformer": CVTransformerModel,
+    "linear_cv_simulator": LinearCVSimulatorModel,
     "hybrid": HybridModel,
+    "transformer_simulator": TransformerSimulatorModel,
 }
 
 MODEL_EXTRAS_REQUIRED = {
@@ -24,26 +28,65 @@ MODEL_EXTRAS_REQUIRED = {
         "transformer_layers",
         "transformer_heads",
         "transformer_dropout",
-        "use_local_skip",
+        "token_sizes",
+    },
+    "linear_cv_simulator": {
+        "num_mlp",
         "token_sizes",
     },
     "hybrid": {
         "num_mlp",
         "cv_checkpoint_path",
     },
+    "transformer_simulator": {
+        "num_mlp",
+        "transformer_layers",
+        "transformer_heads",
+        "transformer_dropout",
+    },
 }
 
 MODEL_EXTRAS_OPTIONAL = {
-    "spatial": set(),
+    "spatial": {
+        "use_skip",
+        "final_decoder_local_skip",
+    },
     "cv_transformer": {
-        "time_lag_steps",
-        "time_lag_weight",
+        "use_normalization",
+        "prediction_target",
+        "global_decoder_max_nodes",
+        "global_decoder_layers",
+        "global_decoder_local_skip",
+    },
+    "linear_cv_simulator": {
+        "use_normalization",
+        "prediction_target",
+        "global_decoder_max_nodes",
+        "global_decoder_layers",
+        "linear_encoder_max_edges",
+        "edge_token_dim",
+        "node_token_dim",
     },
     "hybrid": {
         "cv_inject_scale_init",
         "cv_consistency_weight",
         "time_lag_steps",
         "time_lag_weight",
+    },
+    "transformer_simulator": {
+        "use_normalization",
+        "prediction_target",
+        "K1",
+        "K2",
+        "K3",
+        "K4",
+        "cv_dim",
+        "k2_hidden_size",
+        "use_local_skip",
+        "use_lap_pe",
+        "lap_pe_k",
+        "lap_pe_is_undirected",
+        "edge_aggr",
     },
 }
 
@@ -104,7 +147,9 @@ __all__ = [
     "BaseModelInputs",
     "HybridModel",
     "CVTransformerModel",
+    "LinearCVSimulatorModel",
     "SpatialModel",
+    "TransformerSimulatorModel",
     "MODEL_REGISTRY",
     "MODEL_EXTRAS_REQUIRED",
     "resolve_model_extras",

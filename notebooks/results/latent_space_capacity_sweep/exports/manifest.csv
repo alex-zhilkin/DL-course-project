@@ -1,0 +1,7 @@
+name,rows,cols,path
+sweep_summary,72,13,results/latent_space_capacity_sweep/exports/sweep_summary.csv
+sweep_readout,246,9,results/latent_space_capacity_sweep/exports/sweep_readout.csv
+sweep_first_frame_latents,5544,10,results/latent_space_capacity_sweep/exports/sweep_first_frame_latents.csv
+sweep_rollout_stats,72,14,results/latent_space_capacity_sweep/exports/sweep_rollout_stats.csv
+sweep_ae_history,1617,9,results/latent_space_capacity_sweep/exports/sweep_ae_history.csv
+sweep_dyn_history,1542,10,results/latent_space_capacity_sweep/exports/sweep_dyn_history.csv

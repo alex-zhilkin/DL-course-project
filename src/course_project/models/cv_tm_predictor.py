@@ -25,7 +25,7 @@ class SequenceHistoryAdapter(nn.Module):
         x_desc = x_hist.transpose(1, 2)
         tokens = self.in_proj(x_desc) + self.desc_emb.unsqueeze(0)
         mask = torch.ones(tokens.size(0), tokens.size(1), dtype=torch.bool, device=tokens.device)
-        return CVCoreInput(tokens=tokens, mask=mask, local_skip=tokens)
+        return CVCoreInput(tokens=tokens, mask=mask)
 
 
 class TriangularAttention(nn.Module):
@@ -146,16 +146,13 @@ class BackboneModel(nn.Module):
         self.core = SharedCVCore(
             CVCoreConfig(
                 hidden_size=hidden,
-                output_dim=1,
                 transformer_layers=token_layers,
                 transformer_heads=heads,
                 transformer_dropout=dropout,
                 token_sizes=token_sizes,
-                use_local_skip=True,
             )
         )
-        self.dv_head = nn.Linear(self.cv_count, self.feat_dim)
-        self.tau_head = nn.Linear(self.cv_count, self.feat_dim)
+        self.dv_head = nn.Linear(self.cv_count, self.feat_dim, bias=False)
         self.cls_head = nn.Sequential(
             nn.Linear(self.cv_count, hidden // 2),
             nn.GELU(),
@@ -164,9 +161,7 @@ class BackboneModel(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        for layer in (self.dv_head, self.tau_head):
-            nn.init.xavier_uniform_(layer.weight)
-            nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.dv_head.weight)
         for module in self.cls_head.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -177,16 +172,113 @@ class BackboneModel(nn.Module):
         tokens = core_input.tokens
         for layer in self.pre_token_layers:
             tokens = layer(tokens)
-        core_input = CVCoreInput(tokens=tokens, mask=core_input.mask, local_skip=tokens)
+        core_input = CVCoreInput(tokens=tokens, mask=core_input.mask)
         self.core.encode(core_input)
         return self.core.last_cv
 
     def forward(self, x_hist: torch.Tensor):
         cv = self.encode_cv(x_hist)
         dv_pred = self.dv_head(cv)
-        tau_pred = self.tau_head(cv)
         cls_logit = self.cls_head(cv).squeeze(-1)
-        return dv_pred, tau_pred, cls_logit, cv
+        return dv_pred, cls_logit, cv
+
+
+class LinearBackboneModel(nn.Module):
+    """Linear CV backbone over selected descriptor-history tokens."""
+
+    def __init__(
+        self,
+        feat_dim: int,
+        history: int,
+        hidden: int,
+        token_sizes: tuple[int, ...],
+        dropout: float,
+        descriptor_token_dim: int | None = None,
+        descriptor_indices: list[int] | torch.Tensor | None = None,
+        descriptor_metadata: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        self.feat_dim = int(feat_dim)
+        self.history = int(history)
+        self.cv_count = int(token_sizes[-1])
+        self.descriptor_token_dim = int(descriptor_token_dim) if descriptor_token_dim is not None else int(hidden)
+        if descriptor_indices is None:
+            descriptor_indices_t = torch.arange(self.feat_dim, dtype=torch.long)
+        else:
+            descriptor_indices_t = torch.as_tensor(descriptor_indices, dtype=torch.long)
+        self.register_buffer("descriptor_indices", descriptor_indices_t, persistent=False)
+        if descriptor_metadata is None:
+            descriptor_metadata_t = torch.zeros((descriptor_indices_t.numel(), 0), dtype=torch.float32)
+        else:
+            descriptor_metadata_t = torch.as_tensor(descriptor_metadata, dtype=torch.float32)
+        self.register_buffer("descriptor_metadata", descriptor_metadata_t, persistent=False)
+        self.desc_in = nn.Linear(self.history + descriptor_metadata_t.size(1), self.descriptor_token_dim)
+        self.desc_identity = nn.Parameter(torch.randn(descriptor_indices_t.numel(), self.descriptor_token_dim) * 0.01)
+        self.token_mlp = nn.Sequential(
+            nn.Linear(self.descriptor_token_dim, self.descriptor_token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.descriptor_token_dim, self.descriptor_token_dim),
+            nn.GELU(),
+        )
+        sizes = [int(v) for v in token_sizes]
+        in_dim = 3 * self.descriptor_token_dim
+        layers: list[nn.Module] = []
+        for out_dim in sizes[:-1]:
+            layers.append(nn.Linear(in_dim, out_dim))
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, sizes[-1]))
+        self.cv_net = nn.Sequential(*layers)
+        self.dv_head = nn.Linear(self.cv_count, self.feat_dim, bias=False)
+        self.cls_head = nn.Sequential(
+            nn.Linear(self.cv_count, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.desc_in.weight)
+        nn.init.zeros_(self.desc_in.bias)
+        nn.init.normal_(self.desc_identity, mean=0.0, std=0.01)
+        for module in self.token_mlp.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        for module in self.cv_net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        nn.init.xavier_uniform_(self.dv_head.weight)
+        for module in self.cls_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def encode_cv(self, x_hist: torch.Tensor) -> torch.Tensor:
+        x_selected = x_hist.index_select(dim=2, index=self.descriptor_indices.to(x_hist.device))
+        descriptor_histories = x_selected.transpose(1, 2)
+        if self.descriptor_metadata.size(1) > 0:
+            metadata = self.descriptor_metadata.to(x_hist.device).unsqueeze(0).expand(x_hist.size(0), -1, -1)
+            descriptor_histories = torch.cat([descriptor_histories, metadata], dim=-1)
+        descriptor_tokens = self.desc_in(descriptor_histories)
+        descriptor_tokens = descriptor_tokens + self.desc_identity.to(x_hist.device).unsqueeze(0)
+        descriptor_tokens = self.token_mlp(descriptor_tokens)
+        graph_summary = torch.cat(
+            [
+                descriptor_tokens.mean(dim=1),
+                descriptor_tokens.std(dim=1, unbiased=False),
+                descriptor_tokens.max(dim=1).values,
+            ],
+            dim=-1,
+        )
+        return self.cv_net(graph_summary)
+
+    def forward(self, x_hist: torch.Tensor):
+        cv = self.encode_cv(x_hist)
+        dv_pred = self.dv_head(cv)
+        cls_logit = self.cls_head(cv).squeeze(-1)
+        return dv_pred, cls_logit, cv
 
 
 class MetricHead(nn.Module):

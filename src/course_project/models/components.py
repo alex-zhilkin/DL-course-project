@@ -74,8 +74,9 @@ class Normalizer(nn.Module):
 class BasicMeshGNNLayer(MessagePassing):
     """Basic message-passing layer"""
 
-    def __init__(self, hidden_size: int, num_mlp: int):
+    def __init__(self, hidden_size: int, num_mlp: int, use_skip: bool = False):
         super().__init__(aggr="add")
+        self.use_skip = bool(use_skip)
         
         self.message_mlp = build_mlp(
             hidden_size * 3,
@@ -97,7 +98,8 @@ class BasicMeshGNNLayer(MessagePassing):
         return self.message_mlp(torch.cat([x_i, x_j, edge_attr], dim=1))
 
     def update(self, aggr_out: Tensor, x: Tensor) -> Tensor:
-        return self.node_mlp(torch.cat([aggr_out, x], dim=1))
+        out = self.node_mlp(torch.cat([aggr_out, x], dim=1))
+        return x + out if self.use_skip else out
 
     def forward(self, data: Data) -> Data:
         x = self.propagate(edge_index=data.edge_index, x=data.x, edge_attr=data.edge_attr)
@@ -112,15 +114,16 @@ class BasicMeshGNNLayer(MessagePassing):
 class LocalGNNBackbone(nn.Module):
     """Simple local GNN: encode nodes/edges, then run N basic message-passing layers."""
 
-    def __init__(self, in_node_dim: int, in_edge_dim: int, hidden_size: int, n_layers: int, num_mlp: int):
+    def __init__(self, in_node_dim: int, in_edge_dim: int, hidden_size: int, n_layers: int, num_mlp: int, use_skip: bool = False):
         super().__init__()
         self.node_encoder = build_mlp(in_node_dim, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
         self.edge_encoder = build_mlp(in_edge_dim, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
-        self.layers = nn.ModuleList([BasicMeshGNNLayer(hidden_size, num_mlp=num_mlp) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([BasicMeshGNNLayer(hidden_size, num_mlp=num_mlp, use_skip=use_skip) for _ in range(n_layers)])
 
-    def forward(self, data: Data) -> Data:
+    def forward(self, data: Data, *, return_input_embedding: bool = False):
+        x0 = self.node_encoder(data.x)
         out = Data(
-            x=self.node_encoder(data.x),
+            x=x0,
             edge_index=data.edge_index,
             edge_attr=self.edge_encoder(data.edge_attr),
             box=data.box,
@@ -128,4 +131,6 @@ class LocalGNNBackbone(nn.Module):
         )
         for layer in self.layers:
             out = layer(out)
+        if return_input_embedding:
+            return out, x0
         return out

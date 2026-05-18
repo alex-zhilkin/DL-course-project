@@ -1,0 +1,10 @@
+source,path,total,train,val,test,train_original_indices,latent_dim,repeat,train_networks,train_frames_per_network
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,22,1,1,1,1
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,72,1,1,1,2
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,69,1,1,1,4
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,23,2,1,1,1
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,25,2,1,1,2
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,96,2,1,1,4
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,37,4,1,1,1
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,50,4,1,1,2
+new_reid_combined,../data/new_reid_combined.pt,102,1,25,76,67,4,1,1,4

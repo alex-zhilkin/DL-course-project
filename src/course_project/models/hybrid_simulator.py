@@ -107,11 +107,7 @@ class Model(BaseSimulator):
         cv_t_layers = int(extras["transformer_layers"])
         cv_t_heads = int(extras["transformer_heads"])
         cv_t_drop = float(extras["transformer_dropout"])
-        use_local_skip = bool(extras["use_local_skip"])
         token_sizes = tuple(int(v) for v in extras["token_sizes"])
-        time_lag_steps = int(extras.get("time_lag_steps", 0))
-        time_lag_weight = float(extras.get("time_lag_weight", 0.0))
-
         encoder = CVTransformerModel(
             data=data,
             hidden_size=cv_hidden,
@@ -121,10 +117,7 @@ class Model(BaseSimulator):
             transformer_layers=cv_t_layers,
             transformer_heads=cv_t_heads,
             transformer_dropout=cv_t_drop,
-            use_local_skip=use_local_skip,
             token_sizes=token_sizes,
-            time_lag_steps=time_lag_steps,
-            time_lag_weight=time_lag_weight,
         ).to(self.device)
         encoder.load_state_dict(payload["model"])
         return encoder

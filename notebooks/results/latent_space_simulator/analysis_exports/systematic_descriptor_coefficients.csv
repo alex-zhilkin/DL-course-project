@@ -1,0 +1,17 @@
+feature,standardized_coef,dataset
+stiffness_std,-0.26961967468021814,Reid CV1
+vertical_stiffness,0.08028139899501914,Reid CV1
+horizontal_stiffness,-0.06866339676662862,Reid CV1
+node_stiffness_std,0.04455203771860635,Reid CV1
+node_stiffness_mean,0.03238904631776512,Reid CV1
+stiffness_mean,-0.025325398079698812,Reid CV1
+edge_count,0.0018275670650448796,Reid CV1
+diagonal_stiffness,-0.0014857827761852068,Reid CV1
+stiffness_std,-0.26961967468021814,Reid CV2
+vertical_stiffness,0.08028139899501914,Reid CV2
+horizontal_stiffness,-0.06866339676662862,Reid CV2
+node_stiffness_std,0.04455203771860635,Reid CV2
+node_stiffness_mean,0.03238904631776512,Reid CV2
+stiffness_mean,-0.025325398079698812,Reid CV2
+edge_count,0.0018275670650448796,Reid CV2
+diagonal_stiffness,-0.0014857827761852068,Reid CV2

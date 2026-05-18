@@ -228,30 +228,34 @@ def scaled_metric(mutant: str, target_df: pd.DataFrame, metric_name: str, metric
     return (value - metric_stats["mean"]) / metric_stats["std"]
 
 
-def run_sim_epoch(model, loader, device, time_lag_steps: int, time_lag_weight: float, cls_weight: float, opt=None):
+def run_sim_epoch(
+    model,
+    loader,
+    device,
+    time_lag_steps: int = 0,
+    time_lag_weight: float = 0.0,
+    cls_weight: float = 0.0,
+    opt=None,
+):
     train_mode = opt is not None
     model.train(train_mode)
-    sums = {"sim_loss": 0.0, "dv_mse": 0.0, "tau_mse": 0.0, "cls_bce": 0.0}
+    sums = {"sim_loss": 0.0, "dv_mse": 0.0, "cls_bce": 0.0}
     n = 0
-    for xh, y_dv, y_tau, y_cls in loader:
+    for batch in loader:
+        xh, y_dv, *rest = batch
+        y_cls = rest[-1]
         xh = xh.to(device)
         y_dv = y_dv.to(device)
-        y_tau = y_tau.to(device)
         y_cls = y_cls.to(device)
         with torch.set_grad_enabled(train_mode):
-            dv_pred, tau_pred, cls_logit, _ = model(xh)
+            dv_pred, cls_logit, _ = model(xh)
             loss_dv = F.mse_loss(dv_pred, y_dv)
-            loss_tau = (
-                F.mse_loss(tau_pred, y_tau)
-                if time_lag_steps > 0 and time_lag_weight > 0
-                else torch.zeros((), device=loss_dv.device)
-            )
             loss_cls = (
                 F.binary_cross_entropy_with_logits(cls_logit, y_cls)
                 if cls_weight > 0
                 else torch.zeros((), device=loss_dv.device)
             )
-            loss = loss_dv + time_lag_weight * loss_tau + cls_weight * loss_cls
+            loss = loss_dv + cls_weight * loss_cls
             if train_mode:
                 opt.zero_grad()
                 loss.backward()
@@ -260,7 +264,6 @@ def run_sim_epoch(model, loader, device, time_lag_steps: int, time_lag_weight: f
         n += batch_n
         sums["sim_loss"] += float(loss.item()) * batch_n
         sums["dv_mse"] += float(loss_dv.item()) * batch_n
-        sums["tau_mse"] += float(loss_tau.item()) * batch_n
         sums["cls_bce"] += float(loss_cls.item()) * batch_n
     return {k: v / n for k, v in sums.items()}
 

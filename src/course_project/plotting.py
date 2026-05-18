@@ -14,6 +14,17 @@ PAPER_COLORS = {
     "light": "#94a3b8",
 }
 
+SOURCE_COLORS = {
+    "De Pablo": PAPER_COLORS["blue"],
+    "Reid": PAPER_COLORS["red"],
+    "unknown": PAPER_COLORS["slate"],
+}
+
+STATE_COLORS = {
+    "folded": PAPER_COLORS["blue"],
+    "unfolded": PAPER_COLORS["red"],
+}
+
 
 def apply_editorial_style() -> None:
     plt.rcParams.update(

@@ -20,7 +20,7 @@ def _build_graph_at_index(sim, index: int, cfg, device: str):
     
     if len(frames) > 1:
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
-    return build_graph(input_graphs=frames).to(device)
+    return build_graph(input_graphs=frames, node_features=cfg.node_features).to(device)
 
 
 def _build_optimizer(model, cfg):
@@ -56,7 +56,7 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
 
     allow_norm_accum = bool(is_train)
-    input_graph = build_graph(input_graphs=frames[-(cfg.history + 1):]).to(device)
+    input_graph = build_graph(input_graphs=frames[-(cfg.history + 1):], node_features=cfg.node_features).to(device)
     cur_graph = clone_graph(frames[-1]).to(device)
     prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
     if len(frames) > 1:
@@ -243,16 +243,37 @@ def train_graph_model(model, model_inputs_cls, train_data, val_data, cfg, device
     return stats
 
 
-def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, device: str, *, cv_eval_fn: Callable, checkpoint_fn: Callable):
+def train_graph_cv_model(
+    model,
+    model_inputs_cls,
+    train_data,
+    val_data,
+    cfg,
+    device: str,
+    *,
+    cv_eval_fn: Callable,
+    checkpoint_fn: Callable,
+    rollout_eval_fn: Callable | None = None,
+):
     optimizer = _build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.learning_rate_decay)
     stats = _init_stats()
     stats.update({
         "cv_abs_pearson_r": [],
         "cv_fit_r2": [],
+        "cv_combo_abs_pearson_r": [],
+        "cv_combo_fit_r2": [],
+        "cv_combo_rmse": [],
+        "cv_combo_features": [],
         "cv_used": [],
+        "rollout_r2": [],
+        "rollout_pearson_r": [],
+        "rollout_pos_mse": [],
+        "rollout_used": [],
+        "rollout_total": [],
     })
     cv_eval_every = max(int(cfg.cv_eval_every), 0)
+    rollout_every = max(int(cfg.rollout_every), 0)
     val_every = max(int(cfg.val_every), 0)
     freeze_norm_after = max(int(cfg.freeze_normalizers_after_epoch), 0)
     train_start = time.perf_counter()
@@ -274,25 +295,77 @@ def train_graph_cv_model(model, model_inputs_cls, train_data, val_data, cfg, dev
                 val_info = _epoch_loss(model, val_data, cfg, device, model_inputs_cls, optimizer=None)
                 val_loss = float(val_info["loss"])
 
-        cv_metrics = {"cv_abs_pearson_r": float("nan"), "cv_fit_r2": float("nan"), "cv_used": 0, "best_cv_name": None}
+        cv_metrics = {
+            "cv_abs_pearson_r": float("nan"),
+            "cv_fit_r2": float("nan"),
+            "cv_combo_abs_pearson_r": float("nan"),
+            "cv_combo_fit_r2": float("nan"),
+            "cv_combo_rmse": float("nan"),
+            "cv_combo_features": [],
+            "cv_used": 0,
+            "best_cv_name": None,
+        }
         if cv_eval_every > 0 and epoch % cv_eval_every == 0:
             with torch.no_grad():
                 cv_metrics = _with_frozen_normalizers(model, cv_eval_fn)
-            checkpoint_fn(epoch, model, optimizer, scheduler, cv_metrics, float(train_info["loss"]), val_loss)
+
+        rollout_metrics = {
+            "rollout_r2": float("nan"),
+            "rollout_pearson_r": float("nan"),
+            "rollout_pos_mse": float("nan"),
+            "used": 0,
+            "total": 0,
+            "rows": [],
+        }
+        if rollout_eval_fn is not None and rollout_every > 0 and epoch % rollout_every == 0:
+            with torch.no_grad():
+                rollout_metrics = _with_frozen_normalizers(model, rollout_eval_fn)
+
+        if (
+            (cv_eval_every > 0 and epoch % cv_eval_every == 0)
+            or (rollout_eval_fn is not None and rollout_every > 0 and epoch % rollout_every == 0)
+        ):
+            checkpoint_metrics = {**cv_metrics, **rollout_metrics}
+            checkpoint_fn(epoch, model, optimizer, scheduler, checkpoint_metrics, float(train_info["loss"]), val_loss)
 
         scheduler.step()
         epoch_seconds = time.perf_counter() - epoch_start
         _append_common_stats(stats, epoch, train_info, val_info, val_loss, optimizer, epoch_seconds, model)
         stats["cv_abs_pearson_r"].append(float(cv_metrics["cv_abs_pearson_r"]))
         stats["cv_fit_r2"].append(float(cv_metrics["cv_fit_r2"]))
+        stats["cv_combo_abs_pearson_r"].append(float(cv_metrics.get("cv_combo_abs_pearson_r", float("nan"))))
+        stats["cv_combo_fit_r2"].append(float(cv_metrics.get("cv_combo_fit_r2", float("nan"))))
+        stats["cv_combo_rmse"].append(float(cv_metrics.get("cv_combo_rmse", float("nan"))))
+        stats["cv_combo_features"].append(" + ".join(cv_metrics.get("cv_combo_features", [])))
         stats["cv_used"].append(int(cv_metrics["cv_used"]))
+        stats["rollout_r2"].append(float(rollout_metrics["rollout_r2"]))
+        stats["rollout_pearson_r"].append(float(rollout_metrics["rollout_pearson_r"]))
+        stats["rollout_pos_mse"].append(float(rollout_metrics["rollout_pos_mse"]))
+        stats["rollout_used"].append(int(rollout_metrics["used"]))
+        stats["rollout_total"].append(int(rollout_metrics["total"]))
 
-        if (epoch == cfg.epochs) or (val_every > 0 and epoch % val_every == 0) or (cv_eval_every > 0 and epoch % cv_eval_every == 0):
+        if (
+            (epoch == cfg.epochs)
+            or (val_every > 0 and epoch % val_every == 0)
+            or (cv_eval_every > 0 and epoch % cv_eval_every == 0)
+            or (rollout_eval_fn is not None and rollout_every > 0 and epoch % rollout_every == 0)
+        ):
             best_cv_name = cv_metrics.get("best_cv_name")
             cv_text = "|p|=nan r2=nan" if best_cv_name is None else f"{best_cv_name} |p|={_3g(cv_metrics['cv_abs_pearson_r'])} r2={_3g(cv_metrics['cv_fit_r2'])}"
+            combo_features = cv_metrics.get("cv_combo_features", [])
+            combo_name = " + ".join(combo_features) if combo_features else "combo"
+            combo_text = (
+                "combo r2=nan rmse=nan"
+                if not combo_features
+                else f"{combo_name} r2={_3g(cv_metrics.get('cv_combo_fit_r2'))} rmse={_3g(cv_metrics.get('cv_combo_rmse'))}"
+            )
             line = (
                 f"[ep {epoch:>3}/{cfg.epochs}] tr={_3g(train_info['loss'])} va={_3g(val_loss)} "
-                f"lr={_lr_text(optimizer)} cv={cv_text} (n={int(cv_metrics['cv_used'])}) "
+                f"lr={_lr_text(optimizer)} cv={cv_text} {combo_text} (n={int(cv_metrics['cv_used'])}) "
+                f"roll=r2={_3g(rollout_metrics['rollout_r2'])} "
+                f"p={_3g(rollout_metrics['rollout_pearson_r'])} "
+                f"mse={_3g(rollout_metrics['rollout_pos_mse'])} "
+                f"({int(rollout_metrics['used'])}/{int(rollout_metrics['total'])}) "
                 f"t={_3g(epoch_seconds)}s"
             )
             print(line, flush=True)

@@ -32,6 +32,7 @@ class ExperimentConfig:
     split_seed: int | None = None
     shuffle_dataset_within_source: bool = False
     mix_holdout_across_sources: bool = False
+    node_features: str = "positions"
 
     def to_dict(self) -> dict:
         return asdict(self)

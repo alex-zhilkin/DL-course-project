@@ -29,7 +29,17 @@ def resolve_dataset_splits(
     mix_holdout_across_sources: bool = False,
 ):
     if not dataset_mixture:
-        train_data, val_data, test_data = split_dataset(dataset_path, train_count=train_count, val_count=val_count)
+        sims = load_dataset(dataset_path)
+        if shuffle_within_source:
+            generator = torch.Generator()
+            generator.manual_seed(0 if split_seed is None else int(split_seed))
+            order = torch.randperm(len(sims), generator=generator).tolist()
+            sims = [sims[i] for i in order]
+        train_count = int(train_count)
+        val_count = int(val_count)
+        train_data = sims[:train_count]
+        val_data = sims[train_count : train_count + val_count]
+        test_data = sims[train_count + val_count :]
         split_info = [
             {
                 "source": Path(dataset_path).stem,

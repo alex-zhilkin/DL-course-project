@@ -1,0 +1,5 @@
+case_short,latent,strain,pearson_r,corr_r2,n
+selected,z0,horizontal_strain,0.999952508770757,0.9999050197969309,130
+selected,z0,vertical_strain,-0.9999537821187359,0.9999075663735643,130
+selected,z1,horizontal_strain,0.9999518208772263,0.9999036440756806,130
+selected,z1,vertical_strain,-0.9999531047800295,0.9999062117592207,130
