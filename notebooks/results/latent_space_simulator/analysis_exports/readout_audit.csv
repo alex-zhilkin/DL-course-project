@@ -1,2 +1,0 @@
-dataset,selected_on_val,source,val_pearson_r,test_pearson_r,test_r2_after_1d_fit,null_abs_r_p95,empirical_p_abs_r,val_n,test_n
-Reid CV1,initial_z0,single_latent,-0.5935641863614869,0.18754546928772658,0.43424566224829486,0.21667763108882848,0.09950248756218906,20,81

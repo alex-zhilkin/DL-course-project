@@ -1,3 +1,0 @@
-dataset,split,rollout_steps,used,p_ratio_r2,p_ratio_pearson,p_ratio_mse,final_pos_mse,initial_to_target_mse,pred_to_initial_mse,movement_fraction_mse,case,case_short,train_original_sim_idx
-low_p CV2 sim-61,other_trajectories,100,99,-1.9555669288213964,0.4670977241496584,0.2385334359441288,0.0003712955552724783,0.00048629710135623965,0.0009928472766963143,2.082202693590206,low final p-ratio,low_p,61
-high_p CV2 sim-56,other_trajectories,100,99,-2.899390974543813,0.4791276036604846,0.31436794349688696,0.00022129587361834839,0.0004888429121829268,0.0006365733411671085,1.3313870373926486,high final p-ratio,high_p,56

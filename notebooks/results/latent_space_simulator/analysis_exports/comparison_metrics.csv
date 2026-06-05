@@ -1,5 +1,0 @@
-dataset,latent_dim,metric,value
-dePablo CV1,1,decoded_step_100_pos_mse,8.718541527438598e-05
-dePablo CV1,1,decoded_step_100_p_ratio_mae,0.17471032890223784
-dePablo CV2,2,decoded_step_100_pos_mse,6.29515652159777e-05
-dePablo CV2,2,decoded_step_100_p_ratio_mae,0.049259282553972834

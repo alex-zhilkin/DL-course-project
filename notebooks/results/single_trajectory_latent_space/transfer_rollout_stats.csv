@@ -1,2 +1,0 @@
-dataset,split,rollout_steps,used,p_ratio_r2,p_ratio_pearson,p_ratio_mse,final_pos_mse,initial_to_target_mse,pred_to_initial_mse,movement_fraction_mse,case,case_short,train_original_sim_idx
-selected CV2 sim-56,other_trajectories,99,99,-3.03128382449491,0.25122743594313535,0.32468862852889807,0.0002068339179073298,0.00047902113639260407,0.0005859872346833311,1.2548411050228192,selected trajectory sim 56,selected,56

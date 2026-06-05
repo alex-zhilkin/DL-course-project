@@ -1,3 +1,0 @@
-dataset,loo_ridge_r2,features,n
-Reid CV1,0.9140941053283529,"stiffness_mean, stiffness_std, node_stiffness_mean, node_stiffness_std, horizontal_stiffness, vertical_stiffness, diagonal_stiffness, edge_count",67
-Reid CV2,0.9140941053283529,"stiffness_mean, stiffness_std, node_stiffness_mean, node_stiffness_std, horizontal_stiffness, vertical_stiffness, diagonal_stiffness, edge_count",67

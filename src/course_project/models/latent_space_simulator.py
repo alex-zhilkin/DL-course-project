@@ -193,8 +193,83 @@ class LatentDynamicsMLP(nn.Module):
         return z + self.net(z)
 
 
+class LinearLatentDynamics(nn.Module):
+    """Linear residual latent dynamics: z_next = z + A z + b."""
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.delta = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, z: Tensor) -> Tensor:
+        return z + self.delta(z)
+
+
+class DirectLatentDynamicsMLP(nn.Module):
+    """MLP that predicts the next latent embedding directly."""
+
+    def __init__(self, latent_dim: int, hidden_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, latent_dim),
+        )
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.net(z)
+
+
+class VelocityLatentDynamicsMLP(nn.Module):
+    """MLP that predicts normalized latent velocity from state and previous velocity."""
+
+    def __init__(self, latent_dim: int, hidden_size: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * latent_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, latent_dim),
+        )
+
+    def forward(self, z_and_dz: Tensor) -> Tensor:
+        return self.net(z_and_dz)
+
+
+def make_latent_propagator(
+    latent_dim: int,
+    hidden_size: int,
+    *,
+    model_type: str = "residual_mlp",
+) -> nn.Module:
+    """Create a latent propagator.
+
+    ``residual_mlp`` preserves the historical behavior: model(z) returns
+    z_next in the normalized latent coordinate via a residual update.
+    ``direct_mlp`` predicts z_next directly and is useful for JEPA-style
+    next-embedding objectives.
+    """
+
+    model_type = str(model_type).lower()
+    if model_type in {"residual", "residual_mlp", "delta_mlp"}:
+        return LatentDynamicsMLP(latent_dim, hidden_size)
+    if model_type in {"linear", "linear_residual", "linear_delta"}:
+        return LinearLatentDynamics(latent_dim)
+    if model_type in {"direct", "direct_mlp", "jepa_mlp", "next_mlp"}:
+        return DirectLatentDynamicsMLP(latent_dim, hidden_size)
+    if model_type in {"velocity", "velocity_mlp", "second_order_mlp"}:
+        return VelocityLatentDynamicsMLP(latent_dim, hidden_size)
+    raise ValueError(f"Unknown latent propagator model_type: {model_type}")
+
+
 __all__ = [
+    "DirectLatentDynamicsMLP",
     "LatentDynamicsMLP",
+    "LinearLatentDynamics",
     "NodeDeltaAttentionAutoEncoder",
     "SimpleAttentionPool",
+    "VelocityLatentDynamicsMLP",
+    "make_latent_propagator",
 ]

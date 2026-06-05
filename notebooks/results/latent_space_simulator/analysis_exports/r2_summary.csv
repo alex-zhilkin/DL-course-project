@@ -1,3 +1,0 @@
-dataset,p_ratio_signal,p_ratio_signal_source,cv_to_final_p_ratio_r2,test_rollout_p_ratio_r2,rollout_steps
-Reid CV1,initial_z0,single_latent_val_selected,0.6779508755030906,-0.31473316088430403,80
-Reid CV2,initial_z_linear_p_ratio,val_linear_combo,0.7442078312905596,-2.109685457129038,80

@@ -1,3 +1,0 @@
-dataset,signal,target,fit_split,eval_split,intercept,formula,val_pearson_r,val_r2,test_pearson_r,test_r2,weight_initial_z0,weight_initial_z1
-Reid CV1,initial_z_linear_p_ratio,final_p_ratio,val,test,3.741749838238585,1*z0,0.6925890523984285,0.4796795955021529,0.8233777234678448,0.6600721969431756,1.0,
-Reid CV2,initial_z_linear_p_ratio,final_p_ratio,val,test,-3.0659364613904105,0.86*z0 + 0.51*z1,0.7679498584947815,0.5897469851621552,0.8626748120181554,0.713071921119795,0.8611214563666837,0.5083992893237771
