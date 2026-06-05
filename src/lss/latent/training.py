@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -16,18 +17,112 @@ from graph_utils import (
     calc_p_ratio_rollout_sides,
 )
 
-from course_project.graph import clone_graph
-from course_project.latent_simulation import (
+from ..graph import clone_graph
+from .simulation import (
     ae_target_tensor,
     batch_delta_graphs,
     edge_features,
     filtered_frame_ids,
+    frame_node_feature,
     frame_for_filtered_step,
     iter_batches,
     pearson_r,
     r2_score,
 )
-from course_project.models.latent_space_simulator import make_latent_propagator
+from .models import make_latent_propagator
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Shared optimization and early-stopping settings."""
+
+    max_epochs: int = 250
+    patience: int = 8
+    learning_rate: float = 2e-4
+    weight_decay: float = 1e-5
+    min_delta: float = 1e-5
+    log_every: int = 5
+
+
+@dataclass
+class TrainingResult:
+    """Best restored model plus its training history."""
+
+    model: torch.nn.Module
+    history: pd.DataFrame
+    best_val_loss: float
+    best_epoch: int
+
+
+def _train_with_early_stopping(
+    model: torch.nn.Module,
+    *,
+    train_epoch: Callable,
+    val_epoch: Callable,
+    config: TrainingConfig,
+    label: str,
+    metric_key: str | None = None,
+    verbose: bool = True,
+) -> TrainingResult:
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config.learning_rate),
+        weight_decay=float(config.weight_decay),
+    )
+    best_state = None
+    best_val = float("inf")
+    best_epoch = 0
+    stale = 0
+    rows = []
+
+    for epoch in range(1, int(config.max_epochs) + 1):
+        train_info = train_epoch(optimizer)
+        with torch.no_grad():
+            val_info = val_epoch()
+
+        train_loss = float(train_info[metric_key] if metric_key else train_info)
+        val_loss = float(val_info[metric_key] if metric_key else val_info)
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+        }
+        if isinstance(train_info, dict):
+            row.update({f"train_{key}": float(value) for key, value in train_info.items()})
+        if isinstance(val_info, dict):
+            row.update({f"val_{key}": float(value) for key, value in val_info.items()})
+        rows.append(row)
+
+        improved = np.isfinite(val_loss) and val_loss < best_val - float(config.min_delta)
+        if improved:
+            best_val = val_loss
+            best_epoch = epoch
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            stale = 0
+        else:
+            stale += 1
+
+        if verbose and (epoch == 1 or epoch % int(config.log_every) == 0 or improved):
+            print(
+                f"{label} {epoch:04d} train={train_loss:.6g} "
+                f"val={val_loss:.6g} stale={stale}"
+            )
+        if stale >= int(config.patience):
+            break
+
+    if best_state is None:
+        raise RuntimeError(f"{label} training produced no finite validation loss.")
+    model.load_state_dict(best_state)
+    model.eval()
+    return TrainingResult(
+        model=model,
+        history=pd.DataFrame(rows),
+        best_val_loss=float(best_val),
+        best_epoch=int(best_epoch),
+    )
 
 
 @dataclass
@@ -108,7 +203,13 @@ def encode_frame_latent(
     ref_graph = sim[0]
     cur_graph = sim[int(t)]
     ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
-    node_feature = _frame_node_feature(sim, t, pos_dim=pos_dim, mode=node_feature_mode, device=device)
+    node_feature = frame_node_feature(
+        sim,
+        t,
+        pos_dim=pos_dim,
+        mode=node_feature_mode,
+        device=device,
+    )
     node_feature_norm = (node_feature - normalizers["node_feature_mean"].to(device)) / normalizers[
         "node_feature_std"
     ].to(device)
@@ -131,20 +232,6 @@ def encode_frame_latent(
         batch,
     )
     return z.squeeze(0)
-
-
-def _frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch.Tensor:
-    cur_pos = sim[int(t)].x[:, :pos_dim].to(device).float()
-    if mode in ("position", "positions"):
-        return cur_pos
-    if mode == "delta":
-        return cur_pos - sim[0].x[:, :pos_dim].to(device).float()
-    if mode == "velocity":
-        if int(t) <= 0:
-            return torch.zeros_like(cur_pos)
-        prev_pos = sim[int(t) - 1].x[:, :pos_dim].to(device).float()
-        return cur_pos - prev_pos
-    raise ValueError(f"Unknown node_feature_mode: {mode}")
 
 
 def encode_transition_batch(
@@ -308,6 +395,44 @@ def epoch_autoencoder(
             optimizer.step()
         losses.append(float(loss.item()))
     return float(np.mean(losses)) if losses else float("nan")
+
+
+def train_autoencoder(
+    model,
+    train_sims,
+    val_sims,
+    train_rows,
+    val_rows,
+    *,
+    batch_graphs: int,
+    pos_dim: int,
+    node_feature_mode: str,
+    ae_target_mode: str,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    config: TrainingConfig,
+    verbose: bool = True,
+) -> TrainingResult:
+    """Train and restore the best latent autoencoder."""
+
+    common = {
+        "batch_graphs": batch_graphs,
+        "pos_dim": pos_dim,
+        "node_feature_mode": node_feature_mode,
+        "ae_target_mode": ae_target_mode,
+        "normalizers": normalizers,
+        "device": device,
+    }
+    return _train_with_early_stopping(
+        model,
+        train_epoch=lambda optimizer: epoch_autoencoder(
+            model, train_sims, train_rows, optimizer=optimizer, **common
+        ),
+        val_epoch=lambda: epoch_autoencoder(model, val_sims, val_rows, **common),
+        config=config,
+        label="ae",
+        verbose=verbose,
+    )
 
 
 def epoch_propagator(
@@ -601,6 +726,78 @@ def epoch_multistep_propagator(
         "loss_norm": float(np.mean(losses)) if losses else float("nan"),
         "loss_raw": float(np.mean(raw_losses)) if raw_losses else float("nan"),
     }
+
+
+def train_propagator(
+    model,
+    autoencoder,
+    train_sims,
+    val_sims,
+    train_rows,
+    val_rows,
+    stats: LatentNormalizer,
+    *,
+    batch_graphs: int,
+    pos_dim: int,
+    node_feature_mode: str,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    loss_mode: str,
+    config: TrainingConfig,
+    objective: str = "one_step",
+    horizons=None,
+    verbose: bool = True,
+) -> TrainingResult:
+    """Train any latent propagator through the shared training lifecycle."""
+
+    autoencoder.eval()
+    for parameter in autoencoder.parameters():
+        parameter.requires_grad_(False)
+
+    common = {
+        "batch_graphs": batch_graphs,
+        "pos_dim": pos_dim,
+        "node_feature_mode": node_feature_mode,
+        "normalizers": normalizers,
+        "device": device,
+    }
+    objective = str(objective).lower()
+
+    if objective in {"one_step", "next_step"}:
+        epoch_fn = epoch_propagator
+        extra = {"loss_mode": loss_mode}
+    elif objective in {"multistep", "multi_step"}:
+        if not horizons:
+            raise ValueError("horizons are required for multistep propagator training.")
+        epoch_fn = epoch_multistep_propagator
+        extra = {"loss_mode": loss_mode, "horizons": horizons}
+    elif objective in {"velocity", "second_order"}:
+        epoch_fn = epoch_velocity_propagator
+        extra = {}
+    else:
+        raise ValueError(f"Unknown propagator objective: {objective}")
+
+    def run_epoch(sims, rows, optimizer=None):
+        return epoch_fn(
+            model,
+            autoencoder,
+            sims,
+            rows,
+            stats,
+            optimizer=optimizer,
+            **common,
+            **extra,
+        )
+
+    return _train_with_early_stopping(
+        model,
+        train_epoch=lambda optimizer: run_epoch(train_sims, train_rows, optimizer),
+        val_epoch=lambda: run_epoch(val_sims, val_rows),
+        config=config,
+        label="propagator",
+        metric_key="loss_norm",
+        verbose=verbose,
+    )
 
 
 def rollout_position_metrics(df: pd.DataFrame, *, dataset, split_name, rollout_steps) -> dict[str, float]:

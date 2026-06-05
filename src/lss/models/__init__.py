@@ -1,4 +1,4 @@
-"""Standalone simulator models used by course_project."""
+"""Full-space and collective-variable simulator models."""
 
 from __future__ import annotations
 

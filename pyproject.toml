@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "course-project"
+name = "lss"
 version = "0.1.0"
-description = "Course project models for collective variables and simulators"
+description = "Latent-space models and simulators for network dynamics"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
