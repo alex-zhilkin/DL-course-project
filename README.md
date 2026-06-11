@@ -8,12 +8,18 @@ pip install -e .
 
 Download [the data](https://drive.google.com/file/d/1KTWN1Rp-vs5eKmip4tH5tS77y5HUX_CH/view?usp=sharing) and put it in `data/`.
 
-Then run the notebooks in `notebooks/`.
-The main ones are:
+The primary latent-space workflow is:
 
-- `notebooks/01_train_cv_transformer.ipynb`
-- `notebooks/02_train_chignolin_cv_transformer.ipynb`
-- `notebooks/03_training_hybrid.ipynb`
+- `notebooks/latent_space/04_latent_space_simulator.ipynb`
+- `notebooks/latent_space/04a_noisy_latent_dim_sweep.ipynb`
+- `notebooks/latent_space/04b_noisy_train_ood_eval.ipynb`
+
+The simple non-neural Reid baseline is:
+
+- `notebooks/08_reid_stiffness_pratio_affine_rollout.ipynb`
+
+Older CV/transformer comparisons are under `notebooks/baselines/`.
+Unrelated or superseded experiments are under `notebooks/archive/`.
 
 The repo already includes the model artifacts needed to load the existing results.
 So by default the notebooks can reuse those instead of retraining.
