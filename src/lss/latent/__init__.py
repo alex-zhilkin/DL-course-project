@@ -6,6 +6,15 @@ from .models import (
     make_latent_propagator,
 )
 from .simulator import LatentSpaceSimulator
+from .experiment import (
+    initial_latent_analysis,
+    prepare_source_spec,
+    result_tables,
+    rollout_curve_summary,
+    save_result_tables,
+    seed_everything,
+    train_latent_experiment,
+)
 from .training import (
     LatentNormalizer,
     TrainingConfig,
@@ -21,7 +30,14 @@ __all__ = [
     "NodeDeltaAttentionAutoEncoder",
     "TrainingConfig",
     "TrainingResult",
+    "initial_latent_analysis",
     "make_latent_propagator",
+    "prepare_source_spec",
+    "result_tables",
+    "rollout_curve_summary",
+    "save_result_tables",
+    "seed_everything",
     "train_autoencoder",
+    "train_latent_experiment",
     "train_propagator",
 ]

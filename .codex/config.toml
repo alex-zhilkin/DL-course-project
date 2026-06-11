@@ -1,0 +1,5 @@
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[projects."/absolute/path/to/your/folder"]
+trust_level = "trusted"

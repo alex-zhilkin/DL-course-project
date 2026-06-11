@@ -78,6 +78,8 @@ def evaluate_rollout_pratio_sides(model, sims: list, history: int, rollout_steps
         pred_pos = roll[-1].x[:, :pos_dim]
         target_pos = sim[target_index].x[:, :pos_dim].to(pred_pos.device)
         pos_mse = float(torch.nn.functional.mse_loss(pred_pos, target_pos).item())
+        if not np.isfinite(pos_mse):
+            continue
 
         preds.append(pred_pr)
         targets.append(target_pr)

@@ -135,6 +135,8 @@ class LatentNormalizer:
     dz_std: torch.Tensor
     z_next_mean: torch.Tensor | None = None
     z_next_std: torch.Tensor | None = None
+    context_mean: torch.Tensor | None = None
+    context_std: torch.Tensor | None = None
 
     def to(self, device) -> "LatentNormalizer":
         return LatentNormalizer(
@@ -144,6 +146,8 @@ class LatentNormalizer:
             dz_std=self.dz_std.to(device),
             z_next_mean=None if self.z_next_mean is None else self.z_next_mean.to(device),
             z_next_std=None if self.z_next_std is None else self.z_next_std.to(device),
+            context_mean=None if self.context_mean is None else self.context_mean.to(device),
+            context_std=None if self.context_std is None else self.context_std.to(device),
         )
 
     def as_dict(self) -> dict[str, torch.Tensor]:
@@ -157,6 +161,10 @@ class LatentNormalizer:
             out["z_next_mean"] = self.z_next_mean
         if self.z_next_std is not None:
             out["z_next_std"] = self.z_next_std
+        if self.context_mean is not None:
+            out["context_mean"] = self.context_mean
+        if self.context_std is not None:
+            out["context_std"] = self.context_std
         return out
 
     @classmethod
@@ -168,6 +176,8 @@ class LatentNormalizer:
             dz_std=values["dz_std"],
             z_next_mean=values.get("z_next_mean"),
             z_next_std=values.get("z_next_std"),
+            context_mean=values.get("context_mean"),
+            context_std=values.get("context_std"),
         )
 
     def normalize_z(self, z: torch.Tensor) -> torch.Tensor:
@@ -188,6 +198,46 @@ class LatentNormalizer:
         mean = self.z_next_mean if self.z_next_mean is not None else self.z_mean
         std = self.z_next_std if self.z_next_std is not None else self.z_std
         return z_norm * std + mean
+
+    def normalize_context(self, context: torch.Tensor | None) -> torch.Tensor | None:
+        if context is None:
+            return None
+        if self.context_mean is None or self.context_std is None:
+            return context
+        return (context - self.context_mean) / self.context_std
+
+
+def encode_reference_context(
+    ae_model,
+    sim,
+    *,
+    pos_dim: int,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    include_temperature: bool = False,
+) -> torch.Tensor:
+    """Pool the learned reference-node representation into static network context."""
+    ref_graph = sim[0]
+    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    ref_edge_attr_norm = (
+        edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device)
+        - normalizers["edge_mean"].to(device)
+    ) / normalizers["edge_std"].to(device)
+    h0 = ae_model.encode_reference_graph(
+        ref_pos,
+        ref_edge_attr_norm,
+        ref_graph.edge_index.to(device).long(),
+    )
+    context = h0.mean(dim=0)
+    if include_temperature:
+        temperature = float(getattr(ref_graph, "temperature", 0.0))
+        temperature_feature = torch.tensor(
+            [np.log1p(max(temperature, 0.0))],
+            dtype=context.dtype,
+            device=context.device,
+        )
+        context = torch.cat([context, temperature_feature], dim=0)
+    return context
 
 
 def encode_frame_latent(
@@ -289,10 +339,13 @@ def fit_latent_step_stats(
     node_feature_mode: str,
     normalizers: dict[str, torch.Tensor],
     device,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
 ) -> LatentNormalizer:
     z_chunks = []
     z_next_chunks = []
     dz_chunks = []
+    context_chunks = []
     for rows_batch in iter_batches(rows, batch_graphs, shuffle=False):
         z0, z1 = encode_transition_batch(
             ae_model,
@@ -306,9 +359,22 @@ def fit_latent_step_stats(
         z_chunks.append(z0.detach())
         z_next_chunks.append(z1.detach())
         dz_chunks.append((z1 - z0).detach())
+        if use_static_context:
+            context_chunks.extend(
+                encode_reference_context(
+                    ae_model,
+                    sims[int(row[0])],
+                    pos_dim=pos_dim,
+                    normalizers=normalizers,
+                    device=device,
+                    include_temperature=context_include_temperature,
+                ).detach()
+                for row in rows_batch
+            )
     z_all = torch.cat(z_chunks, dim=0)
     z_next_all = torch.cat(z_next_chunks, dim=0)
     dz_all = torch.cat(dz_chunks, dim=0)
+    context_all = torch.stack(context_chunks, dim=0) if context_chunks else None
     return LatentNormalizer(
         z_mean=z_all.mean(dim=0, keepdim=True),
         z_std=z_all.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6),
@@ -316,6 +382,12 @@ def fit_latent_step_stats(
         dz_std=dz_all.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6),
         z_next_mean=z_next_all.mean(dim=0, keepdim=True),
         z_next_std=z_next_all.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6),
+        context_mean=None if context_all is None else context_all.mean(dim=0, keepdim=True),
+        context_std=(
+            None
+            if context_all is None
+            else context_all.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+        ),
     )
 
 
@@ -331,10 +403,20 @@ def make_propagator(latent_dim: int, hidden_size: int, *, loss_mode: str, model_
     return make_latent_propagator(latent_dim, hidden_size, model_type=model_type)
 
 
-def latent_step(model, z: torch.Tensor, stats: LatentNormalizer, *, loss_mode: str) -> torch.Tensor:
+def latent_step(
+    model,
+    z: torch.Tensor,
+    stats: LatentNormalizer,
+    *,
+    loss_mode: str,
+    context: torch.Tensor | None = None,
+) -> torch.Tensor:
     loss_mode = str(loss_mode).lower()
     z_norm = stats.normalize_z(z.unsqueeze(0))
-    pred = model(z_norm)
+    context_norm = stats.normalize_context(
+        None if context is None else context.unsqueeze(0)
+    )
+    pred = model(z_norm, context_norm)
     if loss_mode in {"delta", "dz", "residual_delta", "hybrid_delta_next"}:
         pred_dz_norm = pred - z_norm
         return z + stats.unnormalize_dz(pred_dz_norm).squeeze(0)
@@ -354,6 +436,7 @@ def epoch_autoencoder(
     ae_target_mode: str,
     normalizers: dict[str, torch.Tensor],
     device,
+    coordinate_weights=None,
     optimizer=None,
 ) -> float:
     is_train = optimizer is not None
@@ -387,7 +470,19 @@ def epoch_autoencoder(
             batch_data["edge_index"],
             batch_data["batch"],
         )
-        loss = F.mse_loss(recon_norm, target_norm)
+        squared_error = (recon_norm - target_norm).square()
+        if coordinate_weights is not None:
+            weights = torch.as_tensor(
+                coordinate_weights,
+                dtype=squared_error.dtype,
+                device=squared_error.device,
+            ).reshape(1, -1)
+            if weights.size(-1) != squared_error.size(-1):
+                raise ValueError(
+                    "coordinate_weights must have one value per reconstructed coordinate."
+                )
+            squared_error = squared_error * weights / weights.mean().clamp_min(1e-8)
+        loss = squared_error.mean()
         if is_train:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -411,6 +506,7 @@ def train_autoencoder(
     normalizers: dict[str, torch.Tensor],
     device,
     config: TrainingConfig,
+    coordinate_weights=None,
     verbose: bool = True,
 ) -> TrainingResult:
     """Train and restore the best latent autoencoder."""
@@ -422,6 +518,7 @@ def train_autoencoder(
         "ae_target_mode": ae_target_mode,
         "normalizers": normalizers,
         "device": device,
+        "coordinate_weights": coordinate_weights,
     }
     return _train_with_early_stopping(
         model,
@@ -448,6 +545,8 @@ def epoch_propagator(
     normalizers: dict[str, torch.Tensor],
     device,
     loss_mode: str,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
     optimizer=None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
@@ -466,7 +565,24 @@ def epoch_propagator(
             device=device,
         )
         z0_norm = stats.normalize_z(z0)
-        pred = model(z0_norm)
+        context = None
+        if use_static_context:
+            context = torch.stack(
+                [
+                    encode_reference_context(
+                        ae_model,
+                        sims[int(row[0])],
+                        pos_dim=pos_dim,
+                        normalizers=normalizers,
+                        device=device,
+                        include_temperature=context_include_temperature,
+                    )
+                    for row in rows
+                ],
+                dim=0,
+            )
+            context = stats.normalize_context(context)
+        pred = model(z0_norm, context)
         if loss_mode in {"delta", "dz", "residual_delta", "hybrid_delta_next"}:
             target_norm = stats.normalize_dz(z1 - z0)
             pred_norm = pred - z0_norm
@@ -528,6 +644,8 @@ def epoch_velocity_propagator(
     node_feature_mode: str,
     normalizers: dict[str, torch.Tensor],
     device,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
     optimizer=None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
@@ -580,7 +698,24 @@ def epoch_velocity_propagator(
         prev_dz = z0 - z_prev
         target_dz = z1 - z0
         inp = torch.cat([stats.normalize_z(z0), stats.normalize_dz(prev_dz)], dim=-1)
-        pred_dz_norm = model(inp)
+        context = None
+        if use_static_context:
+            context = torch.stack(
+                [
+                    encode_reference_context(
+                        ae_model,
+                        sims[int(row[0])],
+                        pos_dim=pos_dim,
+                        normalizers=normalizers,
+                        device=device,
+                        include_temperature=context_include_temperature,
+                    )
+                    for row in batch_rows
+                ],
+                dim=0,
+            )
+            context = stats.normalize_context(context)
+        pred_dz_norm = model(inp, context)
         target_dz_norm = stats.normalize_dz(target_dz)
         pred_z1 = z0 + stats.unnormalize_dz(pred_dz_norm)
         loss = F.mse_loss(pred_dz_norm, target_dz_norm)
@@ -602,9 +737,13 @@ def latent_step_velocity(
     z: torch.Tensor,
     prev_dz: torch.Tensor,
     stats: LatentNormalizer,
+    context: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inp = torch.cat([stats.normalize_z(z.unsqueeze(0)), stats.normalize_dz(prev_dz.unsqueeze(0))], dim=-1)
-    pred_dz = stats.unnormalize_dz(model(inp)).squeeze(0)
+    context_norm = stats.normalize_context(
+        None if context is None else context.unsqueeze(0)
+    )
+    pred_dz = stats.unnormalize_dz(model(inp, context_norm)).squeeze(0)
     return z + pred_dz, pred_dz
 
 
@@ -652,6 +791,8 @@ def epoch_multistep_propagator(
     device,
     loss_mode: str,
     horizons,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
     optimizer=None,
 ) -> dict[str, float]:
     """Train a propagator through autoregressive latent unrolls.
@@ -696,8 +837,26 @@ def epoch_multistep_propagator(
                 )
                 for target_frame in target_frames
             ]
+            context = (
+                encode_reference_context(
+                    ae_model,
+                    sim,
+                    pos_dim=pos_dim,
+                    normalizers=normalizers,
+                    device=device,
+                    include_temperature=context_include_temperature,
+                )
+                if use_static_context
+                else None
+            )
             for step_idx in range(1, max_horizon + 1):
-                z = latent_step(model, z, stats, loss_mode=loss_mode)
+                z = latent_step(
+                    model,
+                    z,
+                    stats,
+                    loss_mode=loss_mode,
+                    context=context,
+                )
                 if step_idx not in horizon_to_idx:
                     continue
                 true_z = target_z[horizon_to_idx[step_idx]]
@@ -746,6 +905,8 @@ def train_propagator(
     config: TrainingConfig,
     objective: str = "one_step",
     horizons=None,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
     verbose: bool = True,
 ) -> TrainingResult:
     """Train any latent propagator through the shared training lifecycle."""
@@ -760,6 +921,8 @@ def train_propagator(
         "node_feature_mode": node_feature_mode,
         "normalizers": normalizers,
         "device": device,
+        "use_static_context": use_static_context,
+        "context_include_temperature": context_include_temperature,
     }
     objective = str(objective).lower()
 

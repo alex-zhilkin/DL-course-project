@@ -27,7 +27,24 @@ def _3g(value) -> str:
 
 
 def _select_best_rollout_checkpoint(entries: list[dict]) -> dict:
-    return max(entries, key=lambda e: (float(e["rollout_r2"]), int(e["epoch"])))
+    candidates = [
+        entry
+        for entry in entries
+        if int(entry.get("used", 0)) > 0
+        and np.isfinite(float(entry.get("rollout_r2", float("nan"))))
+        and np.isfinite(float(entry.get("rollout_pos_mse", float("nan"))))
+    ]
+    if not candidates:
+        raise RuntimeError("No checkpoint produced a finite rollout.")
+    return max(
+        candidates,
+        key=lambda entry: (
+            int(entry.get("used", 0)) / max(int(entry.get("total", 0)), 1),
+            float(entry["rollout_r2"]),
+            -float(entry["rollout_pos_mse"]),
+            int(entry["epoch"]),
+        ),
+    )
 
 
 def _select_best_cv_checkpoint(entries: list[dict], stats: dict) -> dict:
@@ -105,6 +122,7 @@ def _build_model_and_data(cfg: ExperimentConfig):
         dataset_mixture=cfg.dataset_mixture,
         split_seed=cfg.split_seed,
         shuffle_within_source=cfg.shuffle_dataset_within_source,
+        stratify_temperature=cfg.stratify_temperature,
         mix_holdout_across_sources=cfg.mix_holdout_across_sources,
     )
     if cfg.model_type in {"cv_transformer", "linear_cv_simulator"} and cfg.model_extras.get("global_decoder_max_nodes") is None:

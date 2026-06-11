@@ -178,64 +178,184 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
         return recon, z
 
 
-class LatentDynamicsMLP(nn.Module):
-    def __init__(self, latent_dim: int, hidden_size: int):
+class StaticContextProjection(nn.Module):
+    """Project a pooled graph embedding while preserving optional scalar temperature."""
+
+    def __init__(
+        self,
+        raw_context_dim: int,
+        graph_context_dim: int | None = None,
+        *,
+        include_temperature: bool = False,
+    ):
         super().__init__()
+        self.raw_context_dim = int(raw_context_dim)
+        self.include_temperature = bool(include_temperature)
+        self.raw_graph_dim = self.raw_context_dim - int(self.include_temperature)
+        if self.raw_graph_dim < 0:
+            raise ValueError("raw_context_dim is too small for temperature conditioning.")
+        self.graph_context_dim = (
+            self.raw_graph_dim
+            if graph_context_dim is None
+            else int(graph_context_dim)
+        )
+        self.output_dim = self.graph_context_dim + int(self.include_temperature)
+        self.graph_projection = (
+            nn.Identity()
+            if self.graph_context_dim == self.raw_graph_dim
+            else nn.Sequential(
+                nn.Linear(self.raw_graph_dim, self.graph_context_dim),
+                nn.GELU(),
+            )
+        )
+
+    def forward(self, context: Tensor | None) -> Tensor | None:
+        if self.raw_context_dim <= 0:
+            return context
+        if context is None:
+            raise ValueError("This latent propagator requires static network context.")
+        if context.size(-1) != self.raw_context_dim:
+            raise ValueError(
+                f"Expected raw_context_dim={self.raw_context_dim}, "
+                f"received {context.size(-1)}."
+            )
+        graph_context = self.graph_projection(context[..., : self.raw_graph_dim])
+        if not self.include_temperature:
+            return graph_context
+        return torch.cat([graph_context, context[..., -1:]], dim=-1)
+
+
+class LatentDynamicsMLP(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_size: int,
+        context_dim: int = 0,
+        graph_context_dim: int | None = None,
+        context_include_temperature: bool = False,
+    ):
+        super().__init__()
+        self.context_projection = StaticContextProjection(
+            context_dim,
+            graph_context_dim,
+            include_temperature=context_include_temperature,
+        )
+        self.context_dim = self.context_projection.output_dim
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_size),
+            nn.Linear(latent_dim + self.context_dim, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, latent_dim),
         )
 
-    def forward(self, z: Tensor) -> Tensor:
-        return z + self.net(z)
+    def forward(self, z: Tensor, context: Tensor | None = None) -> Tensor:
+        features = _append_context(z, self.context_projection(context), self.context_dim)
+        return z + self.net(features)
 
 
 class LinearLatentDynamics(nn.Module):
     """Linear residual latent dynamics: z_next = z + A z + b."""
 
-    def __init__(self, latent_dim: int):
+    def __init__(
+        self,
+        latent_dim: int,
+        context_dim: int = 0,
+        graph_context_dim: int | None = None,
+        context_include_temperature: bool = False,
+    ):
         super().__init__()
-        self.delta = nn.Linear(latent_dim, latent_dim)
+        self.context_projection = StaticContextProjection(
+            context_dim,
+            graph_context_dim,
+            include_temperature=context_include_temperature,
+        )
+        self.context_dim = self.context_projection.output_dim
+        self.delta = nn.Linear(latent_dim + self.context_dim, latent_dim)
 
-    def forward(self, z: Tensor) -> Tensor:
-        return z + self.delta(z)
+    def forward(self, z: Tensor, context: Tensor | None = None) -> Tensor:
+        features = _append_context(z, self.context_projection(context), self.context_dim)
+        return z + self.delta(features)
 
 
 class DirectLatentDynamicsMLP(nn.Module):
     """MLP that predicts the next latent embedding directly."""
 
-    def __init__(self, latent_dim: int, hidden_size: int):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_size: int,
+        context_dim: int = 0,
+        graph_context_dim: int | None = None,
+        context_include_temperature: bool = False,
+    ):
         super().__init__()
+        self.context_projection = StaticContextProjection(
+            context_dim,
+            graph_context_dim,
+            include_temperature=context_include_temperature,
+        )
+        self.context_dim = self.context_projection.output_dim
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_size),
+            nn.Linear(latent_dim + self.context_dim, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, latent_dim),
         )
 
-    def forward(self, z: Tensor) -> Tensor:
-        return self.net(z)
+    def forward(self, z: Tensor, context: Tensor | None = None) -> Tensor:
+        return self.net(
+            _append_context(z, self.context_projection(context), self.context_dim)
+        )
 
 
 class VelocityLatentDynamicsMLP(nn.Module):
     """MLP that predicts normalized latent velocity from state and previous velocity."""
 
-    def __init__(self, latent_dim: int, hidden_size: int):
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_size: int,
+        context_dim: int = 0,
+        graph_context_dim: int | None = None,
+        context_include_temperature: bool = False,
+    ):
         super().__init__()
+        self.context_projection = StaticContextProjection(
+            context_dim,
+            graph_context_dim,
+            include_temperature=context_include_temperature,
+        )
+        self.context_dim = self.context_projection.output_dim
         self.net = nn.Sequential(
-            nn.Linear(2 * latent_dim, hidden_size),
+            nn.Linear(2 * latent_dim + self.context_dim, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, latent_dim),
         )
 
-    def forward(self, z_and_dz: Tensor) -> Tensor:
-        return self.net(z_and_dz)
+    def forward(self, z_and_dz: Tensor, context: Tensor | None = None) -> Tensor:
+        return self.net(
+            _append_context(
+                z_and_dz,
+                self.context_projection(context),
+                self.context_dim,
+            )
+        )
+
+
+def _append_context(state: Tensor, context: Tensor | None, context_dim: int) -> Tensor:
+    if context_dim <= 0:
+        return state
+    if context is None:
+        raise ValueError("This latent propagator requires static network context.")
+    if context.size(-1) != context_dim:
+        raise ValueError(
+            f"Expected context_dim={context_dim}, received {context.size(-1)}."
+        )
+    return torch.cat([state, context], dim=-1)
 
 
 def make_latent_propagator(
@@ -243,6 +363,9 @@ def make_latent_propagator(
     hidden_size: int,
     *,
     model_type: str = "residual_mlp",
+    context_dim: int = 0,
+    graph_context_dim: int | None = None,
+    context_include_temperature: bool = False,
 ) -> nn.Module:
     """Create a latent propagator.
 
@@ -253,14 +376,19 @@ def make_latent_propagator(
     """
 
     model_type = str(model_type).lower()
+    context_kwargs = {
+        "context_dim": context_dim,
+        "graph_context_dim": graph_context_dim,
+        "context_include_temperature": context_include_temperature,
+    }
     if model_type in {"residual", "residual_mlp", "delta_mlp"}:
-        return LatentDynamicsMLP(latent_dim, hidden_size)
+        return LatentDynamicsMLP(latent_dim, hidden_size, **context_kwargs)
     if model_type in {"linear", "linear_residual", "linear_delta"}:
-        return LinearLatentDynamics(latent_dim)
+        return LinearLatentDynamics(latent_dim, **context_kwargs)
     if model_type in {"direct", "direct_mlp", "jepa_mlp", "next_mlp"}:
-        return DirectLatentDynamicsMLP(latent_dim, hidden_size)
+        return DirectLatentDynamicsMLP(latent_dim, hidden_size, **context_kwargs)
     if model_type in {"velocity", "velocity_mlp", "second_order_mlp"}:
-        return VelocityLatentDynamicsMLP(latent_dim, hidden_size)
+        return VelocityLatentDynamicsMLP(latent_dim, hidden_size, **context_kwargs)
     raise ValueError(f"Unknown latent propagator model_type: {model_type}")
 
 
@@ -270,6 +398,7 @@ __all__ = [
     "LinearLatentDynamics",
     "NodeDeltaAttentionAutoEncoder",
     "SimpleAttentionPool",
+    "StaticContextProjection",
     "VelocityLatentDynamicsMLP",
     "make_latent_propagator",
 ]

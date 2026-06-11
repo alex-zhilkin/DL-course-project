@@ -31,6 +31,7 @@ class ExperimentConfig:
     dataset_mixture: list[dict] | None = None
     split_seed: int | None = None
     shuffle_dataset_within_source: bool = False
+    stratify_temperature: bool = False
     mix_holdout_across_sources: bool = False
     node_features: str = "positions"
 
