@@ -16,6 +16,10 @@ def _install_legacy_auxetic_box_alias() -> None:
     network_module = sys.modules.setdefault("auxetic.network", ModuleType("auxetic.network"))
     network_module.Box = Box
     auxetic_module.network = network_module
+    # Some standalone trajectory generators serialized the same Box type as
+    # ``network.Box`` rather than ``auxetic.network.Box``.
+    legacy_network_module = sys.modules.setdefault("network", ModuleType("network"))
+    legacy_network_module.Box = Box
 
 
 def load_dataset(path: str | Path) -> list:
@@ -34,6 +38,14 @@ def simulation_temperature(sim, default: float = float("nan")) -> float:
     except (TypeError, ValueError):
         return float(default)
     return temperature if math.isfinite(temperature) else float(default)
+
+
+def tag_simulation_source(sim, source_name: str):
+    """Attach source metadata to each frame in a simulation."""
+
+    for frame in sim:
+        frame.source_name = str(source_name)
+    return sim
 
 
 def split_dataset(path: str | Path, *, train_count: int, val_count: int) -> tuple[list, list, list]:
@@ -165,21 +177,29 @@ def resolve_dataset_splits(
         path = Path(spec["path"])
         source_name = str(spec.get("name", f"source_{source_idx + 1}"))
         sims = load_dataset(path)
+        sims = [tag_simulation_source(sim, source_name) for sim in sims]
         if generator is not None:
             order = torch.randperm(len(sims), generator=generator).tolist()
             sims = [sims[i] for i in order]
         src_train = int(spec["train_count"])
+        holdout_train_count = int(spec.get("holdout_train_count", src_train))
+        if src_train > holdout_train_count:
+            raise ValueError(
+                "train_count cannot exceed holdout_train_count for a dataset source."
+            )
         src_train_data = sims[:src_train]
         train_data.extend(src_train_data)
         if mix_holdout_across_sources:
-            for sim in sims[src_train:]:
+            for sim in sims[holdout_train_count:]:
                 pooled_holdout.append((source_name, sim))
             src_val_data = []
             src_test_data = []
         else:
             src_val = int(spec["val_count"])
-            src_val_data = sims[src_train : src_train + src_val]
-            src_test_data = sims[src_train + src_val :]
+            src_val_data = sims[
+                holdout_train_count : holdout_train_count + src_val
+            ]
+            src_test_data = sims[holdout_train_count + src_val :]
             val_data.extend(src_val_data)
             test_data.extend(src_test_data)
         split_info.append(
@@ -188,6 +208,7 @@ def resolve_dataset_splits(
                 "path": str(path),
                 "total": len(sims),
                 "train": len(src_train_data),
+                "reserved_train_pool": holdout_train_count,
                 "val": len(src_val_data),
                 "test": len(src_test_data),
             }

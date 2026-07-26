@@ -3,9 +3,11 @@
 from .models import (
     LatentDynamicsMLP,
     NodeDeltaAttentionAutoEncoder,
+    NodeDeltaDirectAttentionAutoEncoder,
     make_latent_propagator,
 )
 from .simulator import LatentSpaceSimulator
+from .physics import PhysicsLossConfig, elastic_implicit_euler_energy
 from .experiment import (
     initial_latent_analysis,
     prepare_source_spec,
@@ -28,6 +30,8 @@ __all__ = [
     "LatentNormalizer",
     "LatentSpaceSimulator",
     "NodeDeltaAttentionAutoEncoder",
+    "NodeDeltaDirectAttentionAutoEncoder",
+    "PhysicsLossConfig",
     "TrainingConfig",
     "TrainingResult",
     "initial_latent_analysis",
@@ -40,4 +44,5 @@ __all__ = [
     "train_autoencoder",
     "train_latent_experiment",
     "train_propagator",
+    "elastic_implicit_euler_energy",
 ]

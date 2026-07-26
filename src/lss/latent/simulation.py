@@ -7,6 +7,10 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+from graph_utils import directional_side_indices_from_box
+
+from ..graph import box_tensor
+
 
 
 def filtered_frame_ids(
@@ -93,6 +97,75 @@ def edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor
     return torch.cat([ref_vec, cur_vec, ref_len, cur_len, stretch, rel_stretch, stiffness, cur_e], dim=-1)
 
 
+def complete_graph_edge_data(
+    ref_graph,
+    cur_graph,
+    *,
+    pos_dim: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build directed all-pairs edges with periodic geometry and stored-bond weights.
+
+    Every ordered pair ``i -> j`` with ``i != j`` is present. The original
+    undirected elastic coefficient is copied to both directions; pairs absent
+    from the stored elastic graph receive coefficient zero. Geometry uses the
+    minimum-image convention when a periodic box is available.
+    """
+    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    cur_pos = cur_graph.x[:, :pos_dim].to(device).float()
+    if ref_pos.shape != cur_pos.shape:
+        raise ValueError("Complete-graph edge mode requires a fixed node set across frames.")
+
+    num_nodes = ref_pos.size(0)
+    nodes = torch.arange(num_nodes, device=device)
+    source = nodes.repeat_interleave(num_nodes)
+    target = nodes.repeat(num_nodes)
+    keep = source != target
+    source, target = source[keep], target[keep]
+    edge_index = torch.stack([source, target], dim=0)
+
+    def pair_geometry(pos, graph):
+        vector = pos[target] - pos[source]
+        box = box_tensor(graph, device=device, dtype=pos.dtype)
+        if box is not None:
+            vector = vector - torch.round(vector / box.reshape(1, -1)) * box.reshape(1, -1)
+        length = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        return vector, length
+
+    ref_vec, ref_len = pair_geometry(ref_pos, ref_graph)
+    cur_vec, cur_len = pair_geometry(cur_pos, cur_graph)
+
+    stiffness_matrix = torch.zeros(
+        (num_nodes, num_nodes), device=device, dtype=ref_pos.dtype
+    )
+    stored_index = ref_graph.edge_index.to(device).long()
+    stored_stiffness = ref_graph.edge_attr[:, -1].to(device).float()
+    stored_source, stored_target = stored_index
+    stiffness_matrix[stored_source, stored_target] = stored_stiffness
+    stiffness_matrix[stored_target, stored_source] = stored_stiffness
+    stiffness = stiffness_matrix[source, target].reshape(-1, 1)
+
+    def expanded_features(current_vec, current_len):
+        stretch = current_len - ref_len
+        relative_stretch = stretch / ref_len.clamp_min(1e-6)
+        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        return torch.cat(
+            [
+                ref_vec,
+                current_vec,
+                ref_len,
+                current_len,
+                stretch,
+                relative_stretch,
+                stiffness,
+                current_raw,
+            ],
+            dim=-1,
+        )
+
+    return edge_index, expanded_features(cur_vec, cur_len), expanded_features(ref_vec, ref_len)
+
+
 def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch.Tensor:
     t = int(t)
     cur_pos = sim[t].x[:, :pos_dim].to(device).float()
@@ -101,6 +174,10 @@ def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch
     if mode == "delta":
         ref_pos = sim[0].x[:, :pos_dim].to(device).float()
         return cur_pos - ref_pos
+    if mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
+        ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+        scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
+        return (cur_pos - ref_pos) / scale.reshape(1, -1)
     if mode == "velocity":
         if t <= 0:
             return torch.zeros_like(cur_pos)
@@ -116,6 +193,7 @@ def batch_delta_graphs(
     pos_dim: int,
     device,
     node_feature_mode: str = "delta",
+    edge_mode: str = "stored",
 ) -> dict[str, torch.Tensor]:
     xs = []
     node_features = []
@@ -124,6 +202,7 @@ def batch_delta_graphs(
     edge_attrs = []
     ref_edge_attrs = []
     edge_indices = []
+    scales = []
     batch = []
     node_offset = 0
     for local_idx, (sim_idx, t) in enumerate(rows):
@@ -132,19 +211,33 @@ def batch_delta_graphs(
         cur_graph = sim[int(t)]
         ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
         cur_pos = cur_graph.x[:, :pos_dim].to(device).float()
+        scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
         xs.append(cur_pos - ref_pos)
+        scales.append(scale.reshape(1, -1).expand(ref_pos.size(0), -1))
         cur_positions.append(cur_pos)
         node_features.append(
             frame_node_feature(sim, t, pos_dim=pos_dim, mode=node_feature_mode, device=device)
         )
         ref_xs.append(ref_pos)
-        edge_attrs.append(edge_features(ref_graph, cur_graph, pos_dim=pos_dim, device=device))
-        ref_edge_attrs.append(edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device))
-        edge_indices.append(ref_graph.edge_index.to(device).long() + node_offset)
+        if edge_mode == "complete":
+            local_edge_index, current_edges, reference_edges = complete_graph_edge_data(
+                ref_graph, cur_graph, pos_dim=pos_dim, device=device
+            )
+        elif edge_mode == "stored":
+            local_edge_index = ref_graph.edge_index.to(device).long()
+            current_edges = edge_features(ref_graph, cur_graph, pos_dim=pos_dim, device=device)
+            reference_edges = edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device)
+        else:
+            raise ValueError(f"Unknown edge_mode: {edge_mode}")
+        edge_attrs.append(current_edges)
+        ref_edge_attrs.append(reference_edges)
+        edge_indices.append(local_edge_index + node_offset)
         batch.append(torch.full((ref_pos.size(0),), local_idx, dtype=torch.long, device=device))
         node_offset += ref_pos.size(0)
     return {
         "delta": torch.cat(xs, dim=0),
+        "normalized_delta": torch.cat(xs, dim=0) / torch.cat(scales, dim=0),
+        "position_scale": torch.cat(scales, dim=0),
         "cur_pos": torch.cat(cur_positions, dim=0),
         "node_feature": torch.cat(node_features, dim=0),
         "ref_pos": torch.cat(ref_xs, dim=0),
@@ -160,6 +253,8 @@ def ae_target_tensor(batch_data: dict[str, torch.Tensor], target_mode: str) -> t
         return batch_data["cur_pos"]
     if target_mode in ("delta", "displacement"):
         return batch_data["delta"]
+    if target_mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
+        return batch_data["normalized_delta"]
     raise ValueError(f"Unknown ae_target_mode: {target_mode}")
 
 
@@ -214,10 +309,33 @@ def fit_edge_stats(
     pos_dim: int,
     batch_graphs: int,
     device,
+    edge_mode: str = "stored",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if edge_mode == "complete":
+        count = 0
+        total = None
+        total_square = None
+        for rows_batch in iter_batches(rows, batch_graphs, shuffle=False):
+            edges = batch_delta_graphs(
+                sims, rows_batch, pos_dim=pos_dim, device=device, edge_mode=edge_mode
+            )["edge_attr"].detach().double()
+            batch_total = edges.sum(dim=0, keepdim=True)
+            batch_total_square = edges.square().sum(dim=0, keepdim=True)
+            total = batch_total if total is None else total + batch_total
+            total_square = batch_total_square if total_square is None else total_square + batch_total_square
+            count += int(edges.size(0))
+        if not count:
+            raise ValueError("Cannot fit complete-edge statistics from an empty frame index.")
+        mean = total / count
+        denominator = max(count - 1, 1)
+        variance = (total_square - total.square() / count) / denominator
+        return mean.float(), variance.clamp_min(0).sqrt().clamp_min(1e-6).float()
+
     chunks = []
     for rows_batch in iter_batches(rows, batch_graphs, shuffle=False):
-        batch_data = batch_delta_graphs(sims, rows_batch, pos_dim=pos_dim, device=device)
+        batch_data = batch_delta_graphs(
+            sims, rows_batch, pos_dim=pos_dim, device=device, edge_mode=edge_mode
+        )
         chunks.append(batch_data["edge_attr"].detach())
     all_edges = torch.cat(chunks, dim=0)
     mean = all_edges.mean(dim=0, keepdim=True)
@@ -261,6 +379,316 @@ def pearson_r(y_true, y_pred) -> float:
     if np.isclose(np.std(y_true[mask]), 0.0) or np.isclose(np.std(y_pred[mask]), 0.0):
         return float("nan")
     return float(np.corrcoef(y_true[mask], y_pred[mask])[0, 1])
+
+
+def trajectory_p_ratio_sides_strain_gated(
+    trajectory: list,
+    last_index: int = -1,
+    *,
+    first_index: int = 0,
+    min_fit_frames: int = 8,
+    min_driven_strain_range: float = 1e-3,
+    side_quantile: float = 0.10,
+    min_abs_strain: float = 1e-5,
+    eps: float = 1e-12,
+) -> float:
+    """Estimate trajectory p-ratio only after enough driven strain accumulates.
+
+    Linear trajectory fits are unstable at early thermalized frames because both
+    fitted strain rates are small. This variant returns NaN until there are
+    enough meaningful frames and the larger strain component has moved by at
+    least ``min_driven_strain_range``.
+    """
+
+    if len(trajectory) < 2:
+        return float("nan")
+
+    stop = int(last_index)
+    if stop < 0:
+        stop += len(trajectory)
+    start = int(first_index)
+    if start < 0:
+        start += len(trajectory)
+    if not (0 <= start < stop < len(trajectory)):
+        return float("nan")
+
+    reference = trajectory[start]
+    side_idx = directional_side_indices_from_box(
+        reference,
+        quantile=float(side_quantile),
+        eps=float(eps),
+    )
+
+    def pos_np(graph) -> np.ndarray:
+        return graph.x[:, :2].detach().cpu().numpy()
+
+    def side_dimensions(graph) -> tuple[float, float]:
+        pos = pos_np(graph)
+        width = float(pos[side_idx["right"], 0].mean() - pos[side_idx["left"], 0].mean())
+        height = float(pos[side_idx["top"], 1].mean() - pos[side_idx["bottom"], 1].mean())
+        return width, height
+
+    width0, height0 = side_dimensions(reference)
+    if abs(width0) <= eps or abs(height0) <= eps:
+        return float("nan")
+
+    strains = np.asarray(
+        [
+            (
+                (side_dimensions(graph)[0] - width0) / width0,
+                (side_dimensions(graph)[1] - height0) / height0,
+            )
+            for graph in trajectory[start : stop + 1]
+        ],
+        dtype=float,
+    )
+    finite = np.isfinite(strains).all(axis=1)
+    strains = strains[finite]
+    if len(strains) < int(min_fit_frames):
+        return float("nan")
+
+    meaningful = (np.abs(strains[:, 0]) >= float(min_abs_strain)) | (
+        np.abs(strains[:, 1]) >= float(min_abs_strain)
+    )
+    strains = strains[meaningful]
+    if len(strains) < int(min_fit_frames):
+        return float("nan")
+
+    x_range = float(np.ptp(strains[:, 0]))
+    y_range = float(np.ptp(strains[:, 1]))
+    if max(x_range, y_range) < float(min_driven_strain_range):
+        return float("nan")
+
+    time = np.arange(len(strains), dtype=float)
+    if float(np.var(time)) <= eps:
+        return float("nan")
+    dx_rate = float(np.polyfit(time, strains[:, 0], deg=1)[0])
+    dy_rate = float(np.polyfit(time, strains[:, 1], deg=1)[0])
+    if (not np.isfinite(dx_rate)) or (not np.isfinite(dy_rate)):
+        return float("nan")
+    if abs(dx_rate) <= eps or abs(dy_rate) <= eps:
+        return float("nan")
+
+    p_x_driven = -(dy_rate / dx_rate)
+    p_y_driven = -(dx_rate / dy_rate)
+    return float(p_x_driven if abs(p_x_driven) < abs(p_y_driven) else p_y_driven)
+
+
+def _centered_rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
+    window = int(window)
+    if window <= 1 or len(values) < 3:
+        return values
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    out = np.empty_like(values, dtype=float)
+    for idx in range(len(values)):
+        lo = max(0, idx - half)
+        hi = min(len(values), idx + half + 1)
+        out[idx] = float(np.nanmean(values[lo:hi]))
+    return out
+
+
+def _theil_sen_slope(x: np.ndarray, y: np.ndarray, *, eps: float) -> float:
+    slopes = []
+    for i in range(len(x) - 1):
+        dx = x[i + 1 :] - x[i]
+        dy = y[i + 1 :] - y[i]
+        valid = np.abs(dx) > eps
+        if np.any(valid):
+            slopes.extend((dy[valid] / dx[valid]).tolist())
+    if not slopes:
+        return float("nan")
+    return float(np.median(np.asarray(slopes, dtype=float)))
+
+
+def trajectory_p_ratio_sides_robust(
+    trajectory: list,
+    last_index: int = -1,
+    *,
+    first_index: int = 0,
+    min_fit_frames: int = 8,
+    min_driven_strain_range: float = 1e-3,
+    smooth_window: int = 5,
+    side_quantile: float = 0.10,
+    min_abs_strain: float = 1e-5,
+    eps: float = 1e-12,
+) -> float:
+    """Robust p-ratio from transverse strain vs driven strain.
+
+    This avoids fitting strain against time. After light smoothing, the axis
+    with larger strain range is treated as driven, and the transverse/driven
+    slope is estimated by a Theil-Sen median pairwise slope.
+    """
+
+    if len(trajectory) < 2:
+        return float("nan")
+
+    stop = int(last_index)
+    if stop < 0:
+        stop += len(trajectory)
+    start = int(first_index)
+    if start < 0:
+        start += len(trajectory)
+    if not (0 <= start < stop < len(trajectory)):
+        return float("nan")
+
+    reference = trajectory[start]
+    side_idx = directional_side_indices_from_box(
+        reference,
+        quantile=float(side_quantile),
+        eps=float(eps),
+    )
+
+    def side_dimensions(graph) -> tuple[float, float]:
+        pos = graph.x[:, :2].detach().cpu().numpy()
+        width = float(pos[side_idx["right"], 0].mean() - pos[side_idx["left"], 0].mean())
+        height = float(pos[side_idx["top"], 1].mean() - pos[side_idx["bottom"], 1].mean())
+        return width, height
+
+    width0, height0 = side_dimensions(reference)
+    if abs(width0) <= eps or abs(height0) <= eps:
+        return float("nan")
+
+    strains = np.asarray(
+        [
+            (
+                (side_dimensions(graph)[0] - width0) / width0,
+                (side_dimensions(graph)[1] - height0) / height0,
+            )
+            for graph in trajectory[start : stop + 1]
+        ],
+        dtype=float,
+    )
+    finite = np.isfinite(strains).all(axis=1)
+    strains = strains[finite]
+    if len(strains) < int(min_fit_frames):
+        return float("nan")
+
+    strains[:, 0] = _centered_rolling_mean(strains[:, 0], int(smooth_window))
+    strains[:, 1] = _centered_rolling_mean(strains[:, 1], int(smooth_window))
+    meaningful = (np.abs(strains[:, 0]) >= float(min_abs_strain)) | (
+        np.abs(strains[:, 1]) >= float(min_abs_strain)
+    )
+    strains = strains[meaningful]
+    if len(strains) < int(min_fit_frames):
+        return float("nan")
+
+    x_range = float(np.ptp(strains[:, 0]))
+    y_range = float(np.ptp(strains[:, 1]))
+    if max(x_range, y_range) < float(min_driven_strain_range):
+        return float("nan")
+
+    if x_range >= y_range:
+        slope = _theil_sen_slope(strains[:, 0], strains[:, 1], eps=eps)
+    else:
+        slope = _theil_sen_slope(strains[:, 1], strains[:, 0], eps=eps)
+    return float(-slope) if np.isfinite(slope) else float("nan")
+
+
+def trajectory_p_ratio_sides_robust_series(
+    trajectory: list,
+    *,
+    min_fit_frames: int = 8,
+    min_driven_strain_range: float = 1e-3,
+    smooth_window: int = 5,
+    side_quantile: float = 0.10,
+    min_abs_strain: float = 1e-5,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Compute the robust p-ratio for every available trajectory prefix."""
+
+    values = np.full(len(trajectory), np.nan, dtype=float)
+    if len(trajectory) < 2:
+        return values
+
+    side_idx = directional_side_indices_from_box(
+        trajectory[0], quantile=float(side_quantile), eps=float(eps)
+    )
+
+    def dimensions(graph) -> tuple[float, float]:
+        pos = graph.x[:, :2].detach().cpu().numpy()
+        return (
+            float(pos[side_idx["right"], 0].mean() - pos[side_idx["left"], 0].mean()),
+            float(pos[side_idx["top"], 1].mean() - pos[side_idx["bottom"], 1].mean()),
+        )
+
+    dims = np.asarray([dimensions(graph) for graph in trajectory], dtype=float)
+    width0, height0 = dims[0]
+    if abs(width0) <= eps or abs(height0) <= eps:
+        return values
+    strains = np.column_stack(
+        ((dims[:, 0] - width0) / width0, (dims[:, 1] - height0) / height0)
+    )
+
+    for stop in range(1, len(trajectory)):
+        prefix = strains[: stop + 1]
+        prefix = prefix[np.isfinite(prefix).all(axis=1)]
+        if len(prefix) < int(min_fit_frames):
+            continue
+        prefix = prefix.copy()
+        prefix[:, 0] = _centered_rolling_mean(prefix[:, 0], int(smooth_window))
+        prefix[:, 1] = _centered_rolling_mean(prefix[:, 1], int(smooth_window))
+        meaningful = (np.abs(prefix[:, 0]) >= float(min_abs_strain)) | (
+            np.abs(prefix[:, 1]) >= float(min_abs_strain)
+        )
+        prefix = prefix[meaningful]
+        if len(prefix) < int(min_fit_frames):
+            continue
+        x_range = float(np.ptp(prefix[:, 0]))
+        y_range = float(np.ptp(prefix[:, 1]))
+        if max(x_range, y_range) < float(min_driven_strain_range):
+            continue
+        if x_range >= y_range:
+            slope = _theil_sen_slope(prefix[:, 0], prefix[:, 1], eps=eps)
+        else:
+            slope = _theil_sen_slope(prefix[:, 1], prefix[:, 0], eps=eps)
+        if np.isfinite(slope):
+            values[stop] = -slope
+    return values
+
+
+def shrink_p_ratio_series(
+    values,
+    trajectory: list,
+    *,
+    prior: float | None,
+    strain_scale: float = 6e-3,
+    full_weight_frame: int = 20,
+) -> np.ndarray:
+    """Stabilize short-prefix estimates with a training-set p-ratio prior."""
+
+    out = np.asarray(values, dtype=float).copy()
+    try:
+        prior_value = float(prior)
+    except (TypeError, ValueError):
+        return out
+    if not np.isfinite(prior_value) or len(out) != len(trajectory):
+        return out
+
+    boxes = [box_tensor(graph) for graph in trajectory]
+    if any(box is None for box in boxes):
+        return out
+    widths = np.asarray([float(box[0].detach().cpu()) for box in boxes], dtype=float)
+    if not np.isfinite(widths[0]) or abs(widths[0]) <= 1e-12:
+        return out
+    driven_strain = widths / widths[0] - 1.0
+    scale_sq = max(float(strain_scale), 1e-12) ** 2
+    for stop in range(1, len(out)):
+        if stop >= int(full_weight_frame):
+            continue
+        signal = float(np.ptp(driven_strain[: stop + 1]))
+        signal_weight = signal**2 / (signal**2 + scale_sq) if np.isfinite(signal) else 0.0
+        frame_weight = max(
+            0.0,
+            min(1.0, (stop - 8.0) / max(float(full_weight_frame) - 8.0, 1.0)),
+        )
+        weight = max(signal_weight, frame_weight)
+        if np.isfinite(out[stop]):
+            out[stop] = weight * out[stop] + (1.0 - weight) * prior_value
+        else:
+            out[stop] = prior_value
+    return out
 
 
 def initial_graph_descriptors(sim, sim_idx: int, *, p_ratio_fn) -> dict[str, float | int]:
@@ -342,4 +770,6 @@ __all__ = [
     "pearson_r",
     "r2_score",
     "safe_linear_fit_1d",
+    "shrink_p_ratio_series",
+    "trajectory_p_ratio_sides_robust_series",
 ]

@@ -20,7 +20,12 @@ from .experiment import (
     seed_everything,
     train_latent_experiment,
 )
-from .models import NodeDeltaAttentionAutoEncoder, make_latent_propagator
+from .models import (
+    NodeDeltaAttentionAutoEncoder,
+    NodeDeltaMLPAutoEncoder,
+    NodeDeltaPyramidMLPAutoEncoder,
+    make_latent_propagator,
+)
 from .simulation import r2_score
 from .training import LatentNormalizer
 
@@ -123,6 +128,10 @@ def save_experiment_bundle(result: dict, spec: dict, path: str | Path) -> Path:
         "stats": result["stats"],
         "ae_history": result["ae_history"],
         "dyn_history": result["dyn_history"],
+        "rollout_rows": result.get("rollout_rows", pd.DataFrame()),
+        "rollout_stats": result.get("rollout_stats", pd.DataFrame()),
+        "ae_reconstruction_rows": result.get("ae_reconstruction_rows", pd.DataFrame()),
+        "ae_reconstruction_stats": result.get("ae_reconstruction_stats", pd.DataFrame()),
     }
     torch.save(bundle, path)
     return path
@@ -173,13 +182,21 @@ def load_experiment_bundle(
             ),
         }
     )
-    ae_model = NodeDeltaAttentionAutoEncoder(
+    autoencoder_type = str(params.get("autoencoder_model", "attention")).lower()
+    if autoencoder_type in {"mlp", "mean_mlp", "mean_pool"}:
+        autoencoder_cls = NodeDeltaMLPAutoEncoder
+    elif autoencoder_type in {"pyramid_mlp", "mean_pyramid_mlp"}:
+        autoencoder_cls = NodeDeltaPyramidMLPAutoEncoder
+    else:
+        autoencoder_cls = NodeDeltaAttentionAutoEncoder
+    ae_model = autoencoder_cls(
         pos_dim=int(params["pos_dim"]),
         edge_dim=int(normalizers["edge_mean"].numel()),
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
     ).to(device)
+    ae_model.edge_mode = str(params.get("edge_mode", "stored"))
     ae_model.load_state_dict(bundle["ae_state_dict"])
     ae_model.eval()
 
@@ -214,10 +231,27 @@ def load_experiment_bundle(
     dyn_model.load_state_dict(bundle["dyn_state_dict"])
     dyn_model.eval()
 
+    mixture = params.get("dataset_mixture") or []
+    train_count = params.get("train_count")
+    val_count = params.get("val_count")
+    if train_count is None and mixture:
+        train_count = sum(int(item.get("train_count", 0)) for item in mixture)
+    if val_count is None and mixture:
+        val_count = sum(int(item.get("val_count", 0)) for item in mixture)
+    holdout_train_count = sum(
+        int(item.get("holdout_train_count", item.get("train_count", 0)))
+        for item in mixture
+    )
+    if train_count is None or val_count is None:
+        raise KeyError(
+            "Cached latent experiment requires train_count/val_count or dataset_mixture counts"
+        )
+
     split_key = (
         spec["path"],
-        int(params["train_count"]),
-        int(params["val_count"]),
+        int(train_count),
+        int(holdout_train_count),
+        int(val_count),
         params.get("split_seed"),
         params.get("min_train_p_ratio"),
         bool(params.get("split_stratify_temperature", False)),
@@ -246,8 +280,10 @@ def load_experiment_bundle(
         "stats": stats,
         "ae_history": pd.DataFrame(bundle.get("ae_history", [])),
         "dyn_history": pd.DataFrame(bundle.get("dyn_history", [])),
-        "rollout_rows": pd.DataFrame(),
-        "rollout_stats": pd.DataFrame(),
+        "rollout_rows": pd.DataFrame(bundle.get("rollout_rows", [])),
+        "rollout_stats": pd.DataFrame(bundle.get("rollout_stats", [])),
+        "ae_reconstruction_rows": pd.DataFrame(bundle.get("ae_reconstruction_rows", [])),
+        "ae_reconstruction_stats": pd.DataFrame(bundle.get("ae_reconstruction_stats", [])),
     }
 
 
@@ -256,6 +292,12 @@ def evaluate_experiment(result: dict, cfg: dict, *, device) -> dict:
 
     params = result["params"]
     sims = result["test_data"]
+    max_eval_sims = cfg.get(
+        "rollout_eval_max_sims_per_split",
+        params.get("rollout_eval_max_sims_per_split"),
+    )
+    if max_eval_sims is not None:
+        sims = sims[: int(max_eval_sims)]
     steps = rollout_steps_for_sims(
         sims,
         cfg["rollout_steps_grid"],

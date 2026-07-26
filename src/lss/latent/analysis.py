@@ -599,6 +599,13 @@ def framewise_latent_descriptor_sweep(
                         {
                             "split": split_name,
                             "sim_idx": int(sim_idx),
+                            "source": str(
+                                getattr(
+                                    sim[0],
+                                    "source_name",
+                                    result.get("source_name", result["label"]),
+                                )
+                            ),
                             "frame_idx": int(frame_idx),
                             "temperature": float(
                                 getattr(sim[0], "temperature", np.nan)
@@ -688,7 +695,7 @@ def framewise_latent_descriptor_sweep(
                 .replace([np.inf, -np.inf], np.nan)
                 .dropna()
             )
-            test_columns = ["sim_idx", "frame_idx", "temperature", *columns]
+            test_columns = ["sim_idx", "source", "frame_idx", "temperature", *columns]
             test = (
                 frame_df.loc[frame_df["split"].eq("test"), test_columns]
                 .replace([np.inf, -np.inf], np.nan)
@@ -715,7 +722,7 @@ def framewise_latent_descriptor_sweep(
                 }
             )
             prediction_parts.append(
-                test[["sim_idx", "frame_idx", "temperature", target]]
+                test[["sim_idx", "source", "frame_idx", "temperature", target]]
                 .rename(columns={target: "observed"})
                 .assign(
                     feature_set=feature_label,
@@ -774,7 +781,10 @@ def framewise_latent_descriptor_sweep(
                 continue
             observed = observed[valid]
             predicted = predicted[valid]
-            metadata = frame_df.loc[observed.index, ["sim_idx", "frame_idx", "temperature"]]
+            metadata = frame_df.loc[
+                observed.index,
+                ["sim_idx", "source", "frame_idx", "temperature"],
+            ]
             within_network = [
                 pearson_r(group["observed"], group["predicted"])
                 for _, group in metadata.assign(

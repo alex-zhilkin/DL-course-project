@@ -8,11 +8,13 @@ pip install -e .
 
 Download [the data](https://drive.google.com/file/d/1KTWN1Rp-vs5eKmip4tH5tS77y5HUX_CH/view?usp=sharing) and put it in `data/`.
 
-The primary latent-space workflow is:
+The primary latent-space workflow is now:
 
-- `notebooks/latent_space/04_latent_space_simulator.ipynb`
-- `notebooks/latent_space/04a_noisy_latent_dim_sweep.ipynb`
-- `notebooks/latent_space/04b_noisy_train_ood_eval.ipynb`
+- `notebooks/latent_space/04_latent_space_simulator.ipynb` - main mixed/single rollout comparison against the GNN baseline
+- `notebooks/latent_space/04a_latent_space_analysis.ipynb` - 2D latent-space interpretation and p-ratio readouts
+
+The older standalone latent simulator notebook is archived at
+`notebooks/archive/legacy/04_latent_space_simulator_legacy.ipynb`.
 
 The simple non-neural Reid baseline is:
 

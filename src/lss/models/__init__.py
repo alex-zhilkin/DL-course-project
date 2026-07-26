@@ -7,6 +7,7 @@ from torch_geometric.data import Data
 from .base import BaseModelInputs
 from .cv_transformer_simulator import Model as CVTransformerModel
 from .hybrid_simulator import Model as HybridModel
+from .inverse_design_simulator import Model as InverseDesignSimulatorModel
 from .linear_cv_simulator import Model as LinearCVSimulatorModel
 from .spatial_simulator import Model as SpatialModel
 from .transformer_simulator import Model as TransformerSimulatorModel
@@ -16,6 +17,7 @@ MODEL_REGISTRY = {
     "cv_transformer": CVTransformerModel,
     "linear_cv_simulator": LinearCVSimulatorModel,
     "hybrid": HybridModel,
+    "inverse_design_simulator": InverseDesignSimulatorModel,
     "transformer_simulator": TransformerSimulatorModel,
 }
 
@@ -37,6 +39,9 @@ MODEL_EXTRAS_REQUIRED = {
     "hybrid": {
         "num_mlp",
         "cv_checkpoint_path",
+    },
+    "inverse_design_simulator": {
+        "num_mlp",
     },
     "transformer_simulator": {
         "num_mlp",
@@ -73,6 +78,7 @@ MODEL_EXTRAS_OPTIONAL = {
         "time_lag_steps",
         "time_lag_weight",
     },
+    "inverse_design_simulator": set(),
     "transformer_simulator": {
         "use_normalization",
         "prediction_target",
@@ -146,6 +152,7 @@ def create_model(
 __all__ = [
     "BaseModelInputs",
     "HybridModel",
+    "InverseDesignSimulatorModel",
     "CVTransformerModel",
     "LinearCVSimulatorModel",
     "SpatialModel",

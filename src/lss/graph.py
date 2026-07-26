@@ -4,6 +4,28 @@ import torch
 from torch_geometric.data import Data
 
 
+def box_tensor(graph: Data, *, device=None, dtype=None) -> torch.Tensor | None:
+    if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, torch.Tensor):
+        out = graph.box_tensor
+        if device is not None or dtype is not None:
+            out = out.to(device=device or out.device, dtype=dtype or out.dtype)
+        return out
+    if not hasattr(graph, "box") or graph.box is None:
+        return None
+    box = graph.box
+    if hasattr(box, "x") and hasattr(box, "y"):
+        values = [float(box.x), float(box.y)]
+    elif all(hasattr(box, key) for key in ("x1", "x2", "y1", "y2")):
+        values = [float(box.x2) - float(box.x1), float(box.y2) - float(box.y1)]
+    else:
+        return None
+    return torch.tensor(
+        values,
+        device=device or graph.x.device,
+        dtype=dtype or graph.x.dtype,
+    )
+
+
 def clone_graph(graph: Data) -> Data:
     batch = graph.batch.clone() if getattr(graph, 'batch', None) is not None else torch.zeros(graph.x.size(0), dtype=torch.long, device=graph.x.device)
     out = Data(
@@ -14,8 +36,62 @@ def clone_graph(graph: Data) -> Data:
         t=getattr(graph, 't', None),
         batch=batch,
     )
+    if hasattr(graph, "pos") and isinstance(graph.pos, torch.Tensor):
+        out.pos = graph.pos.clone()
+    else:
+        out.pos = out.x[:, :2].clone()
+    if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, torch.Tensor):
+        out.box_tensor = graph.box_tensor.clone()
+    else:
+        maybe_box = box_tensor(graph)
+        if maybe_box is not None:
+            out.box_tensor = maybe_box.clone()
     if hasattr(graph, "vel_state"):
         out.vel_state = graph.vel_state.clone()
+    return out
+
+
+def inverse_design_velocity_graph(input_graphs: list[Data]) -> Data:
+    """Build the residual-velocity input used by GNNInverseDesign."""
+
+    base_graph = input_graphs[-1]
+    if len(input_graphs) == 1:
+        x = torch.zeros_like(base_graph.x[:, :2])
+    else:
+        residual_velocities = []
+        for i in range(len(input_graphs) - 1, 0, -1):
+            target_graph = input_graphs[i]
+            cur_graph = input_graphs[i - 1]
+            cur_box = box_tensor(cur_graph, device=cur_graph.x.device, dtype=cur_graph.x.dtype)
+            target_box = box_tensor(
+                target_graph,
+                device=target_graph.x.device,
+                dtype=target_graph.x.dtype,
+            )
+            if cur_box is None or target_box is None:
+                affine_velocity = torch.zeros_like(cur_graph.x[:, :2])
+            else:
+                strain = (cur_box[0] - target_box[0]) / cur_box[0].clamp_min(1e-12)
+                affine_velocity_x = cur_graph.x[:, 0] * (1 - strain) - cur_graph.x[:, 0]
+                affine_velocity = torch.column_stack(
+                    [affine_velocity_x, torch.zeros_like(affine_velocity_x)]
+                )
+            global_velocity = target_graph.x[:, :2] - cur_graph.x[:, :2]
+            residual_velocities.append(global_velocity - affine_velocity)
+        x = torch.column_stack(residual_velocities)
+
+    out = Data(
+        x=x,
+        pos=base_graph.x[:, :2].clone(),
+        edge_index=base_graph.edge_index,
+        edge_attr=base_graph.edge_attr,
+        box=base_graph.box if hasattr(base_graph, "box") else None,
+        t=getattr(base_graph, "t", None),
+        batch=base_graph.batch.clone() if getattr(base_graph, "batch", None) is not None else torch.zeros(base_graph.x.size(0), dtype=torch.long, device=base_graph.x.device),
+    )
+    maybe_box = box_tensor(base_graph, device=base_graph.x.device, dtype=base_graph.x.dtype)
+    if maybe_box is not None:
+        out.box_tensor = maybe_box
     return out
 
 
@@ -28,6 +104,8 @@ def build_graph(input_graphs: list[Data], node_features: str = "positions") -> D
     match node_features:
         case "positions":
             return clone_graph(base_graph)
+        case "inverse_design_velocity":
+            return inverse_design_velocity_graph(input_graphs)
         case "velocity":
             if len(input_graphs) == 1:
                 x = torch.zeros_like(base_graph.x)

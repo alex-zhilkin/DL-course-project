@@ -16,6 +16,7 @@ from .simulation import (
     make_frame_index,
     make_transition_index,
 )
+from .models import make_latent_propagator
 from .training import (
     LatentNormalizer,
     TrainingConfig,
@@ -23,7 +24,6 @@ from .training import (
     latent_rollout_eval,
     latent_velocity_rollout_eval,
     make_multistep_transition_index,
-    make_propagator,
     make_velocity_transition_index,
     train_autoencoder,
     train_propagator,
@@ -42,6 +42,16 @@ def run_propagator_comparison(
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    use_static_context = bool(cfg.get("propagator_use_static_context", True))
+    context_include_temperature = bool(
+        cfg.get("propagator_context_include_temperature", False)
+    )
+    graph_context_dim = int(cfg.get("graph_context_dim", 16))
+    raw_context_dim = (
+        int(cfg["hidden_size"]) + int(context_include_temperature)
+        if use_static_context
+        else 0
+    )
     train_data, val_data, test_data, split_info = resolve_dataset_splits(
         dataset_spec["path"],
         train_count=int(dataset_spec["train_count"]),
@@ -78,18 +88,6 @@ def run_propagator_comparison(
         val_data,
         frame_skip=cfg["frame_skip"],
         max_frames_per_sim=cfg["dyn_train_transitions_per_sim"],
-    )
-    train_multistep = make_multistep_transition_index(
-        train_data,
-        horizons=cfg["multistep_horizons"],
-        frame_skip=cfg["frame_skip"],
-        max_starts_per_sim=cfg["multistep_max_starts_per_sim"],
-    )
-    val_multistep = make_multistep_transition_index(
-        val_data,
-        horizons=cfg["multistep_horizons"],
-        frame_skip=cfg["frame_skip"],
-        max_starts_per_sim=cfg["multistep_max_starts_per_sim"],
     )
     train_velocity = make_velocity_transition_index(
         train_data,
@@ -193,40 +191,70 @@ def run_propagator_comparison(
         node_feature_mode=cfg["node_feature_mode"],
         normalizers=normalizers,
         device=device,
+        use_static_context=use_static_context,
+        context_include_temperature=context_include_temperature,
+        rho_scale_mode=cfg.get("polar_rho_scale_mode"),
     ).to(device)
 
     histories = []
     models = {}
-    train_config = TrainingConfig(
-        max_epochs=cfg["propagator_max_epochs"],
-        patience=cfg["propagator_patience"],
-        learning_rate=cfg["propagator_lr"],
-        weight_decay=cfg["propagator_weight_decay"],
-        min_delta=cfg["early_stop_min_delta"],
-    )
     for spec_idx, spec in enumerate(propagator_specs):
+        train_config = TrainingConfig(
+            max_epochs=int(spec.get("max_epochs", cfg["propagator_max_epochs"])),
+            patience=int(spec.get("patience", cfg["propagator_patience"])),
+            learning_rate=float(spec.get("learning_rate", cfg["propagator_lr"])),
+            weight_decay=float(spec.get("weight_decay", cfg["propagator_weight_decay"])),
+            min_delta=float(spec.get("early_stop_min_delta", cfg["early_stop_min_delta"])),
+        )
         objective = spec.get("train_objective", "one_step")
         if objective == "velocity":
             train_rows, val_rows = train_velocity, val_velocity
         elif objective == "multistep":
-            train_rows, val_rows = train_multistep, val_multistep
+            horizons = spec.get("multistep_horizons", cfg["multistep_horizons"])
+            max_starts = spec.get(
+                "multistep_max_starts_per_sim",
+                cfg["multistep_max_starts_per_sim"],
+            )
+            train_rows = make_multistep_transition_index(
+                train_data,
+                horizons=horizons,
+                frame_skip=cfg["frame_skip"],
+                max_starts_per_sim=max_starts,
+            )
+            val_rows = make_multistep_transition_index(
+                val_data,
+                horizons=horizons,
+                frame_skip=cfg["frame_skip"],
+                max_starts_per_sim=max_starts,
+            )
         else:
             train_rows, val_rows = train_steps, val_steps
         for repeat_idx in range(1, int(cfg["propagator_repeats"]) + 1):
             repeat_seed = int(seed + 9176 * repeat_idx + 104729 * (spec_idx + 1))
             seed_everything(repeat_seed)
             name = spec["name"]
+            horizon_tag = (
+                "h" + "-".join(str(int(horizon)) for horizon in spec.get("multistep_horizons", []))
+                if spec.get("multistep_horizons")
+                else "h1"
+            )
             path = output_dir / (
                 f"prop_{name}_{cfg['dataset_name']}_cv{cfg['latent_dim']:02d}"
                 f"_nets{dataset_spec['train_count']:03d}"
                 f"_frames{cfg['dyn_train_transitions_per_sim']:03d}"
+                f"_{horizon_tag}"
+                f"_final"
                 f"_rep{repeat_idx:02d}.pt"
             )
-            model = make_propagator(
-                cfg["latent_dim"],
+            model = make_latent_propagator(
+                int(cfg["latent_dim"]),
                 int(spec.get("hidden_size", cfg["hidden_size"])),
-                loss_mode=spec["loss_mode"],
-                model_type=spec.get("model_type"),
+                model_type=spec.get("model_type", "residual_mlp"),
+                context_dim=raw_context_dim,
+                graph_context_dim=graph_context_dim if use_static_context else None,
+                context_include_temperature=(
+                    use_static_context and context_include_temperature
+                ),
             ).to(device)
             if path.exists() and not cfg["force_train_propagators"]:
                 bundle = torch.load(path, map_location=device, weights_only=False)
@@ -248,7 +276,10 @@ def run_propagator_comparison(
                     device=device,
                     loss_mode=spec["loss_mode"],
                     objective=objective,
-                    horizons=cfg["multistep_horizons"] if objective == "multistep" else None,
+                    horizons=spec.get("multistep_horizons", cfg["multistep_horizons"]) if objective == "multistep" else None,
+                    use_static_context=use_static_context,
+                    context_include_temperature=context_include_temperature,
+                    rho_scale_mode=cfg.get("polar_rho_scale_mode"),
                     config=train_config,
                 )
                 model = trained.model
@@ -271,7 +302,11 @@ def run_propagator_comparison(
                 repeat_idx=repeat_idx,
                 repeat_seed=repeat_seed,
                 loss_mode=spec["loss_mode"],
+                learning_rate=float(train_config.learning_rate),
+                weight_decay=float(train_config.weight_decay),
                 train_objective=objective,
+                multistep_horizons=str(spec.get("multistep_horizons", "")),
+                multistep_loss="final_horizon",
             )
             histories.append(history)
             models[(name, repeat_idx)] = (model.eval(), spec, repeat_seed)
@@ -302,6 +337,9 @@ def run_propagator_comparison(
                         kwargs["initial_velocity"] = "mean"
                     else:
                         kwargs["loss_mode"] = spec["loss_mode"]
+                        kwargs["use_static_context"] = use_static_context
+                        kwargs["context_include_temperature"] = context_include_temperature
+                        kwargs["rho_scale_mode"] = cfg.get("polar_rho_scale_mode")
                     raw, stats = evaluator(
                         ae_model,
                         model,
@@ -315,6 +353,7 @@ def run_propagator_comparison(
                         "repeat_seed": repeat_seed,
                         "loss_mode": spec["loss_mode"],
                         "train_objective": spec.get("train_objective", "one_step"),
+                        "multistep_horizons": str(spec.get("multistep_horizons", "")),
                         "p_ratio_method": method,
                     }
                     for key, value in metadata.items():

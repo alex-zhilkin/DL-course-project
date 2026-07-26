@@ -49,7 +49,9 @@ class TwoStageDownUpTransformer(nn.Module):
         self.k2_hidden_size = int(k2_hidden_size) if k2_hidden_size is not None else int(hidden_size)
         self.edge_aggr = str(edge_aggr)
         self.cv_dim = int(cv_dim)
-        self.use_local_skip = bool(use_local_skip)
+        # Kept as an accepted config key for old notebooks/checkpoints, but the
+        # transformer decoder no longer receives a direct input/local skip.
+        self.use_local_skip = False
         self.last_cv = None
 
         self.node_in = build_mlp(in_node_dim, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=False)
@@ -67,8 +69,7 @@ class TwoStageDownUpTransformer(nn.Module):
         )
         self.node_transformer = nn.TransformerEncoder(encoder_layer, num_layers=transformer_layers)
 
-        out_in_dim = hidden_size * 2 if self.use_local_skip else hidden_size
-        self.out = nn.Linear(out_in_dim, pos_dim)
+        self.out = nn.Linear(hidden_size, pos_dim)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -127,8 +128,7 @@ class TwoStageDownUpTransformer(nn.Module):
         encoded_nodes = self.node_transformer(h_dense, src_key_padding_mask=key_padding_nodes)
         valid_counts = mask.sum(dim=1).clamp(min=1).to(encoded_nodes.dtype).unsqueeze(-1)
         self.last_cv = (encoded_nodes * mask.unsqueeze(-1).to(encoded_nodes.dtype)).sum(dim=1) / valid_counts
-        h_fused = torch.cat([h_dense, encoded_nodes], dim=-1) if self.use_local_skip else encoded_nodes
-        dv_dense = self.out(h_fused)
+        dv_dense = self.out(encoded_nodes)
         dv = dv_dense[mask]
 
         if return_context and return_attn:

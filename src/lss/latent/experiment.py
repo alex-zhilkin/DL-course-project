@@ -7,6 +7,8 @@ evaluation, and the tabular summaries shared by the latent-space notebooks.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from pathlib import Path
 from typing import Callable
@@ -20,7 +22,14 @@ from graph_utils import calc_p_ratio_rollout_sides, calc_p_ratio_trajectory_side
 
 from ..data import load_dataset, resolve_dataset_splits, simulation_temperature
 from ..graph import clone_graph
-from .models import NodeDeltaAttentionAutoEncoder, make_latent_propagator
+from .models import (
+    NodeDeltaAttentionAutoEncoder,
+    NodeDeltaDirectAttentionAutoEncoder,
+    NodeDeltaMLPAutoEncoder,
+    NodeDeltaPyramidMLPAutoEncoder,
+    make_latent_propagator,
+)
+from .physics import PhysicsLossConfig
 from .simulation import (
     filtered_frame_ids,
     fit_ae_target_stats,
@@ -31,20 +40,237 @@ from .simulation import (
     make_transition_index,
     pearson_r,
     r2_score,
+    shrink_p_ratio_series,
+    trajectory_p_ratio_sides_robust,
+    trajectory_p_ratio_sides_strain_gated,
 )
 from .training import (
     LatentNormalizer,
     TrainingConfig,
+    TrainingResult,
     decode_latent_to_graph,
     encode_frame_latent,
     encode_reference_context,
     fit_latent_step_stats,
+    initial_structure_scale,
     latent_step,
     latent_step_velocity,
+    make_multistep_transition_index,
     make_velocity_transition_index,
+    batch_delta_graphs,
+    ae_target_tensor,
     train_autoencoder,
     train_propagator,
 )
+
+
+def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _autoencoder_class(model_type: str):
+    model_type = str(model_type).lower()
+    if model_type in {"mlp", "mean_mlp", "mean_pool"}:
+        return NodeDeltaMLPAutoEncoder
+    if model_type in {"pyramid_mlp", "mean_pyramid_mlp"}:
+        return NodeDeltaPyramidMLPAutoEncoder
+    if model_type in {"direct_attention", "attention_direct", "direct_attention_decoder"}:
+        return NodeDeltaDirectAttentionAutoEncoder
+    if model_type in {"attention", "attention_mlp"}:
+        return NodeDeltaAttentionAutoEncoder
+    raise ValueError(f"Unknown autoencoder_model: {model_type}")
+
+
+def initialize_displacement_pca_layers(
+    model,
+    sims,
+    frame_rows,
+    *,
+    pos_dim: int,
+    node_feature_mode: str,
+    target_mode: str,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    max_samples: int = 200_000,
+) -> dict:
+    """Initialize displacement-facing AE weights from per-node PCA directions.
+
+    Full-field PCA is undefined across variable-size graphs. This applies the
+    shared PCA basis of normalized per-node displacement features instead.
+    """
+
+    node_parts, target_parts = [], []
+    count = 0
+    with torch.no_grad():
+        for row in frame_rows:
+            batch = batch_delta_graphs(
+                sims, [row], pos_dim=pos_dim, device=device,
+                node_feature_mode=node_feature_mode,
+            )
+            node = (batch["node_feature"] - normalizers["node_feature_mean"].to(device)) / normalizers[
+                "node_feature_std"
+            ].to(device)
+            target = (ae_target_tensor(batch, target_mode) - normalizers["target_mean"].to(device)) / normalizers[
+                "target_std"
+            ].to(device)
+            node_parts.append(node[:, :pos_dim].cpu())
+            target_parts.append(target[:, :pos_dim].cpu())
+            count += node.size(0)
+            if count >= int(max_samples):
+                break
+
+    def basis(parts):
+        values = torch.cat(parts, dim=0)[: int(max_samples)]
+        centered = values - values.mean(dim=0, keepdim=True)
+        _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+        explained = singular_values.square()
+        explained = explained / explained.sum().clamp_min(1e-12)
+        return vh, explained
+
+    encoder_basis, encoder_explained = basis(node_parts)
+    decoder_basis, decoder_explained = basis(target_parts)
+    if not isinstance(model.node_in, torch.nn.Linear):
+        raise TypeError("PCA initialization currently requires a linear node_in layer.")
+    output_layer = model.node_decoder[-1]
+    if not isinstance(output_layer, torch.nn.Linear):
+        raise TypeError("PCA initialization requires a linear final decoder layer.")
+    with torch.no_grad():
+        # Preserve all unrelated random weights. Align the first pos_dim hidden
+        # channels with PCA scores and initialize the output projection with
+        # the inverse PCA orientation.
+        model.node_in.weight[:pos_dim, :pos_dim].copy_(encoder_basis)
+        output_layer.weight[:, :pos_dim].copy_(decoder_basis.transpose(0, 1))
+    return {
+        "encoder_explained_variance": encoder_explained.tolist(),
+        "decoder_explained_variance": decoder_explained.tolist(),
+        "samples": min(count, int(max_samples)),
+    }
+
+
+def latent_experiment_cache_key(source_spec: dict, cfg: dict) -> str:
+    """Stable hash from source/training configuration, independent of notebook name."""
+
+    ignored_source = {
+        "label",
+        "source_name",
+        "display_name",
+        "experiment_name",
+    }
+    ignored_cfg = {
+        "cache_dir",
+        "cache_path",
+        "force_train",
+        "device",
+        "label",
+        "source_name",
+        "display_name",
+        "experiment_name",
+    }
+    payload = {
+        "source_spec": _json_safe(
+            {key: value for key, value in source_spec.items() if key not in ignored_source}
+        ),
+        "cfg": _json_safe({key: value for key, value in cfg.items() if key not in ignored_cfg}),
+        "cache_version": 3,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _cache_path(source_spec: dict, cfg: dict) -> Path | None:
+    explicit_path = cfg.get("cache_path")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    cache_dir = cfg.get("cache_dir")
+    if not cache_dir:
+        return None
+    path = Path(cache_dir).expanduser()
+    return path / f"latent_{latent_experiment_cache_key(source_spec, cfg)}.pt"
+
+
+def _save_ae_cache(result: dict, source_spec: dict, cfg: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "kind": "ae_only",
+            "cache_key": latent_experiment_cache_key(source_spec, cfg),
+            "source_spec": dict(source_spec),
+            "params": dict(result["params"]),
+            "ae_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in result["ae"].state_dict().items()
+            },
+            "stats": result["stats"],
+            "ae_history": result["ae_history"],
+        },
+        path,
+    )
+
+
+def _load_ae_cache(path: Path, cfg: dict, *, device) -> dict:
+    bundle = torch.load(path, map_location=device, weights_only=False)
+    spec = dict(bundle["source_spec"])
+    params = {**cfg, **bundle["params"], **spec}
+    stats = bundle["stats"]
+    normalizers = {
+        key: stats[key].to(device)
+        for key in (
+            "target_mean",
+            "target_std",
+            "node_feature_mean",
+            "node_feature_std",
+            "edge_mean",
+            "edge_std",
+        )
+    }
+    autoencoder_type = str(params.get("autoencoder_model", "attention")).lower()
+    autoencoder_cls = _autoencoder_class(autoencoder_type)
+    ae_model = autoencoder_cls(
+        pos_dim=int(params["pos_dim"]),
+        edge_dim=int(normalizers["edge_mean"].numel()),
+        hidden_size=int(params["hidden_size"]),
+        latent_dim=int(params["latent_dim"]),
+        latent_tokens=int(params["latent_tokens"]),
+    ).to(device)
+    ae_model.edge_mode = str(params.get("edge_mode", "stored"))
+    ae_model.load_state_dict(bundle["ae_state_dict"])
+    ae_model.eval()
+    for parameter in ae_model.parameters():
+        parameter.requires_grad_(False)
+
+    p_ratio_fn = lambda sim, idx=-1: ground_truth_p_ratio(
+        sim,
+        idx,
+        dataset_name=params["dataset_name"],
+        cfg=params,
+    )
+    train_data, val_data, test_data, split_info = resolve_train_val_test(
+        spec,
+        params,
+        split_seed=params.get("split_seed"),
+        p_ratio_fn=p_ratio_fn,
+    )
+    return {
+        "label": spec["label"],
+        "params": params,
+        "train_data": train_data,
+        "val_data": val_data,
+        "test_data": test_data,
+        "split_info": pd.DataFrame(split_info),
+        "ae": ae_model,
+        "normalizers": normalizers,
+        "stats": stats,
+        "ae_history": pd.DataFrame(bundle.get("ae_history", [])),
+        "cache_path": str(path),
+    }
 
 
 def seed_everything(seed: int) -> int:
@@ -139,14 +365,82 @@ def prepare_source_spec(
 
 
 def is_temperature_dataset(dataset_name: str) -> bool:
-    return dataset_name in {"depablo-10k", "depablo-10k-mix-temp"}
+    return dataset_name in {
+        "depablo-10k",
+        "depablo-10k-mix-temp",
+        "depablo_mixed_temp",
+        "noizy",
+        "lj_noisy",
+    }
 
 
-def ground_truth_p_ratio(sim, last_index: int = -1, *, dataset_name: str) -> float:
+def temperature_p_ratio(trajectory, *, cfg: dict | None = None, last_index: int = -1) -> float:
+    """Noise-aware p-ratio for thermal trajectories."""
+
+    cfg = {} if cfg is None else cfg
+    index = int(last_index)
+    if index < 0:
+        index += len(trajectory)
+
+    def with_training_prior(value: float) -> float:
+        prior = cfg.get("temperature_pratio_prior")
+        if prior is None or not (0 <= index < len(trajectory)):
+            return float(value)
+        series = np.full(len(trajectory), np.nan, dtype=float)
+        series[index] = float(value)
+        shrunk = shrink_p_ratio_series(
+            series,
+            trajectory,
+            prior=prior,
+            strain_scale=float(cfg.get("temperature_pratio_prior_strain_scale", 6e-3)),
+            full_weight_frame=int(cfg.get("temperature_pratio_prior_full_weight_frame", 20)),
+        )
+        return float(shrunk[index])
+
+    estimator = str(cfg.get("temperature_pratio_estimator", "robust")).lower()
+    if estimator in {"endpoint", "rollout_sides", "normal"}:
+        return float(calc_p_ratio_rollout_sides(trajectory, last_index))
+    if estimator in {"linear", "trajectory_linear", "legacy"}:
+        return with_training_prior(
+            float(calc_p_ratio_trajectory_sides(trajectory, last_index=last_index))
+        )
+    if estimator in {"strain_gated", "gated", "min_strain"}:
+        return with_training_prior(
+            trajectory_p_ratio_sides_strain_gated(
+                trajectory,
+                last_index=last_index,
+                min_fit_frames=int(cfg.get("temperature_pratio_min_fit_frames", 8)),
+                min_driven_strain_range=float(
+                    cfg.get("temperature_pratio_min_driven_strain_range", 1e-3)
+                ),
+            )
+        )
+    if estimator in {"robust", "theil_sen", "robust_slope"}:
+        return with_training_prior(
+            trajectory_p_ratio_sides_robust(
+                trajectory,
+                last_index=last_index,
+                min_fit_frames=int(cfg.get("temperature_pratio_min_fit_frames", 8)),
+                min_driven_strain_range=float(
+                    cfg.get("temperature_pratio_min_driven_strain_range", 1e-3)
+                ),
+                smooth_window=int(cfg.get("temperature_pratio_smooth_window", 5)),
+            )
+        )
+    raise ValueError(f"Unknown temperature_pratio_estimator: {estimator}")
+
+
+def ground_truth_p_ratio(
+    sim,
+    last_index: int = -1,
+    *,
+    dataset_name: str,
+    cfg: dict | None = None,
+) -> float:
     """Use trajectory fitting for noisy-temperature data and endpoint fitting otherwise."""
 
     if is_temperature_dataset(dataset_name) and len(sim) > 2:
-        return float(calc_p_ratio_trajectory_sides(sim, last_index=last_index))
+        return temperature_p_ratio(sim, cfg=cfg, last_index=last_index)
     return float(calc_p_ratio_rollout_sides(sim, last_index))
 
 
@@ -237,6 +531,21 @@ def resolve_train_val_test(
     p_ratio_fn: Callable | None = None,
 ):
     """Resolve a deterministic shuffled split, optionally filtering train p-ratio."""
+
+    if source_spec.get("dataset_mixture"):
+        if params.get("min_train_p_ratio") is not None:
+            raise ValueError("dataset_mixture cannot be combined with min_train_p_ratio.")
+        if bool(params.get("split_stratify_temperature", False)):
+            raise ValueError("dataset_mixture cannot be combined with temperature stratification.")
+        return resolve_dataset_splits(
+            source_spec.get("path", source_spec["dataset_mixture"][0]["path"]),
+            train_count=0,
+            val_count=0,
+            dataset_mixture=source_spec["dataset_mixture"],
+            split_seed=split_seed,
+            shuffle_within_source=True,
+            mix_holdout_across_sources=False,
+        )
 
     min_train_p_ratio = params.get("min_train_p_ratio")
     stratify_temperature = bool(params.get("split_stratify_temperature", False))
@@ -404,7 +713,9 @@ def rollout_metrics(df: pd.DataFrame, *, dataset, split_name, rollout_steps) -> 
             "split": split_name,
             "rollout_steps": int(rollout_steps),
             "used": 0,
+            "p_ratio_used": 0,
         }
+    valid_p_ratio = np.isfinite(df["true_p_ratio"]) & np.isfinite(df["pred_p_ratio"])
     final_pos_mse = float(df["final_pos_mse"].mean())
     initial_to_target_mse = float(df["initial_to_target_mse"].mean())
     pred_to_initial_mse = float(df["pred_to_initial_mse"].mean())
@@ -423,9 +734,22 @@ def rollout_metrics(df: pd.DataFrame, *, dataset, split_name, rollout_steps) -> 
         "split": split_name,
         "rollout_steps": int(rollout_steps),
         "used": int(len(df)),
+        "p_ratio_used": int(valid_p_ratio.sum()),
         "p_ratio_r2": r2_score(df["true_p_ratio"], df["pred_p_ratio"]),
         "p_ratio_pearson": pearson_r(df["true_p_ratio"], df["pred_p_ratio"]),
-        "p_ratio_mse": float(np.mean((df["true_p_ratio"] - df["pred_p_ratio"]) ** 2)),
+        "p_ratio_mse": (
+            float(
+                np.mean(
+                    (
+                        df.loc[valid_p_ratio, "true_p_ratio"]
+                        - df.loc[valid_p_ratio, "pred_p_ratio"]
+                    )
+                    ** 2
+                )
+            )
+            if int(valid_p_ratio.sum())
+            else float("nan")
+        ),
         "final_pos_mse": final_pos_mse,
         "initial_to_target_mse": initial_to_target_mse,
         "pred_to_initial_mse": pred_to_initial_mse,
@@ -469,6 +793,7 @@ def evaluate_rollout(
     )
     temperature_data = is_temperature_dataset(cfg["dataset_name"])
     p_ratio_window = cfg.get("temperature_pratio_window", "full")
+    rho_scale_mode = cfg.get("polar_rho_scale_mode")
 
     encode = lambda sim, t: encode_frame_latent(
         ae_model,
@@ -508,6 +833,12 @@ def evaluate_rollout(
                 )
                 if use_static_context
                 else None
+            )
+            rho_scale = initial_structure_scale(
+                sim,
+                mode=rho_scale_mode,
+                pos_dim=pos_dim,
+                device=device,
             )
             predicted_window = []
             ground_truth_window = []
@@ -560,6 +891,7 @@ def evaluate_rollout(
                         latent_stats,
                         loss_mode=loss_mode,
                         context=context,
+                        rho_scale=rho_scale,
                     )
                 if temperature_data and step >= window_start_step:
                     step_index = frame_for_filtered_step(sim, step, frame_skip=frame_skip)
@@ -588,8 +920,8 @@ def evaluate_rollout(
                 device=device,
             )
             if temperature_data and len(predicted_window) >= 2:
-                pred_pr = float(calc_p_ratio_trajectory_sides(predicted_window, last_index=-1))
-                true_pr = float(calc_p_ratio_trajectory_sides(ground_truth_window, last_index=-1))
+                pred_pr = temperature_p_ratio(predicted_window, cfg=cfg, last_index=-1)
+                true_pr = temperature_p_ratio(ground_truth_window, cfg=cfg, last_index=-1)
             else:
                 pred_pr = float(
                     calc_p_ratio_rollout_sides([clone_graph(sim[0]).cpu(), pred_graph], -1)
@@ -598,6 +930,7 @@ def evaluate_rollout(
                     sim,
                     target_index,
                     dataset_name=cfg["dataset_name"],
+                    cfg=cfg,
                 )
 
             initial_pos = sim[0].x[:, :pos_dim].cpu().float()
@@ -621,10 +954,17 @@ def evaluate_rollout(
                     "dataset": dataset,
                     "split": split_name,
                     "sim_idx": int(sim_idx),
+                    "source": str(getattr(sim[0], "source_name", dataset)),
                     "target_index": int(target_index),
                     "rollout_steps": int(rollout_steps),
                     "filtered_steps": int(filtered_steps),
                     "temperature": float(getattr(sim[0], "temperature", np.nan)),
+                    "rho_scale_mode": str(rho_scale_mode or "none"),
+                    "rho_scale": (
+                        float(rho_scale.detach().cpu().reshape(-1)[0])
+                        if rho_scale is not None
+                        else float("nan")
+                    ),
                     "pred_p_ratio": pred_pr,
                     "true_p_ratio": true_pr,
                     "final_pos_mse": final_pos_mse,
@@ -684,13 +1024,13 @@ def evaluate_rollout_horizons(
     )
     temperature_data = is_temperature_dataset(cfg["dataset_name"])
     p_ratio_window = cfg.get("temperature_pratio_window", "full")
+    rho_scale_mode = cfg.get("polar_rho_scale_mode")
 
-    unreachable = [step for step in horizons if step % stride != 0]
-    if unreachable:
-        raise ValueError(
-            "Every rollout horizon must be divisible by propagator_step_stride. "
-            f"stride={stride}, invalid horizons={unreachable}"
-        )
+    if stride > 1:
+        horizons = sorted({int(step) - (int(step) % stride) for step in horizons})
+        horizons = [step for step in horizons if step > 0]
+        if not horizons:
+            return pd.DataFrame(), pd.DataFrame()
 
     rows = []
     horizon_set = set(horizons)
@@ -745,6 +1085,12 @@ def evaluate_rollout_horizons(
                 if use_static_context
                 else None
             )
+            rho_scale = initial_structure_scale(
+                sim,
+                mode=rho_scale_mode,
+                pos_dim=pos_dim,
+                device=device,
+            )
             prev_dz = None
             start_step = stride
             predicted_path = [clone_graph(sim[0]).cpu()] if temperature_data else []
@@ -783,6 +1129,7 @@ def evaluate_rollout_horizons(
                         latent_stats,
                         loss_mode=loss_mode,
                         context=context,
+                        rho_scale=rho_scale,
                     )
 
                 target_index = frame_for_filtered_step(sim, step, frame_skip=frame_skip)
@@ -803,12 +1150,8 @@ def evaluate_rollout_horizons(
                         window_size = max(2, int(p_ratio_window))
                         predicted_window = predicted_path[-window_size:]
                         ground_truth_window = ground_truth_path[-window_size:]
-                    pred_pr = float(
-                        calc_p_ratio_trajectory_sides(predicted_window, last_index=-1)
-                    )
-                    true_pr = float(
-                        calc_p_ratio_trajectory_sides(ground_truth_window, last_index=-1)
-                    )
+                    pred_pr = temperature_p_ratio(predicted_window, cfg=cfg, last_index=-1)
+                    true_pr = temperature_p_ratio(ground_truth_window, cfg=cfg, last_index=-1)
                 else:
                     pred_pr = float(
                         calc_p_ratio_rollout_sides(
@@ -820,6 +1163,7 @@ def evaluate_rollout_horizons(
                         sim,
                         target_index,
                         dataset_name=cfg["dataset_name"],
+                        cfg=cfg,
                     )
 
                 initial_pos = sim[0].x[:, :pos_dim].cpu().float()
@@ -843,10 +1187,17 @@ def evaluate_rollout_horizons(
                         "dataset": dataset,
                         "split": split_name,
                         "sim_idx": int(sim_idx),
+                        "source": str(getattr(sim[0], "source_name", dataset)),
                         "target_index": int(target_index),
                         "rollout_steps": int(step),
                         "filtered_steps": int(step),
                         "temperature": float(getattr(sim[0], "temperature", np.nan)),
+                        "rho_scale_mode": str(rho_scale_mode or "none"),
+                        "rho_scale": (
+                            float(rho_scale.detach().cpu().reshape(-1)[0])
+                            if rho_scale is not None
+                            else float("nan")
+                        ),
                         "pred_p_ratio": pred_pr,
                         "true_p_ratio": true_pr,
                         "final_pos_mse": final_pos_mse,
@@ -945,8 +1296,8 @@ def evaluate_autoencoder_reconstruction_horizons(
                     continue
 
                 if temperature_data:
-                    pred_pr = float(calc_p_ratio_trajectory_sides(pred_path, last_index=-1))
-                    true_pr = float(calc_p_ratio_trajectory_sides(true_path, last_index=-1))
+                    pred_pr = temperature_p_ratio(pred_path, cfg=cfg, last_index=-1)
+                    true_pr = temperature_p_ratio(true_path, cfg=cfg, last_index=-1)
                 else:
                     pred_pr = float(
                         calc_p_ratio_rollout_sides(
@@ -958,6 +1309,7 @@ def evaluate_autoencoder_reconstruction_horizons(
                         sim,
                         target_index,
                         dataset_name=cfg["dataset_name"],
+                        cfg=cfg,
                     )
 
                 initial_pos = sim[0].x[:, :pos_dim].cpu().float()
@@ -973,6 +1325,7 @@ def evaluate_autoencoder_reconstruction_horizons(
                         "dataset": dataset,
                         "split": split_name,
                         "sim_idx": int(sim_idx),
+                        "source": str(getattr(sim[0], "source_name", dataset)),
                         "target_index": int(target_index),
                         "rollout_steps": int(step),
                         "pred_p_ratio": pred_pr,
@@ -1002,8 +1355,8 @@ def evaluate_autoencoder_reconstruction_horizons(
     return raw, pd.DataFrame(stats_rows)
 
 
-def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
-    """Train one autoencoder and propagator, then evaluate all three splits."""
+def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
+    """Train only the latent autoencoder and return splits for analysis notebooks."""
 
     params = {**cfg, **source_spec}
     label = source_spec["label"]
@@ -1012,6 +1365,7 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         sim,
         idx,
         dataset_name=dataset_name,
+        cfg=cfg,
     )
     train_data, val_data, test_data, split_info = resolve_train_val_test(
         source_spec,
@@ -1019,6 +1373,18 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         split_seed=cfg.get("split_seed"),
         p_ratio_fn=p_ratio_fn,
     )
+    if bool(params.get("temperature_pratio_use_training_prior", False)) and is_temperature_dataset(
+        dataset_name
+    ):
+        prior_cfg = dict(params)
+        prior_cfg.pop("temperature_pratio_prior", None)
+        prior_values = np.asarray(
+            [temperature_p_ratio(sim, cfg=prior_cfg, last_index=-1) for sim in train_data],
+            dtype=float,
+        )
+        finite_prior_values = prior_values[np.isfinite(prior_values)]
+        if len(finite_prior_values):
+            params["temperature_pratio_prior"] = float(np.mean(finite_prior_values))
     print(f"\n=== {label} ===")
     print(pd.DataFrame(split_info).to_string(index=False))
 
@@ -1026,9 +1392,9 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     batch_graphs = int(params["batch_graphs"])
     frame_skip = int(params.get("frame_skip", 1))
     ae_frame_budget = int(params["ae_max_train_frames_per_sim"])
-    dyn_budget = int(params["dyn_max_train_transitions_per_sim"])
     node_mode = params["node_feature_mode"]
     target_mode = params["ae_target_mode"]
+    edge_mode = str(params.get("edge_mode", "stored"))
 
     train_frames = make_frame_index(
         train_data,
@@ -1066,6 +1432,7 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         pos_dim=pos_dim,
         batch_graphs=batch_graphs,
         device=device,
+        edge_mode=edge_mode,
     )
     normalizers = {
         "target_mean": target_mean,
@@ -1077,36 +1444,309 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     }
     params["edge_feature_dim"] = int(edge_mean.numel())
 
-    ae_model = NodeDeltaAttentionAutoEncoder(
+    autoencoder_type = str(params.get("autoencoder_model", "attention")).lower()
+    autoencoder_cls = _autoencoder_class(autoencoder_type)
+    ae_model = autoencoder_cls(
         pos_dim=pos_dim,
         edge_dim=params["edge_feature_dim"],
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
     ).to(device)
+    ae_model.edge_mode = edge_mode
+    pretrained_ae_path = params.get("pretrained_ae_cache_path")
+    if pretrained_ae_path and bool(params.get("pca_initialize_displacement_layers", False)):
+        raise ValueError("Cannot combine pretrained_ae_cache_path with PCA initialization.")
+    if bool(params.get("pca_initialize_displacement_layers", False)):
+        params["pca_initialization"] = initialize_displacement_pca_layers(
+            ae_model, train_data, train_frames, pos_dim=pos_dim,
+            node_feature_mode=node_mode, target_mode=target_mode,
+            normalizers=normalizers, device=device,
+        )
+        print(f"PCA initialization: {params['pca_initialization']}")
     print("autoencoder")
-    ae_result = train_autoencoder(
-        ae_model,
-        train_data,
-        val_data,
-        train_frames,
-        val_frames,
-        batch_graphs=batch_graphs,
-        pos_dim=pos_dim,
-        node_feature_mode=node_mode,
-        ae_target_mode=target_mode,
-        normalizers=normalizers,
-        device=device,
-        config=TrainingConfig(
-            max_epochs=int(params["ae_max_epochs"]),
-            patience=int(params["ae_patience"]),
-            learning_rate=float(params["ae_lr"]),
-            weight_decay=float(params["ae_weight_decay"]),
-            min_delta=float(params["early_stop_min_delta"]),
-            log_every=10,
-        ),
-        coordinate_weights=params.get("ae_coordinate_weights"),
+    if pretrained_ae_path:
+        bundle = torch.load(pretrained_ae_path, map_location=device, weights_only=False)
+        if bundle.get("kind") != "ae_only":
+            raise ValueError(f"Expected an AE-only checkpoint at {pretrained_ae_path}")
+        for key, current in normalizers.items():
+            cached = bundle["stats"][key].to(device)
+            if not torch.allclose(current, cached, rtol=1e-5, atol=1e-7):
+                raise ValueError(
+                    f"Pretrained AE normalizer {key!r} does not match the current data split."
+                )
+        ae_model.load_state_dict(bundle["ae_state_dict"])
+        saved_history = pd.DataFrame(bundle.get("ae_history", [])).rename(
+            columns={
+                "train_objective": "train_loss",
+                "val_objective": "val_loss",
+                "train_mse_norm": "train_reconstruction",
+                "val_mse_norm": "val_reconstruction",
+            }
+        )
+        best_row = saved_history.loc[saved_history["val_loss"].idxmin()]
+        ae_result = TrainingResult(
+            model=ae_model,
+            history=saved_history,
+            best_val_loss=float(best_row["val_loss"]),
+            best_epoch=int(best_row["epoch"]),
+        )
+        print(f"loaded pretrained AE: {pretrained_ae_path}")
+    else:
+        ae_result = train_autoencoder(
+            ae_model,
+            train_data,
+            val_data,
+            train_frames,
+            val_frames,
+            batch_graphs=batch_graphs,
+            pos_dim=pos_dim,
+            node_feature_mode=node_mode,
+            ae_target_mode=target_mode,
+            normalizers=normalizers,
+            device=device,
+            edge_mode=edge_mode,
+            config=TrainingConfig(
+                max_epochs=int(params["ae_max_epochs"]),
+                patience=int(params["ae_patience"]),
+                learning_rate=float(params["ae_lr"]),
+                weight_decay=float(params["ae_weight_decay"]),
+                min_delta=float(params["early_stop_min_delta"]),
+                log_every=10,
+            ),
+            coordinate_weights=params.get("ae_coordinate_weights"),
+        )
+    ae_model = ae_result.model
+    for parameter in ae_model.parameters():
+        parameter.requires_grad_(False)
+
+    ae_history = ae_result.history.rename(
+        columns={
+            "train_loss": "train_objective",
+            "val_loss": "val_objective",
+            "train_reconstruction": "train_mse_norm",
+            "val_reconstruction": "val_mse_norm",
+        }
+    ).assign(
+        dataset=label,
+        latent_dim=int(params["latent_dim"]),
+        target_mode=target_mode,
+        hidden_size=int(params["hidden_size"]),
     )
+    stats = {
+        **_normalizers_to_cpu(normalizers),
+        "delta_mean": target_mean.detach().cpu(),
+        "delta_std": target_std.detach().cpu(),
+        "ae_target_mode": target_mode,
+    }
+    return {
+        "label": label,
+        "params": params,
+        "train_data": train_data,
+        "val_data": val_data,
+        "test_data": test_data,
+        "split_info": pd.DataFrame(split_info),
+        "ae": ae_model,
+        "normalizers": normalizers,
+        "stats": stats,
+        "ae_history": ae_history,
+    }
+
+
+def run_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
+    """Run either AE-only analysis training or full rollout training from cfg flags."""
+
+    should_rollout = bool(cfg.get("should_rollout", True))
+    should_train_propagator = bool(
+        cfg.get("should_train_propagator", should_rollout)
+    )
+    path = _cache_path(source_spec, cfg)
+    if path is not None and path.exists() and not bool(cfg.get("force_train", False)):
+        print(f"loading cached latent experiment: {path}")
+        if should_rollout or should_train_propagator:
+            from .capacity import load_experiment_bundle
+
+            result = load_experiment_bundle(path, cfg=cfg, device=device)
+            result["cache_path"] = str(path)
+            return result
+        return _load_ae_cache(path, cfg, device=device)
+
+    if should_rollout or should_train_propagator:
+        result = train_latent_experiment(source_spec, cfg, device=device)
+        if path is not None:
+            from .capacity import save_experiment_bundle
+
+            save_experiment_bundle(result, source_spec, path)
+            result["cache_path"] = str(path)
+        return result
+
+    result = train_latent_autoencoder_experiment(source_spec, cfg, device=device)
+    if path is not None:
+        _save_ae_cache(result, source_spec, cfg, path)
+        result["cache_path"] = str(path)
+    return result
+
+
+def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
+    """Train one autoencoder and propagator, then evaluate all three splits."""
+
+    params = {**cfg, **source_spec}
+    label = source_spec["label"]
+    dataset_name = params["dataset_name"]
+    p_ratio_fn = lambda sim, idx=-1: ground_truth_p_ratio(
+        sim,
+        idx,
+        dataset_name=dataset_name,
+        cfg=cfg,
+    )
+    train_data, val_data, test_data, split_info = resolve_train_val_test(
+        source_spec,
+        params,
+        split_seed=cfg.get("split_seed"),
+        p_ratio_fn=p_ratio_fn,
+    )
+    if bool(params.get("temperature_pratio_use_training_prior", False)) and is_temperature_dataset(
+        dataset_name
+    ):
+        prior_cfg = dict(params)
+        prior_cfg.pop("temperature_pratio_prior", None)
+        prior_values = np.asarray(
+            [temperature_p_ratio(sim, cfg=prior_cfg, last_index=-1) for sim in train_data],
+            dtype=float,
+        )
+        finite_prior_values = prior_values[np.isfinite(prior_values)]
+        if len(finite_prior_values):
+            params["temperature_pratio_prior"] = float(np.mean(finite_prior_values))
+    print(f"\n=== {label} ===")
+    print(pd.DataFrame(split_info).to_string(index=False))
+
+    pos_dim = int(params["pos_dim"])
+    batch_graphs = int(params["batch_graphs"])
+    frame_skip = int(params.get("frame_skip", 1))
+    ae_frame_budget = int(params["ae_max_train_frames_per_sim"])
+    dyn_budget = int(params["dyn_max_train_transitions_per_sim"])
+    node_mode = params["node_feature_mode"]
+    target_mode = params["ae_target_mode"]
+    edge_mode = str(params.get("edge_mode", "stored"))
+    pretrained_ae_path = params.get("pretrained_ae_cache_path")
+
+    train_frames = make_frame_index(
+        train_data,
+        frame_skip=frame_skip,
+        max_frames_per_sim=ae_frame_budget,
+        include_last=True,
+        start_frame_order=int(params.get("train_frame_start_order", 0)),
+    )
+    val_frames = make_frame_index(
+        val_data,
+        frame_skip=frame_skip,
+        max_frames_per_sim=ae_frame_budget,
+        include_last=True,
+        start_frame_order=int(params.get("train_frame_start_order", 0)),
+    )
+    target_mean, target_std = fit_ae_target_stats(
+        train_data,
+        train_frames,
+        pos_dim=pos_dim,
+        batch_graphs=batch_graphs,
+        device=device,
+        target_mode=target_mode,
+    )
+    node_mean, node_std = fit_node_feature_stats(
+        train_data,
+        train_frames,
+        pos_dim=pos_dim,
+        batch_graphs=batch_graphs,
+        device=device,
+        node_feature_mode=node_mode,
+    )
+    edge_mean, edge_std = fit_edge_stats(
+        train_data,
+        train_frames,
+        pos_dim=pos_dim,
+        batch_graphs=batch_graphs,
+        device=device,
+        edge_mode=edge_mode,
+    )
+    normalizers = {
+        "target_mean": target_mean,
+        "target_std": target_std,
+        "node_feature_mean": node_mean,
+        "node_feature_std": node_std,
+        "edge_mean": edge_mean,
+        "edge_std": edge_std,
+    }
+    params["edge_feature_dim"] = int(edge_mean.numel())
+
+    autoencoder_type = str(params.get("autoencoder_model", "attention")).lower()
+    autoencoder_cls = _autoencoder_class(autoencoder_type)
+    ae_model = autoencoder_cls(
+        pos_dim=pos_dim,
+        edge_dim=params["edge_feature_dim"],
+        hidden_size=int(params["hidden_size"]),
+        latent_dim=int(params["latent_dim"]),
+        latent_tokens=int(params["latent_tokens"]),
+    ).to(device)
+    ae_model.edge_mode = edge_mode
+    if bool(params.get("pca_initialize_displacement_layers", False)):
+        params["pca_initialization"] = initialize_displacement_pca_layers(
+            ae_model, train_data, train_frames, pos_dim=pos_dim,
+            node_feature_mode=node_mode, target_mode=target_mode,
+            normalizers=normalizers, device=device,
+        )
+        print(f"PCA initialization: {params['pca_initialization']}")
+    print("autoencoder")
+    if pretrained_ae_path:
+        bundle = torch.load(pretrained_ae_path, map_location=device, weights_only=False)
+        if bundle.get("kind") != "ae_only":
+            raise ValueError(f"Expected an AE-only checkpoint at {pretrained_ae_path}")
+        for key, current in normalizers.items():
+            cached = bundle["stats"][key].to(device)
+            if not torch.allclose(current, cached, rtol=1e-5, atol=1e-7):
+                raise ValueError(
+                    f"Pretrained AE normalizer {key!r} does not match the current data split."
+                )
+        ae_model.load_state_dict(bundle["ae_state_dict"])
+        saved_history = pd.DataFrame(bundle.get("ae_history", [])).rename(
+            columns={
+                "train_objective": "train_loss",
+                "val_objective": "val_loss",
+                "train_mse_norm": "train_reconstruction",
+                "val_mse_norm": "val_reconstruction",
+            }
+        )
+        best_row = saved_history.loc[saved_history["val_loss"].idxmin()]
+        ae_result = TrainingResult(
+            model=ae_model,
+            history=saved_history,
+            best_val_loss=float(best_row["val_loss"]),
+            best_epoch=int(best_row["epoch"]),
+        )
+        print(f"loaded pretrained AE: {pretrained_ae_path}")
+    else:
+        ae_result = train_autoencoder(
+            ae_model,
+            train_data,
+            val_data,
+            train_frames,
+            val_frames,
+            batch_graphs=batch_graphs,
+            pos_dim=pos_dim,
+            node_feature_mode=node_mode,
+            ae_target_mode=target_mode,
+            normalizers=normalizers,
+            device=device,
+            edge_mode=edge_mode,
+            config=TrainingConfig(
+                max_epochs=int(params["ae_max_epochs"]),
+                patience=int(params["ae_patience"]),
+                learning_rate=float(params["ae_lr"]),
+                weight_decay=float(params["ae_weight_decay"]),
+                min_delta=float(params["early_stop_min_delta"]),
+                log_every=10,
+            ),
+            coordinate_weights=params.get("ae_coordinate_weights"),
+        )
     ae_model = ae_result.model
     for parameter in ae_model.parameters():
         parameter.requires_grad_(False)
@@ -1141,9 +1781,33 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         latent_stat_rows = [
             (sim_idx, t0, t1)
             for sim_idx, _t_prev, t0, t1 in train_dyn_rows
-        ]
+            ]
     else:
-        if stride > 1:
+        if objective in {"multistep", "multi_step"}:
+            if stride != 1:
+                raise ValueError("multistep propagator training currently requires propagator_step_stride=1.")
+            multistep_horizons = [
+                int(horizon)
+                for horizon in params.get("propagator_multistep_horizons", list(range(1, 9)))
+            ]
+            train_dyn_rows = make_multistep_transition_index(
+                train_data,
+                horizons=multistep_horizons,
+                frame_skip=frame_skip,
+                max_starts_per_sim=dyn_budget,
+            )
+            val_dyn_rows = make_multistep_transition_index(
+                val_data,
+                horizons=multistep_horizons,
+                frame_skip=frame_skip,
+                max_starts_per_sim=dyn_budget,
+            )
+            latent_stat_rows = make_transition_index(
+                train_data,
+                frame_skip=frame_skip,
+                max_frames_per_sim=dyn_budget,
+            )
+        elif stride > 1:
             train_dyn_rows = make_jump_transition_index(
                 train_data,
                 step_stride=stride,
@@ -1156,6 +1820,7 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
                 frame_skip=frame_skip,
                 max_starts_per_sim=dyn_budget,
             )
+            latent_stat_rows = train_dyn_rows
         else:
             train_dyn_rows = make_transition_index(
                 train_data,
@@ -1167,12 +1832,13 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
                 frame_skip=frame_skip,
                 max_frames_per_sim=dyn_budget,
             )
-        latent_stat_rows = train_dyn_rows
+            latent_stat_rows = train_dyn_rows
 
     print(
         "latent propagator:",
         f"objective={objective}",
         f"step_stride={stride}",
+        f"horizons={params.get('propagator_multistep_horizons', None)}",
         f"train_rows={len(train_dyn_rows)}",
         f"val_rows={len(val_dyn_rows)}",
     )
@@ -1189,7 +1855,18 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         context_include_temperature=bool(
             params.get("propagator_context_include_temperature", False)
         ),
+        rho_scale_mode=params.get("polar_rho_scale_mode"),
     )
+    if not bool(params.get("propagator_standardize_latent", True)):
+        latent_stats.z_mean = torch.zeros_like(latent_stats.z_mean)
+        latent_stats.z_std = torch.ones_like(latent_stats.z_std)
+        latent_stats.dz_mean = torch.zeros_like(latent_stats.dz_mean)
+        latent_stats.dz_std = torch.ones_like(latent_stats.dz_std)
+        if latent_stats.z_next_mean is not None:
+            latent_stats.z_next_mean = torch.zeros_like(latent_stats.z_next_mean)
+        if latent_stats.z_next_std is not None:
+            latent_stats.z_next_std = torch.ones_like(latent_stats.z_next_std)
+        print("latent propagator: raw z and delta-z (standardization disabled)")
     loss_mode = str(params.get("propagator_loss", "delta")).lower()
     default_model = (
         "velocity_mlp"
@@ -1228,13 +1905,35 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         batch_graphs=batch_graphs,
         pos_dim=pos_dim,
         node_feature_mode=node_mode,
+        ae_target_mode=target_mode,
         normalizers=normalizers,
         device=device,
         loss_mode=loss_mode,
         objective=objective,
+        horizons=params.get("propagator_multistep_horizons"),
         use_static_context=bool(params.get("propagator_use_static_context", False)),
         context_include_temperature=bool(
             params.get("propagator_context_include_temperature", False)
+        ),
+        rho_scale_mode=params.get("polar_rho_scale_mode"),
+        physics_config=(
+            PhysicsLossConfig(
+                lambda_phys=float(params.get("physics_lambda", 0.0)),
+                lambda_mse=float(params.get("physics_mse_lambda", 1.0)),
+                inertial_weight=float(params.get("physics_inertial_weight", 1.0)),
+                spring_weight=float(params.get("physics_spring_weight", 1.0)),
+                external_weight=float(params.get("physics_external_weight", 1.0)),
+                boundary_weight=float(params.get("physics_boundary_weight", 1.0)),
+                box_weight=float(params.get("physics_box_weight", 0.0)),
+                spring_strain_margin=float(params.get("physics_spring_strain_margin", 0.0)),
+                default_mass=float(params.get("physics_default_mass", 1.0)),
+                dt=params.get("physics_dt", 1.0),
+                normalize_by_speed=bool(params.get("physics_normalize_by_speed", False)),
+                speed_epsilon=float(params.get("physics_speed_epsilon", 1e-3)),
+                latent_noise_std=float(params.get("physics_latent_noise_std", 0.0)),
+            )
+            if bool(params.get("physics_loss_enabled", False))
+            else None
         ),
         config=TrainingConfig(
             max_epochs=int(params["dyn_max_epochs"]),
@@ -1248,7 +1947,12 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     dyn_model = dyn_result.model
 
     ae_history = ae_result.history.rename(
-        columns={"train_loss": "train_mse_norm", "val_loss": "val_mse_norm"}
+        columns={
+            "train_loss": "train_objective",
+            "val_loss": "val_objective",
+            "train_reconstruction": "train_mse_norm",
+            "val_reconstruction": "val_mse_norm",
+        }
     ).assign(
         dataset=label,
         latent_dim=int(params["latent_dim"]),
@@ -1268,6 +1972,8 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         hidden_size=int(params["hidden_size"]),
         propagator_loss=loss_mode,
         propagator_objective=objective,
+        propagator_multistep_horizons=str(params.get("propagator_multistep_horizons", "")),
+        propagator_multistep_loss="final_horizon",
         propagator_step_stride=stride,
         initial_velocity=params.get("initial_velocity", "zero"),
     )
@@ -1281,6 +1987,9 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         "val": val_data,
         "test": test_data,
     }.items():
+        max_eval_sims = params.get("rollout_eval_max_sims_per_split")
+        if max_eval_sims is not None:
+            sims = sims[: int(max_eval_sims)]
         steps_grid = rollout_steps_for_sims(
             sims,
             params["rollout_steps_grid"],
@@ -1365,7 +2074,8 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
 def build_autoencoder(params: dict, *, edge_dim: int, device):
     """Construct the shared graph autoencoder from experiment parameters."""
 
-    return NodeDeltaAttentionAutoEncoder(
+    autoencoder_cls = _autoencoder_class(params.get("autoencoder_model", "attention"))
+    return autoencoder_cls(
         pos_dim=int(params["pos_dim"]),
         edge_dim=int(edge_dim),
         hidden_size=int(params["hidden_size"]),
@@ -1437,6 +2147,7 @@ def initial_latent_table(
                 "repeat_idx": int(params.get("repeat_idx", 1)),
                 "run_label": result["label"],
                 "sim_idx": int(sim_idx),
+                "source": str(getattr(sim[0], "source_name", result.get("source_name", result["label"]))),
                 "frames": int(len(sim)),
                 "nodes": int(sim[0].x.shape[0]),
                 "temperature": float(getattr(sim[0], "temperature", np.nan)),
@@ -1444,6 +2155,7 @@ def initial_latent_table(
                     sim,
                     -1,
                     dataset_name=params["dataset_name"],
+                    cfg=params,
                 ),
             }
             row.update({f"z{idx}": float(value) for idx, value in enumerate(z)})
@@ -1564,7 +2276,10 @@ __all__ = [
     "rollout_curve_summary",
     "rollout_metrics",
     "rollout_steps_for_sims",
+    "run_latent_experiment",
     "save_result_tables",
     "seed_everything",
+    "temperature_p_ratio",
+    "train_latent_autoencoder_experiment",
     "train_latent_experiment",
 ]
