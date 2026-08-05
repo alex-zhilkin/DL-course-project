@@ -166,6 +166,199 @@ def complete_graph_edge_data(
     return edge_index, expanded_features(cur_vec, cur_len), expanded_features(ref_vec, ref_len)
 
 
+def stored_graph_edge_data(
+    ref_graph,
+    cur_graph,
+    *,
+    pos_dim: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build bidirectional messages only along the stored physical edges.
+
+    The serialized network stores each undirected interaction once. Message
+    passing needs both directions, so every stored pair is expanded to
+    ``i -> j`` and ``j -> i``. Current geometry is always recomputed from
+    ``cur_graph.x``; rollout code therefore cannot leak target-frame edge
+    vectors through a cloned graph container.
+    """
+    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    cur_pos = cur_graph.x[:, :pos_dim].to(device).float()
+    if ref_pos.shape != cur_pos.shape:
+        raise ValueError("Stored-edge mode requires a fixed node set across frames.")
+
+    stored_index = ref_graph.edge_index.to(device).long()
+    forward_source, forward_target = stored_index
+    source = torch.cat([forward_source, forward_target])
+    target = torch.cat([forward_target, forward_source])
+    edge_index = torch.stack([source, target], dim=0)
+
+    def pair_geometry(pos, graph):
+        vector = pos[target] - pos[source]
+        box = box_tensor(graph, device=device, dtype=pos.dtype)
+        if box is not None:
+            vector = vector - torch.round(vector / box.reshape(1, -1)) * box.reshape(1, -1)
+        length = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        return vector, length
+
+    ref_vec, ref_len = pair_geometry(ref_pos, ref_graph)
+    cur_vec, cur_len = pair_geometry(cur_pos, cur_graph)
+    stored_stiffness = ref_graph.edge_attr[:, -1:].to(device).float()
+    stiffness = torch.cat([stored_stiffness, stored_stiffness], dim=0)
+
+    def expanded_features(current_vec, current_len):
+        stretch = current_len - ref_len
+        relative_stretch = stretch / ref_len.clamp_min(1e-6)
+        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        return torch.cat(
+            [
+                ref_vec,
+                current_vec,
+                ref_len,
+                current_len,
+                stretch,
+                relative_stretch,
+                stiffness,
+                current_raw,
+            ],
+            dim=-1,
+        )
+
+    return edge_index, expanded_features(cur_vec, cur_len), expanded_features(ref_vec, ref_len)
+
+
+def undirected_complete_graph_edge_data(
+    ref_graph,
+    cur_graph,
+    *,
+    pos_dim: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one canonical edge ``{i, j}`` for every unordered node pair."""
+    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    cur_pos = cur_graph.x[:, :pos_dim].to(device).float()
+    if ref_pos.shape != cur_pos.shape:
+        raise ValueError("Undirected complete-edge mode requires a fixed node set.")
+
+    num_nodes = ref_pos.size(0)
+    edge_index = torch.triu_indices(
+        num_nodes, num_nodes, offset=1, device=device
+    )
+    first, second = edge_index
+
+    def pair_geometry(pos, graph):
+        vector = pos[second] - pos[first]
+        box = box_tensor(graph, device=device, dtype=pos.dtype)
+        if box is not None:
+            vector = vector - torch.round(vector / box.reshape(1, -1)) * box.reshape(1, -1)
+        length = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        return vector, length
+
+    ref_vec, ref_len = pair_geometry(ref_pos, ref_graph)
+    cur_vec, cur_len = pair_geometry(cur_pos, cur_graph)
+    stiffness_matrix = torch.zeros(
+        (num_nodes, num_nodes), device=device, dtype=ref_pos.dtype
+    )
+    stored_index = ref_graph.edge_index.to(device).long()
+    stored_stiffness = ref_graph.edge_attr[:, -1].to(device).float()
+    stored_first, stored_second = stored_index
+    stiffness_matrix[stored_first, stored_second] = stored_stiffness
+    stiffness_matrix[stored_second, stored_first] = stored_stiffness
+    stiffness = stiffness_matrix[first, second].reshape(-1, 1)
+
+    def expanded_features(current_vec, current_len):
+        stretch = current_len - ref_len
+        relative_stretch = stretch / ref_len.clamp_min(1e-6)
+        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        return torch.cat(
+            [
+                ref_vec,
+                current_vec,
+                ref_len,
+                current_len,
+                stretch,
+                relative_stretch,
+                stiffness,
+                current_raw,
+            ],
+            dim=-1,
+        )
+
+    return edge_index, expanded_features(cur_vec, cur_len), expanded_features(ref_vec, ref_len)
+
+
+def undirected_stored_graph_edge_data(
+    ref_graph,
+    cur_graph,
+    *,
+    pos_dim: int,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Canonicalize and deduplicate the stored physical edge set.
+
+    Reciprocal or repeated serialized entries, if present, collapse to one
+    unordered pair. Duplicate stiffness values are averaged. Geometry is
+    recomputed from positions, so no target-frame edge data enters a rollout.
+    """
+    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    cur_pos = cur_graph.x[:, :pos_dim].to(device).float()
+    if ref_pos.shape != cur_pos.shape:
+        raise ValueError("Undirected stored-edge mode requires a fixed node set.")
+
+    num_nodes = ref_pos.size(0)
+    raw_index = ref_graph.edge_index.to(device).long()
+    raw_first = torch.minimum(raw_index[0], raw_index[1])
+    raw_second = torch.maximum(raw_index[0], raw_index[1])
+    keep = raw_first != raw_second
+    raw_first, raw_second = raw_first[keep], raw_second[keep]
+    keys = raw_first * num_nodes + raw_second
+    unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    first = torch.div(unique_keys, num_nodes, rounding_mode="floor")
+    second = unique_keys.remainder(num_nodes)
+    edge_index = torch.stack([first, second], dim=0)
+
+    # `keep` follows `edge_index` onto the requested device. Move the edge
+    # attributes first so CUDA masks never index a CPU tensor.
+    raw_stiffness = ref_graph.edge_attr[:, -1].to(device).float()[keep]
+    stiffness_sum = torch.zeros(
+        unique_keys.numel(), device=device, dtype=ref_pos.dtype
+    )
+    stiffness_count = torch.zeros_like(stiffness_sum)
+    stiffness_sum.index_add_(0, inverse, raw_stiffness)
+    stiffness_count.index_add_(0, inverse, torch.ones_like(raw_stiffness))
+    stiffness = (stiffness_sum / stiffness_count.clamp_min(1)).reshape(-1, 1)
+
+    def pair_geometry(pos, graph):
+        vector = pos[second] - pos[first]
+        box = box_tensor(graph, device=device, dtype=pos.dtype)
+        if box is not None:
+            vector = vector - torch.round(vector / box.reshape(1, -1)) * box.reshape(1, -1)
+        length = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        return vector, length
+
+    ref_vec, ref_len = pair_geometry(ref_pos, ref_graph)
+    cur_vec, cur_len = pair_geometry(cur_pos, cur_graph)
+
+    def expanded_features(current_vec, current_len):
+        stretch = current_len - ref_len
+        relative_stretch = stretch / ref_len.clamp_min(1e-6)
+        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        return torch.cat(
+            [
+                ref_vec,
+                current_vec,
+                ref_len,
+                current_len,
+                stretch,
+                relative_stretch,
+                stiffness,
+                current_raw,
+            ],
+            dim=-1,
+        )
+
+    return edge_index, expanded_features(cur_vec, cur_len), expanded_features(ref_vec, ref_len)
+
+
 def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch.Tensor:
     t = int(t)
     cur_pos = sim[t].x[:, :pos_dim].to(device).float()
@@ -178,6 +371,47 @@ def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch
         ref_pos = sim[0].x[:, :pos_dim].to(device).float()
         scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
         return (cur_pos - ref_pos) / scale.reshape(1, -1)
+    if mode in {
+        "normalized_delta_velocity",
+        "delta_velocity",
+        "displacement_velocity",
+        "phase_space",
+    }:
+        ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+        scale = (
+            ref_pos.max(dim=0).values - ref_pos.min(dim=0).values
+        ).clamp_min(1e-6)
+        displacement = (cur_pos - ref_pos) / scale.reshape(1, -1)
+        if t <= 0:
+            velocity = torch.zeros_like(cur_pos)
+        else:
+            prev_pos = sim[t - 1].x[:, :pos_dim].to(device).float()
+            velocity = (cur_pos - prev_pos) / scale.reshape(1, -1)
+        return torch.cat([displacement, velocity], dim=-1)
+    if mode in {
+        "normalized_delta_velocity_history3",
+        "displacement_velocity_history3",
+        "modular_history3",
+    }:
+        ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+        scale = (
+            ref_pos.max(dim=0).values - ref_pos.min(dim=0).values
+        ).clamp_min(1e-6)
+        displacement = (cur_pos - ref_pos) / scale.reshape(1, -1)
+        velocities = []
+        # Match modular-network-simulator's history=3 representation:
+        # [x_t-x_{t-1}, x_{t-1}-x_{t-2}, x_{t-2}-x_{t-3}].
+        # Missing differences at the beginning of a trajectory are zero.
+        for offset in range(3):
+            current_index = t - offset
+            if current_index <= 0:
+                velocity = torch.zeros_like(cur_pos)
+            else:
+                current = sim[current_index].x[:, :pos_dim].to(device).float()
+                previous = sim[current_index - 1].x[:, :pos_dim].to(device).float()
+                velocity = (current - previous) / scale.reshape(1, -1)
+            velocities.append(velocity)
+        return torch.cat([displacement, *velocities], dim=-1)
     if mode == "velocity":
         if t <= 0:
             return torch.zeros_like(cur_pos)
@@ -220,8 +454,12 @@ def batch_delta_graphs(
         )
         ref_xs.append(ref_pos)
         if edge_mode == "complete":
-            local_edge_index, current_edges, reference_edges = complete_graph_edge_data(
+            # Store/compute each unordered all-pairs relation once.  The latent
+            # AE contributes it to both endpoints inside aggregate_edges.
+            local_edge_index, current_edges, reference_edges = (
+                undirected_complete_graph_edge_data(
                 ref_graph, cur_graph, pos_dim=pos_dim, device=device
+                )
             )
         elif edge_mode == "stored":
             local_edge_index = ref_graph.edge_index.to(device).long()
@@ -255,6 +493,12 @@ def ae_target_tensor(batch_data: dict[str, torch.Tensor], target_mode: str) -> t
         return batch_data["delta"]
     if target_mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
         return batch_data["normalized_delta"]
+    if target_mode in {
+        "normalized_delta_velocity_history3",
+        "displacement_velocity_history3",
+        "modular_history3",
+    }:
+        return batch_data["node_feature"]
     raise ValueError(f"Unknown ae_target_mode: {target_mode}")
 
 
@@ -266,10 +510,17 @@ def fit_ae_target_stats(
     batch_graphs: int,
     device,
     target_mode: str,
+    node_feature_mode: str = "delta",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     chunks = []
     for rows_batch in iter_batches(rows, batch_graphs, shuffle=False):
-        batch_data = batch_delta_graphs(sims, rows_batch, pos_dim=pos_dim, device=device)
+        batch_data = batch_delta_graphs(
+            sims,
+            rows_batch,
+            pos_dim=pos_dim,
+            device=device,
+            node_feature_mode=node_feature_mode,
+        )
         chunks.append(ae_target_tensor(batch_data, target_mode).detach())
     all_targets = torch.cat(chunks, dim=0)
     mean = all_targets.mean(dim=0, keepdim=True)

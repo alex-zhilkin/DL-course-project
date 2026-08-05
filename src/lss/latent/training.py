@@ -29,6 +29,7 @@ from .simulation import (
     iter_batches,
     pearson_r,
     r2_score,
+    undirected_complete_graph_edge_data,
 )
 from .models import make_latent_propagator
 from .physics import PhysicsLossConfig, elastic_implicit_euler_energy
@@ -64,6 +65,9 @@ def _train_with_early_stopping(
     config: TrainingConfig,
     label: str,
     metric_key: str | None = None,
+    epoch_callback: Callable | None = None,
+    selection_metric_key: str | None = None,
+    selection_mode: str = "min",
     verbose: bool = True,
 ) -> TrainingResult:
     optimizer = torch.optim.AdamW(
@@ -72,7 +76,10 @@ def _train_with_early_stopping(
         weight_decay=float(config.weight_decay),
     )
     best_state = None
-    best_val = float("inf")
+    selection_mode = str(selection_mode).lower()
+    if selection_mode not in {"min", "max"}:
+        raise ValueError("selection_mode must be 'min' or 'max'.")
+    best_val = float("inf") if selection_mode == "min" else float("-inf")
     best_epoch = 0
     stale = 0
     rows = []
@@ -93,11 +100,30 @@ def _train_with_early_stopping(
             row.update({f"train_{key}": float(value) for key, value in train_info.items()})
         if isinstance(val_info, dict):
             row.update({f"val_{key}": float(value) for key, value in val_info.items()})
+        if epoch_callback is not None:
+            with torch.no_grad():
+                callback_info = epoch_callback(epoch, model)
+            if callback_info:
+                row.update(
+                    {
+                        str(key): float(value)
+                        for key, value in callback_info.items()
+                    }
+                )
         rows.append(row)
 
-        improved = np.isfinite(val_loss) and val_loss < best_val - float(config.min_delta)
+        selection_value = float(
+            row.get(selection_metric_key, float("nan"))
+            if selection_metric_key is not None
+            else val_loss
+        )
+        improved = np.isfinite(selection_value) and (
+            selection_value < best_val - float(config.min_delta)
+            if selection_mode == "min"
+            else selection_value > best_val + float(config.min_delta)
+        )
         if improved:
-            best_val = val_loss
+            best_val = selection_value
             best_epoch = epoch
             best_state = {
                 key: value.detach().cpu().clone()
@@ -107,16 +133,27 @@ def _train_with_early_stopping(
         else:
             stale += 1
 
-        if verbose and (epoch == 1 or epoch % int(config.log_every) == 0 or improved):
+        if verbose and (
+            epoch_callback is not None
+            or epoch == 1
+            or epoch % int(config.log_every) == 0
+            or improved
+        ):
+            callback_text = " ".join(
+                f"{key}={value:.4g}"
+                for key, value in row.items()
+                if key.startswith("val_rollout_")
+            )
             print(
                 f"{label} {epoch:04d} train={train_loss:.6g} "
                 f"val={val_loss:.6g} stale={stale}"
+                + (f" {callback_text}" if callback_text else "")
             )
         if stale >= int(config.patience):
             if verbose:
                 print(
                     f"{label} early stop at epoch {epoch:04d}; "
-                    f"best_epoch={best_epoch:04d} best_val={best_val:.6g}"
+                    f"best_epoch={best_epoch:04d} best_{selection_metric_key or 'val'}={best_val:.6g}"
                 )
             break
 
@@ -127,7 +164,7 @@ def _train_with_early_stopping(
     if verbose and stale < int(config.patience):
         print(
             f"{label} finished at max epoch {int(config.max_epochs):04d}; "
-            f"best_epoch={best_epoch:04d} best_val={best_val:.6g}"
+            f"best_epoch={best_epoch:04d} best_{selection_metric_key or 'val'}={best_val:.6g}"
         )
     return TrainingResult(
         model=model,
@@ -277,13 +314,14 @@ def encode_reference_context(
     normalizers: dict[str, torch.Tensor],
     device,
     include_temperature: bool = False,
+    pool_mode: str = "mean",
 ) -> torch.Tensor:
     """Pool the learned reference-node representation into static network context."""
     ref_graph = sim[0]
     ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
     edge_mode = str(getattr(ae_model, "edge_mode", "stored"))
     if edge_mode == "complete":
-        edge_index, _, ref_edge_attr = complete_graph_edge_data(
+        edge_index, _, ref_edge_attr = undirected_complete_graph_edge_data(
             ref_graph, ref_graph, pos_dim=pos_dim, device=device
         )
     elif edge_mode == "stored":
@@ -299,7 +337,23 @@ def encode_reference_context(
         ref_edge_attr_norm,
         edge_index,
     )
-    context = h0.mean(dim=0)
+    pool_mode = str(pool_mode).lower()
+    if pool_mode in {"learned_attention", "attention", "set_attention"}:
+        context = h0
+    elif pool_mode in {"mean", "average"}:
+        context = h0.mean(dim=0)
+    elif pool_mode in {"moments", "distribution", "mean_std_min_max"}:
+        context = torch.cat(
+            [
+                h0.mean(dim=0),
+                h0.std(dim=0, unbiased=False),
+                h0.amin(dim=0),
+                h0.amax(dim=0),
+            ],
+            dim=0,
+        )
+    else:
+        raise ValueError(f"Unknown propagator_context_pool: {pool_mode}")
     if include_temperature:
         temperature = float(getattr(ref_graph, "temperature", 0.0))
         temperature_feature = torch.tensor(
@@ -307,7 +361,13 @@ def encode_reference_context(
             dtype=context.dtype,
             device=context.device,
         )
-        context = torch.cat([context, temperature_feature], dim=0)
+        if context.ndim == 2:
+            context = torch.cat(
+                [context, temperature_feature.reshape(1, 1).expand(context.size(0), 1)],
+                dim=-1,
+            )
+        else:
+            context = torch.cat([context, temperature_feature], dim=0)
     return context
 
 
@@ -337,7 +397,7 @@ def encode_frame_latent(
     ].to(device)
     edge_mode = str(edge_mode or getattr(ae_model, "edge_mode", "stored"))
     if edge_mode == "complete":
-        edge_index, edge_attr, ref_edge_attr = complete_graph_edge_data(
+        edge_index, edge_attr, ref_edge_attr = undirected_complete_graph_edge_data(
             ref_graph, cur_graph, pos_dim=pos_dim, device=device
         )
     elif edge_mode == "stored":
@@ -421,6 +481,7 @@ def fit_latent_step_stats(
     device,
     use_static_context: bool = False,
     context_include_temperature: bool = False,
+    context_pool_mode: str = "mean",
     rho_scale_mode: str | None = None,
 ) -> LatentNormalizer:
     z_chunks = []
@@ -441,7 +502,11 @@ def fit_latent_step_stats(
         z_chunks.append(z0.detach())
         z_next_chunks.append(z1.detach())
         dz_chunks.append((z1 - z0).detach())
-        if use_static_context:
+        if use_static_context and str(context_pool_mode).lower() not in {
+            "learned_attention",
+            "attention",
+            "set_attention",
+        }:
             context_chunks.extend(
                 encode_reference_context(
                     ae_model,
@@ -450,6 +515,7 @@ def fit_latent_step_stats(
                     normalizers=normalizers,
                     device=device,
                     include_temperature=context_include_temperature,
+                    pool_mode=context_pool_mode,
                 ).detach()
                 for row in rows_batch
             )
@@ -541,6 +607,92 @@ def latent_step(
     raise ValueError(f"Unknown propagator loss_mode: {loss_mode}")
 
 
+def latent_step_kinematic(
+    model,
+    z: torch.Tensor,
+    z_previous: torch.Tensor,
+    z_reference: torch.Tensor,
+    stats: LatentNormalizer,
+    *,
+    progress: float | torch.Tensor,
+    context: torch.Tensor | None = None,
+    context_is_encoded: bool = False,
+) -> torch.Tensor:
+    """Advance an anchored, second-order latent state by one closed-loop step."""
+
+    if not getattr(model, "uses_kinematic_state", False):
+        raise ValueError(
+            f"{model.__class__.__name__} is not a kinematic latent propagator."
+        )
+    z_std = stats.z_std.to(z).clamp_min(1e-6)
+    q = (z.unsqueeze(0) - z_reference.unsqueeze(0)) / z_std
+    # Zero physical velocity should be represented by exactly zero.  We use
+    # the learned delta scale but deliberately do not subtract its mean.
+    velocity = (z.unsqueeze(0) - z_previous.unsqueeze(0)) / stats.dz_std.to(z).clamp_min(
+        1e-6
+    )
+    reference = stats.normalize_z(z_reference.unsqueeze(0))
+    progress_tensor = torch.as_tensor(progress, dtype=z.dtype, device=z.device).reshape(1, 1)
+    progress_tensor = 2.0 * progress_tensor.clamp(0.0, 1.0) - 1.0
+    state = torch.cat([q, velocity, reference, progress_tensor], dim=-1)
+    if context_is_encoded:
+        context_norm = context
+    else:
+        context_value = context
+        if context_value is not None and context_value.ndim == 1:
+            context_value = context_value.unsqueeze(0)
+        context_norm = stats.normalize_context(context_value)
+    next_q = model(
+        state,
+        context_norm,
+        context_is_encoded=context_is_encoded,
+    )
+    return (z_reference.unsqueeze(0) + next_q * z_std).squeeze(0)
+
+
+def latent_step_history(
+    model,
+    z: torch.Tensor,
+    z_previous: torch.Tensor,
+    z_previous_previous: torch.Tensor,
+    z_reference: torch.Tensor,
+    stats: LatentNormalizer,
+    *,
+    context: torch.Tensor | None = None,
+    context_is_encoded: bool = False,
+) -> torch.Tensor:
+    """Advance a latent state using position, velocity, and acceleration."""
+
+    if not getattr(model, "uses_history_state", False):
+        raise ValueError(
+            f"{model.__class__.__name__} is not a three-frame latent propagator."
+        )
+    z_std = stats.z_std.to(z).clamp_min(1e-6)
+    dz_std = stats.dz_std.to(z).clamp_min(1e-6)
+    q = (z.unsqueeze(0) - z_reference.unsqueeze(0)) / z_std
+    velocity = (z.unsqueeze(0) - z_previous.unsqueeze(0)) / dz_std
+    previous_velocity = (
+        z_previous.unsqueeze(0) - z_previous_previous.unsqueeze(0)
+    ) / dz_std
+    acceleration = velocity - previous_velocity
+    reference = stats.normalize_z(z_reference.unsqueeze(0))
+    state = torch.cat([q, velocity, acceleration, reference], dim=-1)
+    if context_is_encoded:
+        context_norm = context
+    else:
+        context_value = context
+        if context_value is not None and context_value.ndim == 1:
+            context_value = context_value.unsqueeze(0)
+        context_norm = stats.normalize_context(context_value)
+    predicted_acceleration = model(
+        state,
+        context_norm,
+        context_is_encoded=context_is_encoded,
+    )
+    next_velocity = velocity + predicted_acceleration
+    return (z.unsqueeze(0) + next_velocity * dz_std).squeeze(0)
+
+
 def epoch_autoencoder(
     model,
     sims,
@@ -601,21 +753,20 @@ def epoch_autoencoder(
                 )
             squared_error = squared_error * weights / weights.mean().clamp_min(1e-8)
         reconstruction_loss = squared_error.mean()
-        # The AE objective is deliberately reconstruction-only. Latent
-        # independence, variance, strain, and MI-style auxiliary penalties do
-        # not belong in representation training.
         loss = reconstruction_loss
         if is_train:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-        losses.append({"loss": float(loss.item()), "reconstruction": float(loss.item())})
+        losses.append(
+            {
+                "loss": float(loss.item()),
+                "reconstruction": float(reconstruction_loss.item()),
+            }
+        )
     if not losses:
-        return {
-            key: float("nan")
-            for key in ("loss", "reconstruction")
-        }
+        return {"loss": float("nan"), "reconstruction": float("nan")}
     return {key: float(np.mean([row[key] for row in losses])) for key in losses[0]}
 
 
@@ -1195,6 +1346,367 @@ def epoch_multistep_propagator(
     }
 
 
+def _previous_filtered_frame(sim, frame: int, *, frame_skip: int) -> int:
+    frame_ids = filtered_frame_ids(sim, frame_skip=frame_skip, include_last=True)
+    try:
+        order = frame_ids.index(int(frame))
+    except ValueError:
+        return max(0, int(frame) - max(1, int(frame_skip)))
+    return int(frame_ids[max(0, order - 1)])
+
+
+def _nth_previous_filtered_frame(
+    sim,
+    frame: int,
+    *,
+    frame_skip: int,
+    steps: int,
+) -> int:
+    previous = int(frame)
+    for _ in range(max(0, int(steps))):
+        previous = _previous_filtered_frame(
+            sim,
+            previous,
+            frame_skip=frame_skip,
+        )
+    return previous
+
+
+def _precompute_kinematic_latents(
+    ae_model,
+    sims,
+    rows,
+    *,
+    pos_dim: int,
+    node_feature_mode: str,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    frame_skip: int,
+    use_static_context: bool,
+    context_include_temperature: bool,
+    context_pool_mode: str,
+) -> tuple[dict[tuple[int, int], torch.Tensor], dict[int, torch.Tensor]]:
+    """Encode every latent needed by history training once."""
+
+    required: dict[int, set[int]] = {}
+    for sim_idx, start_frame, target_frames in rows:
+        sim_idx = int(sim_idx)
+        start_frame = int(start_frame)
+        required.setdefault(sim_idx, {0}).update(
+            {
+                start_frame,
+                _previous_filtered_frame(
+                    sims[sim_idx], start_frame, frame_skip=frame_skip
+                ),
+                _nth_previous_filtered_frame(
+                    sims[sim_idx],
+                    start_frame,
+                    frame_skip=frame_skip,
+                    steps=2,
+                ),
+                *(int(frame) for frame in target_frames),
+            }
+        )
+    latent_cache: dict[tuple[int, int], torch.Tensor] = {}
+    context_cache: dict[int, torch.Tensor] = {}
+    ae_model.eval()
+    with torch.no_grad():
+        for sim_idx, frames in required.items():
+            sim = sims[sim_idx]
+            for frame in sorted(frames):
+                latent_cache[(sim_idx, frame)] = encode_frame_latent(
+                    ae_model,
+                    sim,
+                    frame,
+                    pos_dim=pos_dim,
+                    node_feature_mode=node_feature_mode,
+                    normalizers=normalizers,
+                    device=device,
+                ).detach()
+            if use_static_context:
+                context_cache[sim_idx] = encode_reference_context(
+                    ae_model,
+                    sim,
+                    pos_dim=pos_dim,
+                    normalizers=normalizers,
+                    device=device,
+                    include_temperature=context_include_temperature,
+                    pool_mode=context_pool_mode,
+                ).detach()
+    return latent_cache, context_cache
+
+
+def _per_frame_latent_variation(
+    latent_cache: dict[tuple[int, int], torch.Tensor],
+    *,
+    global_scale: torch.Tensor,
+    floor_fraction: float,
+) -> dict[int, torch.Tensor]:
+    """Estimate coordinate-wise between-network scale at each physical frame."""
+
+    grouped: dict[int, list[torch.Tensor]] = {}
+    for (_sim_idx, frame), latent in latent_cache.items():
+        grouped.setdefault(int(frame), []).append(latent)
+    floor = (
+        global_scale.detach().reshape(-1) * float(floor_fraction)
+    ).clamp_min(1e-6)
+    return {
+        frame: torch.stack(values, dim=0)
+        .std(dim=0, unbiased=False)
+        .clamp_min(floor)
+        for frame, values in grouped.items()
+        if len(values) >= 2
+    }
+
+
+def epoch_kinematic_multistep_propagator(
+    model,
+    ae_model,
+    sims,
+    rows,
+    stats: LatentNormalizer,
+    *,
+    batch_graphs: int,
+    pos_dim: int,
+    node_feature_mode: str,
+    normalizers: dict[str, torch.Tensor],
+    device,
+    unroll_steps: int,
+    frame_skip: int = 1,
+    use_static_context: bool = False,
+    context_include_temperature: bool = False,
+    latent_cache=None,
+    context_cache=None,
+    context_pool_mode: str = "mean",
+    ae_target_mode: str | None = None,
+    position_loss_weight: float = 0.0,
+    position_boundary_weight: float = 1.0,
+    position_boundary_fraction: float = 0.10,
+    position_coordinate_weights=None,
+    network_variation_weight: float = 0.0,
+    frame_variation=None,
+    optimizer=None,
+    **_unused,
+) -> dict[str, float]:
+    """Supervise every state of a fully autoregressive latent unroll."""
+
+    del node_feature_mode
+    is_train = optimizer is not None
+    model.train(is_train)
+    unroll_steps = int(unroll_steps)
+    losses, raw_losses, position_losses = [], [], []
+
+    for batch_rows in iter_batches(rows, batch_graphs, shuffle=is_train):
+        row_losses, row_raw_losses = [], []
+        for sim_idx, start_frame, target_frames in batch_rows:
+            sim_idx, start_frame = int(sim_idx), int(start_frame)
+            if len(target_frames) < unroll_steps:
+                continue
+            sim = sims[sim_idx]
+            z_reference = latent_cache[(sim_idx, 0)]
+            z = latent_cache[(sim_idx, start_frame)]
+            previous_frame = _previous_filtered_frame(
+                sim, start_frame, frame_skip=frame_skip
+            )
+            z_previous = latent_cache[(sim_idx, previous_frame)]
+            previous_previous_frame = _previous_filtered_frame(
+                sim, previous_frame, frame_skip=frame_skip
+            )
+            z_previous_previous = latent_cache[
+                (sim_idx, previous_previous_frame)
+            ]
+            context = (
+                context_cache[sim_idx] if use_static_context else None
+            )
+            encoded_context = None
+            if context is not None:
+                context_value = (
+                    context.unsqueeze(0) if context.ndim == 1 else context
+                )
+                encoded_context = model.encode_context(
+                    stats.normalize_context(context_value)
+                )
+            step_losses, step_raw_losses, weights = [], [], []
+            for offset in range(unroll_steps):
+                target_frame = int(target_frames[offset])
+                if getattr(model, "uses_history_state", False):
+                    z_next = latent_step_history(
+                        model,
+                        z,
+                        z_previous,
+                        z_previous_previous,
+                        z_reference,
+                        stats,
+                        context=encoded_context,
+                        context_is_encoded=encoded_context is not None,
+                    )
+                else:
+                    progress = target_frame / max(1, len(sim) - 1)
+                    z_next = latent_step_kinematic(
+                        model,
+                        z,
+                        z_previous,
+                        z_reference,
+                        stats,
+                        progress=progress,
+                        context=encoded_context,
+                        context_is_encoded=encoded_context is not None,
+                    )
+                true_z = latent_cache[(sim_idx, target_frame)]
+                weight = 1.0 + offset / max(1, unroll_steps)
+                if getattr(model, "uses_history_state", False):
+                    # The history model predicts motion, not an absolute
+                    # coordinate. Train it on the increment at the natural
+                    # delta-Z scale so small velocity errors are not hidden by
+                    # the much larger overall latent range.
+                    delta_scale = stats.dz_std.squeeze(0).to(z).clamp_min(1e-6)
+                    predicted_delta = (z_next - z) / delta_scale
+                    target_delta = (true_z - z) / delta_scale
+                    step_loss = F.mse_loss(predicted_delta, target_delta)
+                else:
+                    pred_q = (
+                        z_next - z_reference
+                    ) / stats.z_std.squeeze(0).to(z).clamp_min(1e-6)
+                    true_q = (
+                        true_z - z_reference
+                    ) / stats.z_std.squeeze(0).to(z).clamp_min(1e-6)
+                    step_loss = F.mse_loss(pred_q, true_q)
+                step_losses.append(step_loss * weight)
+                if float(network_variation_weight) > 0 and target_frame in frame_variation:
+                    variation_error = (
+                        z_next - true_z
+                    ) / frame_variation[target_frame].to(z).clamp_min(1e-6)
+                    step_losses[-1] = step_losses[-1] + (
+                        float(network_variation_weight)
+                        * variation_error.square().mean()
+                        * weight
+                    )
+                step_raw_losses.append(F.mse_loss(z_next, true_z) * weight)
+                weights.append(weight)
+                z_previous_previous, z_previous, z = z_previous, z, z_next
+            row_losses.append(torch.stack(step_losses).sum() / sum(weights))
+            row_raw_losses.append(torch.stack(step_raw_losses).sum() / sum(weights))
+            if float(position_loss_weight) > 0:
+                target_frame = int(target_frames[unroll_steps - 1])
+                if (
+                    str(context_pool_mode).lower()
+                    in {"learned_attention", "attention", "set_attention"}
+                    and context is not None
+                ):
+                    h0 = context[:, : ae_model.hidden_size]
+                    batch = torch.zeros(
+                        h0.size(0), dtype=torch.long, device=device
+                    )
+                    target_norm = ae_model.decode(z.unsqueeze(0), h0, batch)
+                    target_value = (
+                        target_norm * normalizers["target_std"].to(device)
+                        + normalizers["target_mean"].to(device)
+                    )
+                    ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+                    if (ae_target_mode or "normalized_delta") in {
+                        "normalized_delta",
+                        "self_normalized_delta",
+                        "relative_delta",
+                    }:
+                        decode_scale = (
+                            ref_pos.amax(dim=0) - ref_pos.amin(dim=0)
+                        ).clamp_min(1e-6)
+                        pred_pos = (
+                            ref_pos + target_value * decode_scale.reshape(1, -1)
+                        )
+                    elif (ae_target_mode or "normalized_delta") in {
+                        "position",
+                        "positions",
+                    }:
+                        pred_pos = target_value
+                    else:
+                        pred_pos = ref_pos + target_value
+                else:
+                    pred_pos = decode_latent_positions(
+                        ae_model,
+                        sim,
+                        z,
+                        target_frame,
+                        pos_dim=pos_dim,
+                        ae_target_mode=ae_target_mode or "normalized_delta",
+                        normalizers=normalizers,
+                        device=device,
+                    )
+                ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+                target_pos = sim[target_frame].x[:, :pos_dim].to(device).float()
+                if float(position_loss_weight) > 0:
+                    scale = (
+                        ref_pos.amax(dim=0) - ref_pos.amin(dim=0)
+                    ).clamp_min(1e-6)
+                    squared_position_error = (
+                        (pred_pos - target_pos) / scale.reshape(1, -1)
+                    ).square()
+                    if position_coordinate_weights is not None:
+                        coordinate_weights = torch.as_tensor(
+                            position_coordinate_weights,
+                            dtype=pred_pos.dtype,
+                            device=device,
+                        ).reshape(1, -1)
+                        squared_position_error = (
+                            squared_position_error
+                            * coordinate_weights
+                            / coordinate_weights.mean().clamp_min(1e-8)
+                        )
+                    node_error = squared_position_error.mean(dim=-1)
+                    if float(position_boundary_weight) != 1.0:
+                        side_count = max(
+                            1,
+                            int(
+                                np.ceil(
+                                    float(position_boundary_fraction)
+                                    * ref_pos.size(0)
+                                )
+                            ),
+                        )
+                        boundary = torch.cat(
+                            [
+                                torch.topk(
+                                    ref_pos[:, axis], side_count, largest=largest
+                                ).indices
+                                for axis in range(min(2, ref_pos.size(1)))
+                                for largest in (False, True)
+                            ]
+                        ).unique()
+                        node_weights = torch.ones_like(node_error)
+                        node_weights[boundary] = float(position_boundary_weight)
+                        position_loss = (
+                            node_error * node_weights
+                        ).sum() / node_weights.sum()
+                    else:
+                        position_loss = node_error.mean()
+                    row_losses[-1] = (
+                        row_losses[-1]
+                        + float(position_loss_weight) * position_loss
+                    )
+                    position_losses.append(float(position_loss.detach().cpu()))
+        if not row_losses:
+            continue
+        loss = torch.stack(row_losses).mean()
+        raw_loss = torch.stack(row_raw_losses).mean()
+        if is_train:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+        raw_losses.append(float(raw_loss.detach().cpu()))
+
+    return {
+        "loss_norm": float(np.mean(losses)) if losses else float("nan"),
+        "loss_raw": float(np.mean(raw_losses)) if raw_losses else float("nan"),
+        "position_loss": (
+            float(np.mean(position_losses))
+            if position_losses
+            else 0.0
+        ),
+    }
+
+
 def train_propagator(
     model,
     autoencoder,
@@ -1214,10 +1726,21 @@ def train_propagator(
     ae_target_mode: str | None = None,
     objective: str = "one_step",
     horizons=None,
+    frame_skip: int = 1,
+    context_pool_mode: str = "mean",
+    position_loss_weight: float = 0.0,
+    position_boundary_weight: float = 1.0,
+    position_boundary_fraction: float = 0.10,
+    position_coordinate_weights=None,
+    network_variation_weight: float = 0.0,
+    network_variation_floor_fraction: float = 0.05,
     use_static_context: bool = False,
     context_include_temperature: bool = False,
     rho_scale_mode: str | None = None,
     physics_config: PhysicsLossConfig | None = None,
+    epoch_callback: Callable | None = None,
+    selection_metric_key: str | None = None,
+    selection_mode: str = "min",
     verbose: bool = True,
 ) -> TrainingResult:
     """Train any latent propagator through the shared training lifecycle."""
@@ -1253,6 +1776,178 @@ def train_propagator(
             "loss_mode": loss_mode,
             "horizons": horizons,
         }
+    elif objective in {
+        "kinematic_multistep",
+        "kinematic",
+        "anchored_multistep",
+        "closed_loop",
+        "history_one_step",
+    }:
+        if not horizons:
+            raise ValueError("horizons are required for kinematic multistep training.")
+        max_horizon = max(int(horizon) for horizon in horizons)
+        if sorted({int(horizon) for horizon in horizons}) != list(
+            range(1, max_horizon + 1)
+        ):
+            raise ValueError(
+                "Kinematic multistep horizons must contain every step from 1 "
+                f"through {max_horizon}."
+            )
+        if getattr(model, "uses_history_state", False):
+            def has_three_frames(sims, row):
+                sim_idx, start_frame, _ = row
+                previous = _previous_filtered_frame(
+                    sims[int(sim_idx)],
+                    int(start_frame),
+                    frame_skip=frame_skip,
+                )
+                previous_previous = _previous_filtered_frame(
+                    sims[int(sim_idx)],
+                    previous,
+                    frame_skip=frame_skip,
+                )
+                has_latent_history = (
+                    previous_previous != previous
+                    and previous != int(start_frame)
+                )
+                if node_feature_mode in {
+                    "normalized_delta_velocity_history3",
+                    "displacement_velocity_history3",
+                    "modular_history3",
+                }:
+                    third_previous = _previous_filtered_frame(
+                        sims[int(sim_idx)],
+                        previous_previous,
+                        frame_skip=frame_skip,
+                    )
+                    return has_latent_history and third_previous != previous_previous
+                return has_latent_history
+
+            train_rows = [
+                row for row in train_rows if has_three_frames(train_sims, row)
+            ]
+            val_rows = [
+                row for row in val_rows if has_three_frames(val_sims, row)
+            ]
+        print("precomputing frozen AE latents for closed-loop training")
+        train_cache, train_context_cache = _precompute_kinematic_latents(
+            autoencoder,
+            train_sims,
+            train_rows,
+            pos_dim=pos_dim,
+            node_feature_mode=node_feature_mode,
+            normalizers=normalizers,
+            device=device,
+            frame_skip=frame_skip,
+            use_static_context=use_static_context,
+            context_include_temperature=context_include_temperature,
+            context_pool_mode=context_pool_mode,
+        )
+        val_cache, val_context_cache = _precompute_kinematic_latents(
+            autoencoder,
+            val_sims,
+            val_rows,
+            pos_dim=pos_dim,
+            node_feature_mode=node_feature_mode,
+            normalizers=normalizers,
+            device=device,
+            frame_skip=frame_skip,
+            use_static_context=use_static_context,
+            context_include_temperature=context_include_temperature,
+            context_pool_mode=context_pool_mode,
+        )
+        frame_variation = _per_frame_latent_variation(
+            train_cache,
+            global_scale=stats.z_std,
+            floor_fraction=network_variation_floor_fraction,
+        )
+        stages = [max_horizon]
+        stage_epochs = [int(config.max_epochs)]
+
+        histories = []
+        epoch_offset = 0
+        final_result = None
+        for stage_index, (stage_horizon, max_epochs) in enumerate(
+            zip(stages, stage_epochs), start=1
+        ):
+            print(
+                f"latent history training: steps={stage_horizon}, "
+                f"max_epochs={max_epochs}"
+            )
+            stage_config = TrainingConfig(
+                max_epochs=max_epochs,
+                patience=min(int(config.patience), max(2, max_epochs // 2)),
+                learning_rate=float(config.learning_rate),
+                weight_decay=float(config.weight_decay),
+                min_delta=float(config.min_delta),
+                log_every=int(config.log_every),
+            )
+            stage_common = {
+                **common,
+                "frame_skip": frame_skip,
+                "unroll_steps": stage_horizon,
+                "context_pool_mode": context_pool_mode,
+                "ae_target_mode": ae_target_mode,
+                "position_loss_weight": position_loss_weight,
+                "position_boundary_weight": position_boundary_weight,
+                "position_boundary_fraction": position_boundary_fraction,
+                "position_coordinate_weights": position_coordinate_weights,
+                "network_variation_weight": network_variation_weight,
+                "frame_variation": frame_variation,
+            }
+
+            def stage_epoch(sims, rows, cache, context_cache, optimizer=None):
+                return epoch_kinematic_multistep_propagator(
+                    model,
+                    autoencoder,
+                    sims,
+                    rows,
+                    stats,
+                    optimizer=optimizer,
+                    latent_cache=cache,
+                    context_cache=context_cache,
+                    **stage_common,
+                )
+
+            final_result = _train_with_early_stopping(
+                model,
+                train_epoch=lambda optimizer: stage_epoch(
+                    train_sims,
+                    train_rows,
+                    train_cache,
+                    train_context_cache,
+                    optimizer,
+                ),
+                val_epoch=lambda: stage_epoch(
+                    val_sims,
+                    val_rows,
+                    val_cache,
+                    val_context_cache,
+                ),
+                config=stage_config,
+                label=f"propagator-h{stage_horizon}",
+                metric_key="loss_norm",
+                epoch_callback=epoch_callback,
+                selection_metric_key=selection_metric_key,
+                selection_mode=selection_mode,
+                verbose=verbose,
+            )
+            history = final_result.history.copy()
+            history["stage"] = stage_index
+            history["unroll_steps"] = stage_horizon
+            history["stage_epoch"] = history["epoch"]
+            history["epoch"] = history["epoch"] + epoch_offset
+            histories.append(history)
+            epoch_offset += len(history)
+        combined = pd.concat(histories, ignore_index=True)
+        return TrainingResult(
+            model=model,
+            history=combined,
+            best_val_loss=float(final_result.best_val_loss),
+            best_epoch=int(
+                histories[-1]["epoch"].iloc[0] - 1 + final_result.best_epoch
+            ),
+        )
     elif objective in {"velocity", "second_order"}:
         epoch_fn = epoch_velocity_propagator
         extra = {
@@ -1281,6 +1976,9 @@ def train_propagator(
         config=config,
         label="propagator",
         metric_key="loss_norm",
+        epoch_callback=epoch_callback,
+        selection_metric_key=selection_metric_key,
+        selection_mode=selection_mode,
         verbose=verbose,
     )
 
@@ -1344,7 +2042,7 @@ def decode_latent_positions(
     ref_pos = ref.x[:, :pos_dim].to(device).float()
     edge_mode = str(getattr(ae_model, "edge_mode", "stored"))
     if edge_mode == "complete":
-        edge_index, _, ref_edge_attr = complete_graph_edge_data(
+        edge_index, _, ref_edge_attr = undirected_complete_graph_edge_data(
             ref, ref, pos_dim=pos_dim, device=device
         )
     elif edge_mode == "stored":
@@ -1361,9 +2059,16 @@ def decode_latent_positions(
     target = target_norm * normalizers["target_std"].to(device) + normalizers["target_mean"].to(device)
     if ae_target_mode in ("position", "positions"):
         return target
-    if ae_target_mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
+    if ae_target_mode in {
+        "normalized_delta",
+        "self_normalized_delta",
+        "relative_delta",
+        "normalized_delta_velocity_history3",
+        "displacement_velocity_history3",
+        "modular_history3",
+    }:
         scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
-        return ref_pos + target * scale.reshape(1, -1)
+        return ref_pos + target[:, :pos_dim] * scale.reshape(1, -1)
     return ref_pos + target
 
 
@@ -1383,7 +2088,9 @@ def decode_latent_to_graph(
         ae_model, sim, z, target_index, pos_dim=pos_dim,
         ae_target_mode=ae_target_mode, normalizers=normalizers, device=device,
     )
-    pred = clone_graph(sim[target_index]).to(device)
+    # A predicted frame may reuse static topology and node metadata, but must
+    # not inherit target-frame box or dynamic attributes.
+    pred = clone_graph(sim[0]).to(device)
     pred.x = pred.x.clone().float()
     pred.x[:, :pos_dim] = target
     return pred.cpu()

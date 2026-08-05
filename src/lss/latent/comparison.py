@@ -58,6 +58,12 @@ def run_propagator_comparison(
         val_count=int(dataset_spec["val_count"]),
         split_seed=cfg["split_seed"],
         shuffle_within_source=True,
+        edge_multiplicity=int(
+            dataset_spec.get("edge_multiplicity", cfg.get("edge_multiplicity", 1))
+        ),
+        edge_vector_dim=int(
+            dataset_spec.get("edge_vector_dim", cfg.get("edge_vector_dim", 2))
+        ),
     )
     rollout_grid = rollout_steps_for_sims(
         val_data + test_data,

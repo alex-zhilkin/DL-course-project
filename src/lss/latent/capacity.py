@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 from pathlib import Path
 
 import numpy as np
@@ -24,10 +26,103 @@ from .models import (
     NodeDeltaAttentionAutoEncoder,
     NodeDeltaMLPAutoEncoder,
     NodeDeltaPyramidMLPAutoEncoder,
+    NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
 from .simulation import r2_score
 from .training import LatentNormalizer
+
+
+def experiment_config_fingerprint(config: dict, *, length: int = 12) -> str:
+    """Return a stable cache tag for a complete experiment configuration."""
+
+    runtime_only = {"cache_path", "force_train", "device"}
+    identity = {
+        str(key): value
+        for key, value in config.items()
+        if str(key) not in runtime_only
+    }
+    payload = json.dumps(identity, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[: int(length)]
+
+
+FINAL_05_2D_PROPAGATORS = {
+    "depablo_low_temp": {
+        "cache_name": "final_2d_single_stage_h64_one_step.pt",
+        "ae_cache_name": "ae_2d_single_stage_h64_frames100.pt",
+        "seed_offset": 67,
+        "autoencoder_model": "single_stage_attention",
+        "hidden_size": 64,
+        "latent_tokens": 16,
+        "batch_graphs": 32,
+        "ae_max_train_frames_per_sim": 100,
+        "ae_max_epochs": 40,
+        "ae_patience": 6,
+        "ae_lr": 2e-4,
+        "ae_weight_decay": 1e-5,
+        "propagator_objective": "one_step",
+        "propagator_model": "delta_mlp",
+        "propagator_loss": "delta",
+        "propagator_hidden_size": 64,
+        "graph_context_dim": 16,
+        "dyn_lr": 1e-4,
+        "dyn_weight_decay": 1e-5,
+        "dyn_max_epochs": 40,
+        "dyn_patience": 6,
+        "propagator_rollout_eval_horizon": 100,
+        "propagator_rollout_eval_horizons": [50, 100, 150, 199],
+    },
+    "reid": {
+        "cache_name": "final_2d_single_stage_h64_train30_ae200_prop32_dyn100_one_step.pt",
+        "ae_cache_name": "ae_2d_single_stage_h64_train30_frames200.pt",
+        "seed_offset": 109,
+        "train_count": 30,
+        "val_count": 20,
+        "autoencoder_model": "single_stage_attention",
+        "hidden_size": 64,
+        "latent_tokens": 16,
+        "batch_graphs": 32,
+        # The AE learns the complete state manifold; the propagator below still
+        # fits only the first 100 transitions and is evaluated beyond them.
+        "ae_max_train_frames_per_sim": 200,
+        "ae_max_epochs": 40,
+        "ae_patience": 6,
+        "ae_lr": 2e-4,
+        "ae_weight_decay": 5e-5,
+        "propagator_objective": "one_step",
+        "propagator_model": "delta_mlp",
+        "propagator_loss": "delta",
+        "propagator_hidden_size": 32,
+        "graph_context_dim": 16,
+        "dyn_lr": 1e-4,
+        "dyn_weight_decay": 1e-5,
+        "dyn_max_epochs": 30,
+        "dyn_patience": 6,
+        "propagator_rollout_eval_horizon": 100,
+        "propagator_rollout_eval_horizons": [50, 100, 150, 199],
+    },
+    "depablo_mixed_temp": {
+        "cache_name": "../../depablo_mixed_temp/latent_rollout_attention_cv2_train20_frames100_epochs80_pat8_dyn_epochs80_dynpat8_seed20261013.pt",
+        "seed_offset": 0,
+        "propagator_objective": "one_step",
+        "propagator_model": "delta_mlp",
+        "propagator_loss": "delta",
+        "propagator_hidden_size": 96,
+        "graph_context_dim": 16,
+        "dyn_lr": 3e-5,
+        "dyn_weight_decay": 1e-4,
+        "dyn_max_epochs": 80,
+        "dyn_patience": 8,
+        "propagator_rollout_eval_horizon": 100,
+    },
+}
+
+
+def final_05_2d_propagator_config(dataset_name: str) -> dict | None:
+    """Return the validation-selected final 2D propagator settings for 05b/05c."""
+
+    config = FINAL_05_2D_PROPAGATORS.get(str(dataset_name))
+    return dict(config) if config is not None else None
 
 
 def build_capacity_specs(
@@ -187,10 +282,18 @@ def load_experiment_bundle(
         autoencoder_cls = NodeDeltaMLPAutoEncoder
     elif autoencoder_type in {"pyramid_mlp", "mean_pyramid_mlp"}:
         autoencoder_cls = NodeDeltaPyramidMLPAutoEncoder
+    elif autoencoder_type in {"single_stage_attention", "direct_latent_attention", "node_to_latent_attention"}:
+        autoencoder_cls = NodeDeltaSingleStageAttentionAutoEncoder
     else:
         autoencoder_cls = NodeDeltaAttentionAutoEncoder
     ae_model = autoencoder_cls(
         pos_dim=int(params["pos_dim"]),
+        node_feature_dim=int(
+            params.get(
+                "node_feature_dim",
+                normalizers["node_feature_mean"].numel(),
+            )
+        ),
         edge_dim=int(normalizers["edge_mean"].numel()),
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
@@ -202,17 +305,37 @@ def load_experiment_bundle(
 
     objective = str(params.get("propagator_objective", "one_step")).lower()
     loss_mode = str(params.get("propagator_loss", "delta")).lower()
+    kinematic_objectives = {
+        "kinematic_multistep",
+        "kinematic",
+        "anchored_multistep",
+        "closed_loop",
+    }
     default_model = (
         "velocity_mlp"
         if objective in {"velocity", "second_order"}
-        else ("direct_mlp" if loss_mode in {"next_z", "jepa", "next_embedding"} else "residual_mlp")
+        else (
+            "kinematic_mlp"
+            if objective in kinematic_objectives
+            else (
+                "direct_mlp"
+                if loss_mode in {"next_z", "jepa", "next_embedding"}
+                else "residual_mlp"
+            )
+        )
     )
     dyn_model = make_latent_propagator(
         int(params["latent_dim"]),
-        int(params["hidden_size"]),
+        int(params.get("propagator_hidden_size", params["hidden_size"])),
         model_type=params.get("propagator_model") or default_model,
         context_dim=(
             int(params["hidden_size"])
+            * (
+                4
+                if str(params.get("propagator_context_pool", "mean")).lower()
+                in {"moments", "distribution", "mean_std_min_max"}
+                else 1
+            )
             + int(bool(params.get("propagator_context_include_temperature", False)))
             if params.get("propagator_use_static_context", False)
             else 0
@@ -227,6 +350,7 @@ def load_experiment_bundle(
             params.get("propagator_use_static_context", False)
             and params.get("propagator_context_include_temperature", False)
         ),
+        context_pool_mode=str(params.get("propagator_context_pool", "mean")),
     ).to(device)
     dyn_model.load_state_dict(bundle["dyn_state_dict"])
     dyn_model.eval()

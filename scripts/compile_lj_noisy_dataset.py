@@ -11,6 +11,12 @@ import pandas as pd
 import torch
 from graph_utils.box import Box
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from lss.data import load_dataset
+
 
 def install_legacy_box_alias() -> None:
     """Allow loading source chunks that serialized their box as network.Box."""
@@ -100,7 +106,7 @@ def main() -> None:
     manifest_rows = []
     for compiled_idx, row in enumerate(selected.itertuples(index=False)):
         source_path = source_dir / Path(row.file_path).name
-        source_trajectory = torch.load(source_path, map_location="cpu", weights_only=False)
+        source_trajectory = load_dataset(source_path, edge_multiplicity=1)
         frame_ids = evenly_spaced_indices(len(source_trajectory), int(args.frames))
         trajectory = [
             convert_frame(

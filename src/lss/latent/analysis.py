@@ -41,6 +41,12 @@ class CVAnalysisContext:
         stats = bundle["stats"]
         ae = NodeDeltaAttentionAutoEncoder(
             pos_dim=int(self.cfg["pos_dim"]),
+            node_feature_dim=int(
+                stats.get(
+                    "node_feature_mean",
+                    torch.zeros(int(self.cfg["pos_dim"])),
+                ).numel()
+            ),
             edge_dim=int(stats["edge_mean"].numel()),
             hidden_size=int(spec.get("hidden_size", params.get("hidden_size", 92))),
             latent_dim=int(spec.get("latent_dim", params.get("latent_dim"))),
@@ -68,6 +74,18 @@ class CVAnalysisContext:
             val_count=int(spec.get("val_count", params.get("val_count", snapshot.get("val_count", 30)))),
             split_seed=snapshot.get("split_seed", params.get("split_seed")),
             shuffle_within_source=True,
+            edge_multiplicity=int(
+                spec.get(
+                    "edge_multiplicity",
+                    params.get("edge_multiplicity", snapshot.get("edge_multiplicity", 1)),
+                )
+            ),
+            edge_vector_dim=int(
+                spec.get(
+                    "edge_vector_dim",
+                    params.get("edge_vector_dim", snapshot.get("edge_vector_dim", 2)),
+                )
+            ),
         )
 
     def encode_frame_z(self, ae, bundle, sim, frame_idx):
@@ -476,6 +494,397 @@ def _finite_mean_median(values) -> tuple[float, float]:
     if not len(finite):
         return np.nan, np.nan
     return float(np.mean(finite)), float(np.median(finite))
+
+
+def decompose_latent_correlations(
+    frame: pd.DataFrame,
+    *,
+    metric_columns: dict[str, str],
+    latent_columns: list[str] | None = None,
+    trajectory_columns: tuple[str, ...] = ("split", "sim_idx"),
+    between_latent_summary: str = "mean",
+) -> pd.DataFrame:
+    """Separate pooled frame correlations into within- and between-trajectory parts.
+
+    ``within`` correlates trajectory-demeaned frame values. ``between`` gives
+    one point to every trajectory. Its latent descriptor is either the temporal
+    mean (the default) or the initial latent code; the metric is temporally
+    averaged. Constant per-trajectory quantities such as final p-ratio therefore
+    have a meaningful between correlation and an intentionally undefined within
+    correlation.
+    """
+
+    if latent_columns is None:
+        latent_columns = sorted(
+            (
+                column
+                for column in frame.columns
+                if column.startswith("z") and column[1:].isdigit()
+            ),
+            key=lambda column: int(column[1:]),
+        )
+    group_keys = list(trajectory_columns)
+    rows = []
+    for latent_column in latent_columns:
+        for metric_label, metric_column in metric_columns.items():
+            pair = frame[group_keys + [latent_column, metric_column]].replace(
+                [np.inf, -np.inf], np.nan
+            )
+            pooled = pair[[latent_column, metric_column]].dropna()
+
+            within = pair.copy()
+            within[latent_column] = within[latent_column] - within.groupby(
+                group_keys
+            )[latent_column].transform("mean")
+            within[metric_column] = within[metric_column] - within.groupby(
+                group_keys
+            )[metric_column].transform("mean")
+            within = within[[latent_column, metric_column]].dropna()
+
+            if between_latent_summary == "mean":
+                between = (
+                    pair.groupby(group_keys, as_index=False)[
+                        [latent_column, metric_column]
+                    ]
+                    .mean()
+                    .dropna()
+                )
+                between_level = "between trajectories (mean z)"
+            elif between_latent_summary == "initial":
+                ordered = frame[group_keys + [latent_column, metric_column] + (
+                    ["frame_idx"] if "frame_idx" in frame.columns else []
+                )].replace([np.inf, -np.inf], np.nan)
+                if "frame_idx" in ordered.columns:
+                    ordered = ordered.sort_values(group_keys + ["frame_idx"])
+                initial_z = ordered.dropna(subset=[latent_column]).groupby(
+                    group_keys, as_index=False
+                )[latent_column].first()
+                metric_mean = ordered.groupby(group_keys, as_index=False)[
+                    metric_column
+                ].mean()
+                between = initial_z.merge(metric_mean, on=group_keys).dropna()
+                between_level = "between trajectories (initial z)"
+            else:
+                raise ValueError(
+                    "between_latent_summary must be either 'mean' or 'initial'."
+                )
+            for level, values in (
+                ("pooled", pooled),
+                ("within trajectory", within),
+                (between_level, between),
+            ):
+                x = values[latent_column].to_numpy(float)
+                y = values[metric_column].to_numpy(float)
+                correlation = (
+                    float(np.corrcoef(x, y)[0, 1])
+                    if len(values) >= 2
+                    and not np.isclose(np.std(x), 0.0)
+                    and not np.isclose(np.std(y), 0.0)
+                    else np.nan
+                )
+                rows.append(
+                    {
+                        "coordinate": latent_column,
+                        "metric": metric_label,
+                        "metric_column": metric_column,
+                        "level": level,
+                        "pearson_r": correlation,
+                        "n": int(len(values)),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def plot_latent_correlation_decomposition(
+    table: pd.DataFrame,
+    *,
+    metric_order: list[str],
+    title: str,
+):
+    """Plot pooled, within-trajectory, and between-trajectory heatmaps."""
+
+    import matplotlib.pyplot as plt
+
+    print(title)
+    between_levels = [
+        level
+        for level in table["level"].drop_duplicates().tolist()
+        if level.startswith("between trajectories")
+    ]
+    levels = ["pooled", "within trajectory", *between_levels[:1]]
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(12.2, 3.2),
+        constrained_layout=True,
+        sharey=True,
+    )
+    image = None
+    for ax, level in zip(axes, levels):
+        heat = table[table["level"].eq(level)].pivot(
+            index="coordinate",
+            columns="metric",
+            values="pearson_r",
+        )
+        heat = heat.reindex(columns=metric_order)
+        values = heat.to_numpy(float)
+        image = ax.imshow(
+            values,
+            cmap="RdBu_r",
+            vmin=-1.0,
+            vmax=1.0,
+            aspect="auto",
+        )
+        ax.grid(False, which="both")
+        ax.set_xlabel(level)
+        ax.set_xticks(range(heat.shape[1]))
+        ax.set_xticklabels(heat.columns, rotation=40, ha="right")
+        ax.set_yticks(range(heat.shape[0]))
+        ax.set_yticklabels(heat.index)
+        for row in range(heat.shape[0]):
+            for column in range(heat.shape[1]):
+                value = values[row, column]
+                ax.text(
+                    column,
+                    row,
+                    "—" if not np.isfinite(value) else f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color=(
+                        "white"
+                        if np.isfinite(value) and abs(value) > 0.55
+                        else "0.15"
+                    ),
+                )
+    fig.colorbar(image, ax=axes, pad=0.015, fraction=0.025, label="Pearson r")
+    return fig
+
+
+def network_level_latent_correlations(
+    descriptors: pd.DataFrame,
+    *,
+    metric_columns: dict[str, str],
+) -> pd.DataFrame:
+    """Correlate one latent descriptor with one target value per network."""
+
+    feature_columns = sorted(
+        [
+            column
+            for column in descriptors.columns
+            if column.startswith("z")
+            and (column.endswith("_initial") or column.endswith("_slope"))
+        ],
+        key=lambda column: (
+            0 if column.endswith("_initial") else 1,
+            int(column[1:].split("_")[0]),
+        ),
+    )
+    rows = []
+    for feature in feature_columns:
+        for metric_label, metric_column in metric_columns.items():
+            values = descriptors[[feature, metric_column]].replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            x = values[feature].to_numpy(float)
+            y = values[metric_column].to_numpy(float)
+            correlation = (
+                float(np.corrcoef(x, y)[0, 1])
+                if len(values) >= 2
+                and not np.isclose(np.std(x), 0.0)
+                and not np.isclose(np.std(y), 0.0)
+                else np.nan
+            )
+            rows.append(
+                {
+                    "descriptor": feature,
+                    "metric": metric_label,
+                    "metric_column": metric_column,
+                    "pearson_r": correlation,
+                    "n_networks": int(len(values)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def per_trajectory_latent_correlations(
+    frame: pd.DataFrame,
+    *,
+    metric_columns: dict[str, str],
+    latent_columns: list[str] | None = None,
+    trajectory_columns: tuple[str, ...] = ("split", "sim_idx"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute framewise correlations inside each trajectory, then summarize."""
+
+    if latent_columns is None:
+        latent_columns = sorted(
+            [
+                column
+                for column in frame.columns
+                if column.startswith("z") and column[1:].isdigit()
+            ],
+            key=lambda column: int(column[1:]),
+        )
+    group_keys = list(trajectory_columns)
+    rows = []
+    for trajectory_key, group in frame.groupby(group_keys, sort=False):
+        if not isinstance(trajectory_key, tuple):
+            trajectory_key = (trajectory_key,)
+        identifiers = dict(zip(group_keys, trajectory_key))
+        for latent_column in latent_columns:
+            for metric_label, metric_column in metric_columns.items():
+                values = group[[latent_column, metric_column]].replace(
+                    [np.inf, -np.inf], np.nan
+                ).dropna()
+                x = values[latent_column].to_numpy(float)
+                y = values[metric_column].to_numpy(float)
+                correlation = (
+                    float(np.corrcoef(x, y)[0, 1])
+                    if len(values) >= 3
+                    and not np.isclose(np.std(x), 0.0)
+                    and not np.isclose(np.std(y), 0.0)
+                    else np.nan
+                )
+                rows.append(
+                    {
+                        **identifiers,
+                        "coordinate": latent_column,
+                        "metric": metric_label,
+                        "metric_column": metric_column,
+                        "pearson_r": correlation,
+                        "n_frames": int(len(values)),
+                    }
+                )
+    per_trajectory = pd.DataFrame(rows)
+    finite = per_trajectory.dropna(subset=["pearson_r"])
+    summary = finite.groupby(
+        ["coordinate", "metric", "metric_column"], as_index=False
+    )["pearson_r"].agg(
+        mean_r="mean",
+        median_r="median",
+        std_r="std",
+        n_trajectories="count",
+    )
+    return per_trajectory, summary
+
+
+def plot_correlation_heatmap(
+    table: pd.DataFrame,
+    *,
+    row: str,
+    column: str,
+    value: str,
+    row_order: list[str] | None = None,
+    column_order: list[str] | None = None,
+    title: str | None = None,
+):
+    """Plot a compact annotated correlation heatmap."""
+
+    import matplotlib.pyplot as plt
+
+    if title:
+        print(title)
+    heat = table.pivot(index=row, columns=column, values=value)
+    if row_order is not None:
+        heat = heat.reindex(row_order)
+    if column_order is not None:
+        heat = heat.reindex(columns=column_order)
+    values = np.abs(heat.to_numpy(float))
+    width = max(4.2, 1.15 * heat.shape[1] + 1.8)
+    height = max(2.6, 0.55 * heat.shape[0] + 1.5)
+    fig, ax = plt.subplots(figsize=(width, height), constrained_layout=True)
+    image = ax.imshow(values, cmap="YlGnBu", vmin=0, vmax=1, aspect="auto")
+    ax.grid(False, which="both")
+    ax.set_xticks(range(heat.shape[1]), heat.columns, rotation=35, ha="right")
+    ax.set_yticks(range(heat.shape[0]), heat.index)
+    for y_index in range(heat.shape[0]):
+        for x_index in range(heat.shape[1]):
+            current = values[y_index, x_index]
+            ax.text(
+                x_index, y_index,
+                "—" if not np.isfinite(current) else f"{current:.2f}",
+                ha="center", va="center", fontsize=8,
+                color="white" if np.isfinite(current) and current > 0.65 else "0.15",
+            )
+    fig.colorbar(image, ax=ax, pad=.02, fraction=.045, label="|Pearson r|")
+    return fig
+
+
+def plot_network_descriptor_scatters(
+    descriptors: pd.DataFrame,
+    *,
+    case_order: list[str] | None = None,
+    case_labels: dict[str, str] | None = None,
+    target_column: str = "final_p_ratio",
+):
+    """Plot every initial/slope latent against one target value per network."""
+
+    import matplotlib.pyplot as plt
+
+    print("Network-level latent descriptors versus final p-ratio; rows are datasets and columns are descriptors.")
+    test = descriptors[descriptors["split"].eq("test")].copy()
+    if case_order is None:
+        case_order = test["case"].drop_duplicates().tolist()
+    features = sorted(
+        [
+            column
+            for column in test.columns
+            if column.startswith("z")
+            and (column.endswith("_initial") or column.endswith("_slope"))
+        ],
+        key=lambda column: (
+            0 if column.endswith("_initial") else 1,
+            int(column[1:].split("_")[0]),
+        ),
+    )
+    fig, axes = plt.subplots(
+        len(case_order), len(features),
+        figsize=(3.35 * len(features), 3.0 * len(case_order)),
+        squeeze=False, constrained_layout=True,
+    )
+    rows = []
+    for row_index, case in enumerate(case_order):
+        case_frame = test[test["case"].eq(case)]
+        label = (
+            case_labels.get(case, case) if case_labels is not None
+            else str(case_frame["case_label"].iloc[0])
+        )
+        for column_index, feature in enumerate(features):
+            ax = axes[row_index, column_index]
+            values = case_frame[[feature, target_column]].replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            x = values[feature].to_numpy(float)
+            y = values[target_column].to_numpy(float)
+            x_std = np.std(x)
+            x_display = (x - np.mean(x)) / x_std if x_std > 1e-12 else x * np.nan
+            correlation = (
+                float(np.corrcoef(x, y)[0, 1])
+                if len(values) >= 2 and x_std > 1e-12 and np.std(y) > 1e-12
+                else np.nan
+            )
+            ax.scatter(x_display, y, s=22, alpha=.7, edgecolor="none")
+            if len(values) >= 2 and np.all(np.isfinite(x_display)):
+                slope, intercept = np.polyfit(x_display, y, 1)
+                xx = np.linspace(float(x_display.min()), float(x_display.max()), 100)
+                ax.plot(xx, slope * xx + intercept, color="0.2", ls="--", lw=1)
+            ax.text(
+                .03, .97, f"r={correlation:.2f}", transform=ax.transAxes,
+                ha="left", va="top", fontsize=8,
+            )
+            ax.set_xlabel(f"standardized {feature}")
+            ax.set_ylabel(f"{label}\nfinal p-ratio")
+            rows.append(
+                {
+                    "case": case,
+                    "case_label": label,
+                    "descriptor": feature,
+                    "target": target_column,
+                    "pearson_r": correlation,
+                    "n_networks": int(len(values)),
+                }
+            )
+    return fig, pd.DataFrame(rows)
 
 
 def _trajectory_p_ratio_columns(group: pd.DataFrame) -> pd.DataFrame:

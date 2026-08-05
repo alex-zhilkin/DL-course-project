@@ -124,6 +124,8 @@ def _build_model_and_data(cfg: ExperimentConfig):
         shuffle_within_source=cfg.shuffle_dataset_within_source,
         stratify_temperature=cfg.stratify_temperature,
         mix_holdout_across_sources=cfg.mix_holdout_across_sources,
+        edge_multiplicity=cfg.edge_multiplicity,
+        edge_vector_dim=cfg.edge_vector_dim,
     )
     if cfg.model_type in {"cv_transformer", "linear_cv_simulator"} and cfg.model_extras.get("global_decoder_max_nodes") is None:
         cfg_dict["model_extras"]["global_decoder_max_nodes"] = max(

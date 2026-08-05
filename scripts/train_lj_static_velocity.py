@@ -22,6 +22,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import global_max_pool, global_mean_pool
 
+from lss.data import load_dataset
 from lss.latent.capacity import load_experiment_bundle
 from lss.latent.experiment import ground_truth_p_ratio
 from lss.latent.simulation import pearson_r, r2_score
@@ -296,7 +297,7 @@ def main():
     baseline_raw = torch.load(BASELINE, map_location="cpu", weights_only=False)
     cfg = dict(baseline_raw["params"])
     bundle = load_experiment_bundle(BASELINE, cfg=cfg, device=device)
-    sims = torch.load(DATA, map_location="cpu", weights_only=False)
+    sims = load_dataset(DATA, edge_multiplicity=1)
     rows = prepare(bundle, sims, cfg, device, OUT / "static_velocity_targets.pt")
     # The final 200 registry entries were never available to the original AE training.
     test_idx = list(range(len(rows) - 200, len(rows)))

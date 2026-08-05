@@ -4,6 +4,7 @@ from .models import (
     LatentDynamicsMLP,
     NodeDeltaAttentionAutoEncoder,
     NodeDeltaDirectAttentionAutoEncoder,
+    NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
 from .simulator import LatentSpaceSimulator
@@ -31,6 +32,7 @@ __all__ = [
     "LatentSpaceSimulator",
     "NodeDeltaAttentionAutoEncoder",
     "NodeDeltaDirectAttentionAutoEncoder",
+    "NodeDeltaSingleStageAttentionAutoEncoder",
     "PhysicsLossConfig",
     "TrainingConfig",
     "TrainingResult",

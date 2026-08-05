@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
+from lss.data import load_dataset
+
 from lss.latent.experiment import ground_truth_p_ratio, temperature_p_ratio
 from lss.latent.simulation import pearson_r, r2_score
 from lss.models.transformer_simulator import TwoStageDownUpTransformer
@@ -232,7 +234,7 @@ def main():
     args = parser.parse_args()
     torch.manual_seed(SEED); np.random.seed(SEED)
     device = resolve_device("auto")
-    sims = torch.load(DATA, map_location="cpu", weights_only=False)
+    sims = load_dataset(DATA, edge_multiplicity=1)
     base_rows = torch.load(OUT / "static_velocity_targets.pt", map_location="cpu", weights_only=False)
     rows = add_displacement_targets(base_rows, sims)
     test_idx = list(range(len(rows) - 200, len(rows)))

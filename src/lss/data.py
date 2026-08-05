@@ -4,10 +4,13 @@ import math
 from pathlib import Path
 import sys
 from types import ModuleType
+from typing import Literal
 import warnings
 
 import torch
 from graph_utils.box import Box
+
+EdgeMultiplicity = Literal[1, 2]
 
 
 def _install_legacy_auxetic_box_alias() -> None:
@@ -22,9 +25,180 @@ def _install_legacy_auxetic_box_alias() -> None:
     legacy_network_module.Box = Box
 
 
-def load_dataset(path: str | Path) -> list:
+def canonicalize_graph_edges(
+    graph,
+    *,
+    edge_multiplicity: EdgeMultiplicity = 1,
+    edge_vector_dim: int = 2,
+):
+    """Normalize a graph to one or two entries per undirected node pair.
+
+    ``edge_multiplicity=1`` stores one canonical ``i < j`` edge. With
+    ``edge_multiplicity=2``, the canonical edge is followed by its reverse
+    orientation. Reciprocal/repeated input entries are coalesced before either
+    representation is produced.
+
+    The project's edge convention stores the oriented relative-position vector
+    in the first ``edge_vector_dim`` columns of ``edge_attr``. Those columns are
+    sign-corrected when an edge orientation is reversed; scalar features such
+    as length and stiffness are unchanged.
+    """
+    if int(edge_multiplicity) not in (1, 2):
+        raise ValueError("edge_multiplicity must be 1 or 2")
+    edge_multiplicity = int(edge_multiplicity)
+    edge_vector_dim = int(edge_vector_dim)
+    if edge_vector_dim < 0:
+        raise ValueError("edge_vector_dim must be non-negative")
+    if not hasattr(graph, "edge_index") or graph.edge_index is None:
+        return graph
+
+    edge_index = graph.edge_index.long()
+    if edge_index.ndim != 2 or edge_index.size(0) != 2:
+        raise ValueError(
+            f"Expected edge_index shape [2, E], found {tuple(edge_index.shape)}"
+        )
+    original_edges = int(edge_index.size(1))
+    if original_edges == 0:
+        graph.edge_multiplicity = edge_multiplicity
+        graph.edges_are_undirected = True
+        return graph
+
+    source, target = edge_index
+    first = torch.minimum(source, target)
+    second = torch.maximum(source, target)
+    keep = first != second
+    first, second = first[keep], second[keep]
+    source = source[keep]
+    num_nodes = int(graph.x.size(0)) if hasattr(graph, "x") else int(edge_index.max()) + 1
+    keys = first * num_nodes + second
+    unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    canonical_first = torch.div(unique_keys, num_nodes, rounding_mode="floor")
+    canonical_second = unique_keys.remainder(num_nodes)
+    canonical_index = torch.stack([canonical_first, canonical_second], dim=0)
+
+    edge_attr = getattr(graph, "edge_attr", None)
+    canonical_attr = None
+    if isinstance(edge_attr, torch.Tensor):
+        if edge_attr.size(0) != original_edges:
+            raise ValueError(
+                "edge_attr must have one row per input edge; "
+                f"found {edge_attr.size(0)} rows for {original_edges} edges"
+            )
+        original_rank = edge_attr.ndim
+        if original_rank == 1:
+            edge_attr = edge_attr.reshape(-1, 1)
+        elif original_rank != 2:
+            raise ValueError(
+                f"Expected edge_attr rank 1 or 2, found shape {tuple(edge_attr.shape)}"
+            )
+        oriented_attr = edge_attr[keep].clone()
+        vector_width = min(edge_vector_dim, oriented_attr.size(1))
+        flipped = source != first
+        if vector_width and flipped.any():
+            oriented_attr[flipped, :vector_width] *= -1
+        if not oriented_attr.is_floating_point():
+            oriented_attr = oriented_attr.float()
+        canonical_attr = torch.zeros(
+            (unique_keys.numel(), oriented_attr.size(1)),
+            device=oriented_attr.device,
+            dtype=oriented_attr.dtype,
+        )
+        counts = torch.zeros(
+            (unique_keys.numel(), 1),
+            device=oriented_attr.device,
+            dtype=oriented_attr.dtype,
+        )
+        canonical_attr.index_add_(0, inverse, oriented_attr)
+        counts.index_add_(
+            0,
+            inverse,
+            torch.ones(
+                (oriented_attr.size(0), 1),
+                device=oriented_attr.device,
+                dtype=oriented_attr.dtype,
+            ),
+        )
+        canonical_attr = canonical_attr / counts.clamp_min(1)
+        if original_rank == 1:
+            canonical_attr = canonical_attr.reshape(-1)
+
+    if edge_multiplicity == 1:
+        graph.edge_index = canonical_index
+        if canonical_attr is not None:
+            graph.edge_attr = canonical_attr
+    else:
+        graph.edge_index = torch.cat([canonical_index, canonical_index.flip(0)], dim=1)
+        if canonical_attr is not None:
+            reverse_attr = canonical_attr.clone()
+            if reverse_attr.ndim == 1:
+                # A one-dimensional edge attribute is scalar, so it is
+                # orientation independent.
+                pass
+            else:
+                vector_width = min(edge_vector_dim, reverse_attr.size(1))
+                if vector_width:
+                    reverse_attr[:, :vector_width] *= -1
+            graph.edge_attr = torch.cat([canonical_attr, reverse_attr], dim=0)
+
+    graph.edge_multiplicity = edge_multiplicity
+    graph.edges_are_undirected = True
+    return graph
+
+
+def normalize_dataset_edges(
+    simulations: list,
+    *,
+    edge_multiplicity: EdgeMultiplicity = 1,
+    edge_vector_dim: int = 2,
+) -> list:
+    """Apply the shared edge representation to every trajectory frame.
+
+    Both a full ``list[trajectory]`` dataset and a single ``list[frame]``
+    trajectory are accepted and returned with the same outer structure.
+    """
+    if not simulations:
+        return simulations
+    trajectories = (
+        [simulations]
+        if hasattr(simulations[0], "edge_index")
+        else simulations
+    )
+    for simulation in trajectories:
+        for graph in simulation:
+            canonicalize_graph_edges(
+                graph,
+                edge_multiplicity=edge_multiplicity,
+                edge_vector_dim=edge_vector_dim,
+            )
+    return simulations
+
+
+def load_dataset(
+    path: str | Path,
+    *,
+    edge_multiplicity: EdgeMultiplicity = 1,
+    edge_vector_dim: int = 2,
+    map_location: str | torch.device = "cpu",
+) -> list:
+    """Load a trajectory dataset using the project-wide edge convention.
+
+    The default is one canonical undirected edge per node pair. Callers that
+    explicitly require both orientations can request ``edge_multiplicity=2``.
+    The source file is never modified.
+    """
     _install_legacy_auxetic_box_alias()
-    return list(torch.load(Path(path), weights_only=False))
+    simulations = list(
+        torch.load(
+            Path(path),
+            weights_only=False,
+            map_location=map_location,
+        )
+    )
+    return normalize_dataset_edges(
+        simulations,
+        edge_multiplicity=edge_multiplicity,
+        edge_vector_dim=edge_vector_dim,
+    )
 
 
 def simulation_temperature(sim, default: float = float("nan")) -> float:
@@ -48,8 +222,19 @@ def tag_simulation_source(sim, source_name: str):
     return sim
 
 
-def split_dataset(path: str | Path, *, train_count: int, val_count: int) -> tuple[list, list, list]:
-    sims = load_dataset(path)
+def split_dataset(
+    path: str | Path,
+    *,
+    train_count: int,
+    val_count: int,
+    edge_multiplicity: EdgeMultiplicity = 1,
+    edge_vector_dim: int = 2,
+) -> tuple[list, list, list]:
+    sims = load_dataset(
+        path,
+        edge_multiplicity=edge_multiplicity,
+        edge_vector_dim=edge_vector_dim,
+    )
     train_count = int(train_count)
     val_count = int(val_count)
     train_data = sims[:train_count]
@@ -68,9 +253,15 @@ def resolve_dataset_splits(
     shuffle_within_source: bool = False,
     stratify_temperature: bool = False,
     mix_holdout_across_sources: bool = False,
+    edge_multiplicity: EdgeMultiplicity = 1,
+    edge_vector_dim: int = 2,
 ):
     if not dataset_mixture:
-        sims = load_dataset(dataset_path)
+        sims = load_dataset(
+            dataset_path,
+            edge_multiplicity=edge_multiplicity,
+            edge_vector_dim=edge_vector_dim,
+        )
         if stratify_temperature:
             temperatures = [simulation_temperature(sim) for sim in sims]
             if not temperatures or not all(math.isfinite(value) for value in temperatures):
@@ -176,7 +367,11 @@ def resolve_dataset_splits(
     for source_idx, spec in enumerate(dataset_mixture):
         path = Path(spec["path"])
         source_name = str(spec.get("name", f"source_{source_idx + 1}"))
-        sims = load_dataset(path)
+        sims = load_dataset(
+            path,
+            edge_multiplicity=spec.get("edge_multiplicity", edge_multiplicity),
+            edge_vector_dim=int(spec.get("edge_vector_dim", edge_vector_dim)),
+        )
         sims = [tag_simulation_source(sim, source_name) for sim in sims]
         if generator is not None:
             order = torch.randperm(len(sims), generator=generator).tolist()

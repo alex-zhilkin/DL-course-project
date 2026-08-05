@@ -20,16 +20,30 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from lss.graph import clone_graph
+from lss.data import load_dataset
+from lss.graph import box_tensor, clone_graph
 from lss.latent.experiment import ground_truth_p_ratio, seed_everything
 from lss.latent.simulation import (
     complete_graph_edge_data,
     pearson_r,
     r2_score,
+    stored_graph_edge_data,
+    undirected_complete_graph_edge_data,
+    undirected_stored_graph_edge_data,
+)
+from lss.models.complete_graph_attention_simulator import (
+    CompleteGraphAttentionSimulator,
 )
 from lss.models.complete_graph_transformer_simulator import (
     CompleteGraphTransformerSimulator,
 )
+from lss.models.one_shot_edge_attention_simulator import (
+    OneShotUndirectedEdgeAttentionSimulator,
+)
+from lss.models.simple_edge_mlp_simulator import (
+    SimpleUndirectedEdgeMLPSimulator,
+)
+from lss.models.attention_pyramid_simulator import AttentionPyramidSimulator
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,12 +83,53 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Teacher-forced epochs before closed-loop multi-step training.",
     )
+    parser.add_argument(
+        "--startup-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of training samples that start at the static frame.",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--train-batches", type=int, default=400)
     parser.add_argument("--val-batches", type=int, default=100)
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument(
+        "--edge-mode",
+        choices=("complete", "stored"),
+        default="complete",
+    )
+    parser.add_argument(
+        "--model-kind",
+        choices=(
+            "transformer",
+            "edge_attention",
+            "one_shot",
+            "simple_mlp",
+            "pyramid",
+        ),
+        default="transformer",
+    )
+    parser.add_argument(
+        "--pyramid-tokens",
+        type=str,
+        default="32,16",
+        help="Strictly decreasing token counts for the attention pyramid.",
+    )
+    parser.add_argument("--bottleneck-layers", type=int, default=2)
+    parser.add_argument(
+        "--latent-dim",
+        type=int,
+        default=0,
+        help="Exact scalar bottleneck; 0 keeps the token bottleneck.",
+    )
+    parser.add_argument(
+        "--message-layers",
+        type=int,
+        default=4,
+        help="Sparse edge-attention layers; ignored by the Transformer model.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=10)
@@ -92,6 +147,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-features", action="store_true")
     parser.add_argument("--boundary-weight", type=float, default=1.0)
     parser.add_argument("--node-count-feature", action="store_true")
+    parser.add_argument(
+        "--no-progress-feature",
+        action="store_true",
+        help="Omit explicit time progress and infer updates only from the current state.",
+    )
+    parser.add_argument(
+        "--global-context",
+        action="store_true",
+        help="Broadcast a learned mean-pooled graph state to every node decoder.",
+    )
+    parser.add_argument(
+        "--static-structure-only",
+        action="store_true",
+        help="Use frame-0 topology, edge properties, and box at every model call.",
+    )
+    parser.add_argument(
+        "--ignore-box",
+        action="store_true",
+        help="Do not expose box dimensions to geometric edge construction.",
+    )
     parser.add_argument("--select-rollout-networks", type=int, default=0)
     parser.add_argument("--select-rollout-horizon", type=int, default=49)
     parser.add_argument(
@@ -108,6 +183,11 @@ def parse_args() -> argparse.Namespace:
         "--init-state",
         type=Path,
         help="Warm-start training from a compatible saved state.",
+    )
+    parser.add_argument(
+        "--init-local-state",
+        type=Path,
+        help="For a pyramid, initialize its high-resolution path from one-shot state.",
     )
     parser.add_argument("--load-state", type=Path)
     return parser.parse_args()
@@ -163,7 +243,14 @@ def acceleration_stats(sims, rows):
     return values.mean(0, keepdim=True), values.std(0, keepdim=True).clamp_min(1e-9)
 
 
-def edge_stats(sims, rows, sample_count: int = 80):
+def edge_stats(
+    sims,
+    rows,
+    edge_mode: str,
+    *,
+    undirected_edges: bool,
+    sample_count: int = 80,
+):
     chosen = np.linspace(0, len(rows) - 1, min(sample_count, len(rows)), dtype=int)
     sums = torch.zeros(13)
     sums2 = torch.zeros(13)
@@ -171,9 +258,19 @@ def edge_stats(sims, rows, sample_count: int = 80):
     for index in chosen:
         sim_index, t = rows[int(index)]
         sim = sims[sim_index]
-        _, edge, _ = complete_graph_edge_data(
-            sim[0], sim[t], pos_dim=2, device="cpu"
-        )
+        if undirected_edges:
+            edge_builder = (
+                undirected_complete_graph_edge_data
+                if edge_mode == "complete"
+                else undirected_stored_graph_edge_data
+            )
+        else:
+            edge_builder = (
+                complete_graph_edge_data
+                if edge_mode == "complete"
+                else stored_graph_edge_data
+            )
+        _, edge, _ = edge_builder(sim[0], sim[t], pos_dim=2, device="cpu")
         sums += edge.sum(0)
         sums2 += edge.square().sum(0)
         count += edge.size(0)
@@ -202,8 +299,15 @@ def make_inputs(
     boundary_weight: float,
     node_count_feature: bool,
     target_mode: str,
+    edge_mode: str,
+    undirected_edges: bool,
     device: str,
     with_target: bool,
+    include_progress: bool = True,
+    include_velocity_feature: bool = False,
+    warm_start_frames: int = 0,
+    static_structure_only: bool = False,
+    ignore_box: bool = False,
 ):
     ref, ref_normalized, scale, center = reference_geometry(sim, device)
     current_pos = current_graph.x[:, :2].to(device).float()
@@ -214,8 +318,10 @@ def make_inputs(
         (ref.size(0), 1), (t + 1) / (len(sim) - 1), device=device
     )
     previous_displacement = (current_pos - previous_pos) / scale
-    node_parts = [current_normalized, current_delta, ref_normalized, progress]
-    if velocity_skip or dual_kinematic:
+    node_parts = [current_normalized, current_delta, ref_normalized]
+    if include_progress:
+        node_parts.append(progress)
+    if include_velocity_feature or velocity_skip or dual_kinematic:
         node_parts.append(previous_displacement)
     side_flags = torch.zeros((ref.size(0), 4), device=device, dtype=ref.dtype)
     side_count = max(1, int(np.ceil(0.10 * ref.size(0))))
@@ -235,13 +341,48 @@ def make_inputs(
             )
         )
     node = torch.cat(node_parts, dim=1)
-    edge_index, raw_edge, _ = complete_graph_edge_data(
-        sim[0], current_graph, pos_dim=2, device=device
+    if undirected_edges:
+        edge_builder = (
+            undirected_complete_graph_edge_data
+            if edge_mode == "complete"
+            else undirected_stored_graph_edge_data
+        )
+    else:
+        edge_builder = (
+            complete_graph_edge_data
+            if edge_mode == "complete"
+            else stored_graph_edge_data
+        )
+    reference_edge_graph = sim[0]
+    edge_graph = current_graph
+    if static_structure_only:
+        # Preserve predicted/current positions while making all structural
+        # metadata exactly the metadata available in the single input frame.
+        edge_graph = clone_graph(current_graph)
+        edge_graph.box = sim[0].box
+        static_box = box_tensor(
+            sim[0], device=current_pos.device, dtype=current_pos.dtype
+        )
+        if static_box is not None:
+            edge_graph.box_tensor = static_box
+        edge_graph.edge_index = sim[0].edge_index
+        edge_graph.edge_attr = sim[0].edge_attr
+    if ignore_box:
+        reference_edge_graph = clone_graph(sim[0])
+        edge_graph = clone_graph(edge_graph)
+        reference_edge_graph.box = None
+        edge_graph.box = None
+        if "box_tensor" in reference_edge_graph:
+            del reference_edge_graph.box_tensor
+        if "box_tensor" in edge_graph:
+            del edge_graph.box_tensor
+    edge_index, raw_edge, _ = edge_builder(
+        reference_edge_graph, edge_graph, pos_dim=2, device=device
     )
     current_distance = raw_edge[:, 5]
-    prior = (-0.5 * (current_distance / length_scale).square()).clamp_min(
-        distance_floor
-    )
+    prior = -0.5 * (current_distance / length_scale).square()
+    if distance_floor is not None:
+        prior = prior.clamp_min(float(distance_floor))
     edge = (raw_edge - edge_mean) / edge_std
     target = None
     if with_target:
@@ -300,7 +441,7 @@ def epoch_pass(
             edge_index,
             prior,
             target,
-            _,
+            scale,
             previous_displacement,
             boundary_mask,
         ) = make_inputs(
@@ -390,6 +531,7 @@ def multi_step_epoch(
     max_batches,
     seed,
     common,
+    startup_fraction=0.0,
 ):
     """Train through short, fully autoregressive position rollouts."""
     model.train(True)
@@ -400,6 +542,19 @@ def multi_step_epoch(
             max(0, min(int(transitions), len(sim) - 1) - int(unroll_steps) + 1)
         )
     ]
+    if startup_fraction > 0:
+        if not 0 <= startup_fraction < 1:
+            raise ValueError("startup_fraction must be in [0, 1)")
+        startup = [row for row in chunks if row[1] == 0]
+        ordinary = [row for row in chunks if row[1] != 0]
+        repeats = int(
+            np.ceil(
+                startup_fraction
+                * len(ordinary)
+                / max((1.0 - startup_fraction) * len(startup), 1.0)
+            )
+        )
+        chunks = ordinary + startup * max(1, repeats)
     rng = np.random.default_rng(seed)
     rng.shuffle(chunks)
     if max_batches is not None and len(chunks) > int(max_batches):
@@ -438,13 +593,16 @@ def multi_step_epoch(
             node_loss = (prediction - target).square().mean(dim=1)
             weights = 1.0 + (common["boundary_weight"] - 1.0) * boundary_mask
             step_loss = (node_loss * weights).sum() / weights.sum()
+            ref, _, _, _ = reference_geometry(sim, common["device"])
+            position = predicted_position(prediction, current, scale, ref, common)
             # Later free-running states matter slightly more than the first
             # teacher-initialized step.
             step_losses.append(step_loss * (1.0 + offset / max(1, unroll_steps)))
-            ref, _, _, _ = reference_geometry(sim, common["device"])
-            position = predicted_position(prediction, current, scale, ref, common)
             previous = current
-            current = make_predicted_graph(sim[t + 1], position)
+            template = (
+                sim[0] if common.get("static_structure_only", False) else sim[t + 1]
+            )
+            current = make_predicted_graph(template, position)
         loss = torch.stack(step_losses).sum() / sum(
             1.0 + offset / max(1, unroll_steps)
             for offset in range(int(unroll_steps))
@@ -458,10 +616,13 @@ def multi_step_epoch(
 
 
 def rollout(model, sim, horizon: int, common):
-    predicted = [clone_graph(sim[0]).cpu()]
-    current = predicted[0]
+    warm_start_frames = min(
+        int(common.get("warm_start_frames", 0)), int(horizon), len(sim) - 1
+    )
+    predicted = [clone_graph(graph).cpu() for graph in sim[: warm_start_frames + 1]]
+    current = predicted[-1]
     with torch.no_grad():
-        for next_step in range(1, horizon + 1):
+        for next_step in range(warm_start_frames + 1, horizon + 1):
             previous = predicted[-2] if len(predicted) > 1 else current
             (
                 node,
@@ -512,7 +673,12 @@ def rollout(model, sim, horizon: int, common):
                 position = predicted_position(
                     pred_standard, current, scale, ref, common
                 )
-            next_graph = make_predicted_graph(sim[next_step], position).cpu()
+            template = (
+                sim[0]
+                if common.get("static_structure_only", False)
+                else sim[next_step]
+            )
+            next_graph = make_predicted_graph(template, position).cpu()
             predicted.append(next_graph)
             current = next_graph
     return predicted
@@ -542,10 +708,9 @@ def main():
         / "data"
         / "lj-noisy-eps0.01-sigma1.0-cutoff1.122_1348sims_50frames.pt",
     }
-    sims = torch.load(
+    sims = load_dataset(
         dataset_paths[args.dataset_key],
-        map_location="cpu",
-        weights_only=False,
+        edge_multiplicity=1,
     )
     order = np.random.default_rng(args.seed).permutation(len(sims))
     train_ids = order[: args.train_networks]
@@ -555,11 +720,33 @@ def main():
     val_sims = [sims[i] for i in val_ids]
     test_sims = [sims[i] for i in test_ids]
     train_rows = transition_rows(train_sims, args.transitions)
+    stats_train_rows = train_rows
     val_rows = transition_rows(val_sims, args.transitions)
+    if args.startup_fraction > 0:
+        if not 0 <= args.startup_fraction < 1:
+            raise ValueError("--startup-fraction must be in [0, 1)")
+        startup = [row for row in train_rows if row[1] == 0]
+        ordinary = [row for row in train_rows if row[1] != 0]
+        repeats = int(
+            np.ceil(
+                args.startup_fraction
+                * len(ordinary)
+                / max((1.0 - args.startup_fraction) * len(startup), 1.0)
+            )
+        )
+        train_rows = ordinary + startup * max(1, repeats)
 
-    target_mean, target_std = target_stats(train_sims, train_rows, args.target_mode)
-    accel_mean, accel_std = acceleration_stats(train_sims, train_rows)
-    edge_mean, edge_std = edge_stats(train_sims, train_rows)
+    target_mean, target_std = target_stats(
+        train_sims, stats_train_rows, args.target_mode
+    )
+    accel_mean, accel_std = acceleration_stats(train_sims, stats_train_rows)
+    undirected_edges = args.model_kind in {"one_shot", "simple_mlp", "pyramid"}
+    edge_mean, edge_std = edge_stats(
+        train_sims,
+        stats_train_rows,
+        args.edge_mode,
+        undirected_edges=undirected_edges,
+    )
     bond_lengths = torch.cat(
         [torch.linalg.vector_norm(sim[0].edge_attr[:, :2].float(), dim=1) for sim in train_sims]
     )
@@ -578,23 +765,70 @@ def main():
         "boundary_features": bool(args.boundary_features),
         "boundary_weight": float(args.boundary_weight),
         "node_count_feature": bool(args.node_count_feature),
+        "include_progress": not bool(args.no_progress_feature),
+        "static_structure_only": bool(args.static_structure_only),
+        "ignore_box": bool(args.ignore_box),
         "target_mode": str(args.target_mode),
+        "edge_mode": str(args.edge_mode),
+        "undirected_edges": bool(undirected_edges),
         "device": device,
     }
-    model = CompleteGraphTransformerSimulator(
-        node_dim=(
-            7
-            + (2 if (args.velocity_skip or args.dual_kinematic) else 0)
-            + (4 if args.boundary_features else 0)
-            + (1 if args.node_count_feature else 0)
-        ),
-        edge_dim=13,
-        hidden_size=args.hidden,
-        transformer_layers=args.layers,
-        transformer_heads=args.heads,
-        edge_aggregation=args.edge_aggregation,
-        output_dim=4 if args.dual_kinematic else 2,
-    ).to(device)
+    node_dim = (
+        (7 if common["include_progress"] else 6)
+        + (2 if (args.velocity_skip or args.dual_kinematic) else 0)
+        + (4 if args.boundary_features else 0)
+        + (1 if args.node_count_feature else 0)
+    )
+    if args.model_kind == "transformer":
+        model = CompleteGraphTransformerSimulator(
+            node_dim=node_dim,
+            edge_dim=13,
+            hidden_size=args.hidden,
+            transformer_layers=args.layers,
+            transformer_heads=args.heads,
+            edge_aggregation=args.edge_aggregation,
+            output_dim=4 if args.dual_kinematic else 2,
+        ).to(device)
+    elif args.model_kind == "edge_attention":
+        model = CompleteGraphAttentionSimulator(
+            node_dim=node_dim,
+            edge_dim=13,
+            hidden_size=args.hidden,
+            layers=args.message_layers,
+            output_dim=4 if args.dual_kinematic else 2,
+        ).to(device)
+    elif args.model_kind == "one_shot":
+        model = OneShotUndirectedEdgeAttentionSimulator(
+            node_dim=node_dim,
+            edge_dim=13,
+            hidden_size=args.hidden,
+            output_dim=4 if args.dual_kinematic else 2,
+            global_context=args.global_context,
+            edge_aggregation=args.edge_aggregation,
+        ).to(device)
+    elif args.model_kind == "simple_mlp":
+        model = SimpleUndirectedEdgeMLPSimulator(
+            node_dim=node_dim,
+            edge_dim=13,
+            hidden_size=args.hidden,
+            output_dim=4 if args.dual_kinematic else 2,
+        ).to(device)
+    else:
+        pyramid_tokens = tuple(
+            int(value.strip())
+            for value in args.pyramid_tokens.split(",")
+            if value.strip()
+        )
+        model = AttentionPyramidSimulator(
+            node_dim=node_dim,
+            edge_dim=13,
+            hidden_size=args.hidden,
+            pyramid_tokens=pyramid_tokens,
+            heads=args.heads,
+            bottleneck_layers=args.bottleneck_layers,
+            latent_dim=args.latent_dim,
+            output_dim=4 if args.dual_kinematic else 2,
+        ).to(device)
     best_state = None
     best_val = float("inf")
     best_rollout_r2 = float("-inf")
@@ -612,20 +846,54 @@ def main():
     if state_path is not None:
         state = torch.load(state_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model_state"])
+        saved_common = state.get("common", state)
         common.update(
             {
-                "target_mean": state["target_mean"].to(device),
-                "target_std": state["target_std"].to(device),
-                "accel_mean": state.get("accel_mean", accel_mean).to(device),
-                "accel_std": state.get("accel_std", accel_std).to(device),
-                "edge_mean": state["edge_mean"].to(device),
-                "edge_std": state["edge_std"].to(device),
-                "length_scale": float(state["length_scale"]),
+                "target_mean": saved_common.get("target_mean", target_mean).to(device),
+                "target_std": saved_common.get("target_std", target_std).to(device),
+                "accel_mean": saved_common.get("accel_mean", accel_mean).to(device),
+                "accel_std": saved_common.get("accel_std", accel_std).to(device),
+                "edge_mean": saved_common.get("edge_mean", edge_mean).to(device),
+                "edge_std": saved_common.get("edge_std", edge_std).to(device),
+                "length_scale": float(saved_common.get("length_scale", length_scale)),
             }
         )
         if args.load_state is not None:
             best_state = deepcopy(model.state_dict())
             best_val = float("nan")
+    if args.init_local_state is not None:
+        if args.model_kind != "pyramid":
+            raise ValueError("--init-local-state is only valid for --model-kind pyramid")
+        local_state = torch.load(
+            args.init_local_state, map_location=device, weights_only=False
+        )
+        source = local_state["model_state"]
+        translated = {}
+        for key, value in source.items():
+            target_key = (
+                "local_decoder" + key[len("decoder") :]
+                if key.startswith("decoder.")
+                else key
+            )
+            if target_key in model.state_dict() and model.state_dict()[target_key].shape == value.shape:
+                translated[target_key] = value
+        missing, unexpected = model.load_state_dict(translated, strict=False)
+        print(
+            f"initialized pyramid local path from {args.init_local_state} "
+            f"({len(translated)} tensors; {len(missing)} pyramid tensors new)",
+            flush=True,
+        )
+        common.update(
+            {
+                "target_mean": local_state["target_mean"].to(device),
+                "target_std": local_state["target_std"].to(device),
+                "accel_mean": local_state.get("accel_mean", accel_mean).to(device),
+                "accel_std": local_state.get("accel_std", accel_std).to(device),
+                "edge_mean": local_state["edge_mean"].to(device),
+                "edge_std": local_state["edge_std"].to(device),
+                "length_scale": float(local_state["length_scale"]),
+            }
+        )
     if args.load_state is None:
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -645,6 +913,7 @@ def main():
                     max_batches=(args.unroll_batches or args.train_batches),
                     seed=args.seed + epoch,
                     common=common,
+                    startup_fraction=args.startup_fraction,
                 )
                 with torch.no_grad():
                     _, train_r2 = epoch_pass(
@@ -678,8 +947,14 @@ def main():
                 )
                 val_rollout_r2 = float("nan")
                 selection_epoch = (
-                    epoch % max(1, int(args.selection_every)) == 0
-                    or epoch == args.epochs
+                    (
+                        epoch % max(1, int(args.selection_every)) == 0
+                        or epoch == args.epochs
+                    )
+                    and (
+                        args.unroll_steps <= 1
+                        or epoch > int(args.one_step_warmup)
+                    )
                 )
                 if args.select_rollout_networks > 0 and selection_epoch:
                     true_ratios = []
@@ -783,7 +1058,10 @@ def main():
                 }
             )
         print(f"rollout={test_index + 1}/{len(selected_test)}", flush=True)
-    predictions = pd.DataFrame(prediction_rows).dropna()
+    predictions = pd.DataFrame(
+        prediction_rows,
+        columns=("test_index", "rollout_step", "true_p_ratio", "pred_p_ratio"),
+    ).dropna()
     metrics = []
     for horizon, group in predictions.groupby("rollout_step"):
         metrics.append(
@@ -800,6 +1078,9 @@ def main():
             "output": str(args.output),
             "state_output": str(args.state_output) if args.state_output else None,
             "init_state": str(args.init_state) if args.init_state else None,
+            "init_local_state": (
+                str(args.init_local_state) if args.init_local_state else None
+            ),
             "load_state": str(args.load_state) if args.load_state else None,
         },
         "best_val_loss": best_val,

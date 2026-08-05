@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from graph_utils import calc_p_ratio_rollout_sides, calc_p_ratio_trajectory_sides
+from graph_utils import calc_p_ratio_rollout_sides
 
 from ..data import load_dataset, resolve_dataset_splits, simulation_temperature
 from ..graph import clone_graph
@@ -27,6 +27,7 @@ from .models import (
     NodeDeltaDirectAttentionAutoEncoder,
     NodeDeltaMLPAutoEncoder,
     NodeDeltaPyramidMLPAutoEncoder,
+    NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
 from .physics import PhysicsLossConfig
@@ -40,9 +41,7 @@ from .simulation import (
     make_transition_index,
     pearson_r,
     r2_score,
-    shrink_p_ratio_series,
     trajectory_p_ratio_sides_robust,
-    trajectory_p_ratio_sides_strain_gated,
 )
 from .training import (
     LatentNormalizer,
@@ -54,6 +53,8 @@ from .training import (
     fit_latent_step_stats,
     initial_structure_scale,
     latent_step,
+    latent_step_history,
+    latent_step_kinematic,
     latent_step_velocity,
     make_multistep_transition_index,
     make_velocity_transition_index,
@@ -62,6 +63,30 @@ from .training import (
     train_autoencoder,
     train_propagator,
 )
+
+KINEMATIC_OBJECTIVES = {
+    "kinematic_multistep",
+    "kinematic",
+    "anchored_multistep",
+    "closed_loop",
+    "history_one_step",
+}
+
+THREE_FRAME_INITIALIZATIONS = {
+    "three_frames",
+    "three_frame",
+    "observed_three",
+    "history3",
+}
+
+
+def _observed_position_graph(sim, frame_index: int, *, pos_dim: int):
+    """Copy observed positions onto the reference graph's static metadata."""
+
+    graph = clone_graph(sim[0])
+    graph.x = graph.x.clone().float()
+    graph.x[:, :pos_dim] = sim[frame_index].x[:, :pos_dim].cpu().float()
+    return graph.cpu()
 
 
 def _json_safe(value):
@@ -84,6 +109,8 @@ def _autoencoder_class(model_type: str):
         return NodeDeltaPyramidMLPAutoEncoder
     if model_type in {"direct_attention", "attention_direct", "direct_attention_decoder"}:
         return NodeDeltaDirectAttentionAutoEncoder
+    if model_type in {"single_stage_attention", "direct_latent_attention", "node_to_latent_attention"}:
+        return NodeDeltaSingleStageAttentionAutoEncoder
     if model_type in {"attention", "attention_mlp"}:
         return NodeDeltaAttentionAutoEncoder
     raise ValueError(f"Unknown autoencoder_model: {model_type}")
@@ -235,6 +262,7 @@ def _load_ae_cache(path: Path, cfg: dict, *, device) -> dict:
     autoencoder_cls = _autoencoder_class(autoencoder_type)
     ae_model = autoencoder_cls(
         pos_dim=int(params["pos_dim"]),
+        node_feature_dim=int(normalizers["node_feature_mean"].numel()),
         edge_dim=int(normalizers["edge_mean"].numel()),
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
@@ -365,69 +393,29 @@ def prepare_source_spec(
 
 
 def is_temperature_dataset(dataset_name: str) -> bool:
-    return dataset_name in {
-        "depablo-10k",
-        "depablo-10k-mix-temp",
+    normalized = str(dataset_name).strip().lower().replace("-", "_")
+    return normalized in {
+        "depablo_10k",
+        "depablo_10k_mix_temp",
         "depablo_mixed_temp",
-        "noizy",
         "lj_noisy",
+        "lj_noisy_eps0.01_sigma1.0_cutoff1.122",
     }
 
 
 def temperature_p_ratio(trajectory, *, cfg: dict | None = None, last_index: int = -1) -> float:
-    """Noise-aware p-ratio for thermal trajectories."""
+    """Fixed robust estimator used only for mixed-temperature dePablo data."""
 
-    cfg = {} if cfg is None else cfg
-    index = int(last_index)
-    if index < 0:
-        index += len(trajectory)
-
-    def with_training_prior(value: float) -> float:
-        prior = cfg.get("temperature_pratio_prior")
-        if prior is None or not (0 <= index < len(trajectory)):
-            return float(value)
-        series = np.full(len(trajectory), np.nan, dtype=float)
-        series[index] = float(value)
-        shrunk = shrink_p_ratio_series(
-            series,
+    del cfg
+    return float(
+        trajectory_p_ratio_sides_robust(
             trajectory,
-            prior=prior,
-            strain_scale=float(cfg.get("temperature_pratio_prior_strain_scale", 6e-3)),
-            full_weight_frame=int(cfg.get("temperature_pratio_prior_full_weight_frame", 20)),
+            last_index=last_index,
+            min_fit_frames=8,
+            min_driven_strain_range=1e-3,
+            smooth_window=5,
         )
-        return float(shrunk[index])
-
-    estimator = str(cfg.get("temperature_pratio_estimator", "robust")).lower()
-    if estimator in {"endpoint", "rollout_sides", "normal"}:
-        return float(calc_p_ratio_rollout_sides(trajectory, last_index))
-    if estimator in {"linear", "trajectory_linear", "legacy"}:
-        return with_training_prior(
-            float(calc_p_ratio_trajectory_sides(trajectory, last_index=last_index))
-        )
-    if estimator in {"strain_gated", "gated", "min_strain"}:
-        return with_training_prior(
-            trajectory_p_ratio_sides_strain_gated(
-                trajectory,
-                last_index=last_index,
-                min_fit_frames=int(cfg.get("temperature_pratio_min_fit_frames", 8)),
-                min_driven_strain_range=float(
-                    cfg.get("temperature_pratio_min_driven_strain_range", 1e-3)
-                ),
-            )
-        )
-    if estimator in {"robust", "theil_sen", "robust_slope"}:
-        return with_training_prior(
-            trajectory_p_ratio_sides_robust(
-                trajectory,
-                last_index=last_index,
-                min_fit_frames=int(cfg.get("temperature_pratio_min_fit_frames", 8)),
-                min_driven_strain_range=float(
-                    cfg.get("temperature_pratio_min_driven_strain_range", 1e-3)
-                ),
-                smooth_window=int(cfg.get("temperature_pratio_smooth_window", 5)),
-            )
-        )
-    raise ValueError(f"Unknown temperature_pratio_estimator: {estimator}")
+    )
 
 
 def ground_truth_p_ratio(
@@ -531,6 +519,12 @@ def resolve_train_val_test(
     p_ratio_fn: Callable | None = None,
 ):
     """Resolve a deterministic shuffled split, optionally filtering train p-ratio."""
+    edge_multiplicity = int(
+        source_spec.get("edge_multiplicity", params.get("edge_multiplicity", 1))
+    )
+    edge_vector_dim = int(
+        source_spec.get("edge_vector_dim", params.get("edge_vector_dim", 2))
+    )
 
     if source_spec.get("dataset_mixture"):
         if params.get("min_train_p_ratio") is not None:
@@ -545,6 +539,8 @@ def resolve_train_val_test(
             split_seed=split_seed,
             shuffle_within_source=True,
             mix_holdout_across_sources=False,
+            edge_multiplicity=edge_multiplicity,
+            edge_vector_dim=edge_vector_dim,
         )
 
     min_train_p_ratio = params.get("min_train_p_ratio")
@@ -555,7 +551,11 @@ def resolve_train_val_test(
                 "Temperature-stratified splitting cannot currently be combined "
                 "with min_train_p_ratio."
             )
-        sims = load_dataset(source_spec["path"])
+        sims = load_dataset(
+            source_spec["path"],
+            edge_multiplicity=edge_multiplicity,
+            edge_vector_dim=edge_vector_dim,
+        )
         temperatures_by_sim = [simulation_temperature(sim) for sim in sims]
         if not temperatures_by_sim or not all(
             np.isfinite(temperature) for temperature in temperatures_by_sim
@@ -654,11 +654,17 @@ def resolve_train_val_test(
             val_count=params["val_count"],
             split_seed=split_seed,
             shuffle_within_source=True,
+            edge_multiplicity=edge_multiplicity,
+            edge_vector_dim=edge_vector_dim,
         )
 
     if p_ratio_fn is None:
         raise ValueError("p_ratio_fn is required when min_train_p_ratio is set.")
-    sims = load_dataset(source_spec["path"])
+    sims = load_dataset(
+        source_spec["path"],
+        edge_multiplicity=edge_multiplicity,
+        edge_vector_dim=edge_vector_dim,
+    )
     generator = torch.Generator()
     generator.manual_seed(0 if split_seed is None else int(split_seed))
     order = torch.randperm(len(sims), generator=generator).tolist()
@@ -786,12 +792,13 @@ def evaluate_rollout(
     objective = str(cfg.get("propagator_objective", "one_step")).lower()
     stride = max(1, int(cfg.get("propagator_step_stride", 1)))
     initial_velocity = str(cfg.get("initial_velocity", "zero")).lower()
+    rollout_history_frames = max(1, int(cfg.get("rollout_history_frames", 1)))
     loss_mode = str(cfg.get("propagator_loss", "delta")).lower()
     use_static_context = bool(cfg.get("propagator_use_static_context", False))
     context_include_temperature = bool(
         cfg.get("propagator_context_include_temperature", False)
     )
-    temperature_data = is_temperature_dataset(cfg["dataset_name"])
+    context_pool_mode = str(cfg.get("propagator_context_pool", "mean"))
     p_ratio_window = cfg.get("temperature_pratio_window", "full")
     rho_scale_mode = cfg.get("polar_rho_scale_mode")
 
@@ -807,6 +814,10 @@ def evaluate_rollout(
 
     with torch.no_grad():
         for sim_idx, sim in enumerate(sims):
+            sim_dataset_name = str(
+                getattr(sim[0], "source_name", cfg["dataset_name"])
+            )
+            temperature_data = is_temperature_dataset(sim_dataset_name)
             available = max(
                 len(filtered_frame_ids(sim, frame_skip=frame_skip, include_last=True)) - 1,
                 0,
@@ -822,6 +833,8 @@ def evaluate_rollout(
 
             z0 = encode(sim, 0)
             z = z0.clone()
+            z_previous = z0.clone()
+            z_previous_previous = z0.clone()
             context = (
                 encode_reference_context(
                     ae_model,
@@ -830,6 +843,7 @@ def evaluate_rollout(
                     normalizers=normalizers,
                     device=device,
                     include_temperature=context_include_temperature,
+                    pool_mode=context_pool_mode,
                 )
                 if use_static_context
                 else None
@@ -852,7 +866,35 @@ def evaluate_rollout(
 
             start_step = stride
             prev_dz = None
-            if objective in {"velocity", "second_order"}:
+            if (
+                objective not in {"velocity", "second_order"}
+                and objective not in KINEMATIC_OBJECTIVES
+                and rollout_history_frames > 1
+            ):
+                observed_order = (rollout_history_frames - 1) * stride
+                if filtered_steps < observed_order:
+                    continue
+                observed_index = frame_for_filtered_step(
+                    sim, observed_order, frame_skip=frame_skip
+                )
+                z = encode(sim, observed_index)
+                start_step = observed_order + stride
+                if temperature_data:
+                    for order in range(stride, observed_order + 1, stride):
+                        if order < window_start_step:
+                            continue
+                        frame_index = frame_for_filtered_step(
+                            sim, order, frame_skip=frame_skip
+                        )
+                        predicted_window.append(
+                            _observed_position_graph(
+                                sim, frame_index, pos_dim=pos_dim
+                            )
+                        )
+                        ground_truth_window.append(
+                            clone_graph(sim[frame_index]).cpu()
+                        )
+            elif objective in {"velocity", "second_order"}:
                 if initial_velocity == "zero" or filtered_steps <= 1:
                     prev_dz = torch.zeros_like(z)
                 elif initial_velocity in {"first_step", "gt_first", "observed"}:
@@ -873,6 +915,65 @@ def evaluate_rollout(
                     prev_dz = latent_stats.dz_mean.squeeze(0).to(device)
                 else:
                     raise ValueError(f"Unknown initial_velocity: {initial_velocity}")
+            elif objective in KINEMATIC_OBJECTIVES:
+                if getattr(dyn_model, "uses_history_state", False):
+                    if initial_velocity not in THREE_FRAME_INITIALIZATIONS:
+                        raise ValueError(
+                            "The three-frame propagator requires "
+                            "initial_velocity='three_frames'."
+                        )
+                    observed_order = max(2, rollout_history_frames - 1) * stride
+                    if filtered_steps < observed_order:
+                        continue
+                    history_orders = [
+                        observed_order - 2 * stride,
+                        observed_order - stride,
+                        observed_order,
+                    ]
+                    history_indices = [
+                        frame_for_filtered_step(sim, order, frame_skip=frame_skip)
+                        for order in history_orders
+                    ]
+                    z_history = [encode(sim, index) for index in history_indices]
+                    z_previous_previous, z_previous, z = (
+                        z_history[0].clone(),
+                        z_history[1].clone(),
+                        z_history[2].clone(),
+                    )
+                    start_step = observed_order + stride
+                    if temperature_data:
+                        for order in range(stride, observed_order + 1, stride):
+                            frame_index = frame_for_filtered_step(
+                                sim, order, frame_skip=frame_skip
+                            )
+                            if order >= window_start_step:
+                                predicted_window.append(
+                                    _observed_position_graph(
+                                        sim, frame_index, pos_dim=pos_dim
+                                    )
+                                )
+                                ground_truth_window.append(
+                                    clone_graph(sim[frame_index]).cpu()
+                                )
+                elif initial_velocity == "zero" or filtered_steps <= 1:
+                    pass
+                elif initial_velocity in {"first_step", "gt_first", "observed"}:
+                    first_order = min(stride, filtered_steps)
+                    first_index = frame_for_filtered_step(
+                        sim,
+                        first_order,
+                        frame_skip=frame_skip,
+                    )
+                    z1 = encode(sim, first_index)
+                    z_previous, z = z0.clone(), z1.clone()
+                    start_step = first_order + stride
+                    if temperature_data and first_order >= window_start_step:
+                        predicted_window.append(clone_graph(sim[first_index]).cpu())
+                        ground_truth_window.append(clone_graph(sim[first_index]).cpu())
+                elif initial_velocity == "mean":
+                    z_previous = z - latent_stats.dz_mean.squeeze(0).to(device)
+                else:
+                    raise ValueError(f"Unknown initial_velocity: {initial_velocity}")
 
             step_orders = list(range(start_step, filtered_steps + 1, stride))
             for step in step_orders:
@@ -884,6 +985,28 @@ def evaluate_rollout(
                         latent_stats,
                         context=context,
                     )
+                elif objective in KINEMATIC_OBJECTIVES:
+                    if getattr(dyn_model, "uses_history_state", False):
+                        z_next = latent_step_history(
+                            dyn_model,
+                            z,
+                            z_previous,
+                            z_previous_previous,
+                            z0,
+                            latent_stats,
+                            context=context,
+                        )
+                    else:
+                        z_next = latent_step_kinematic(
+                            dyn_model,
+                            z,
+                            z_previous,
+                            z0,
+                            latent_stats,
+                            progress=step / max(1, available),
+                            context=context,
+                        )
+                    z_previous_previous, z_previous, z = z_previous, z, z_next
                 else:
                     z = latent_step(
                         dyn_model,
@@ -929,7 +1052,7 @@ def evaluate_rollout(
                 true_pr = ground_truth_p_ratio(
                     sim,
                     target_index,
-                    dataset_name=cfg["dataset_name"],
+                    dataset_name=sim_dataset_name,
                     cfg=cfg,
                 )
 
@@ -1017,12 +1140,13 @@ def evaluate_rollout_horizons(
     objective = str(cfg.get("propagator_objective", "one_step")).lower()
     stride = max(1, int(cfg.get("propagator_step_stride", 1)))
     initial_velocity = str(cfg.get("initial_velocity", "zero")).lower()
+    rollout_history_frames = max(1, int(cfg.get("rollout_history_frames", 1)))
     loss_mode = str(cfg.get("propagator_loss", "delta")).lower()
     use_static_context = bool(cfg.get("propagator_use_static_context", False))
     context_include_temperature = bool(
         cfg.get("propagator_context_include_temperature", False)
     )
-    temperature_data = is_temperature_dataset(cfg["dataset_name"])
+    context_pool_mode = str(cfg.get("propagator_context_pool", "mean"))
     p_ratio_window = cfg.get("temperature_pratio_window", "full")
     rho_scale_mode = cfg.get("polar_rho_scale_mode")
 
@@ -1063,6 +1187,10 @@ def evaluate_rollout_horizons(
 
     with torch.no_grad():
         for sim_idx, sim in enumerate(sims):
+            sim_dataset_name = str(
+                getattr(sim[0], "source_name", cfg["dataset_name"])
+            )
+            temperature_data = is_temperature_dataset(sim_dataset_name)
             available = max(
                 len(filtered_frame_ids(sim, frame_skip=frame_skip, include_last=True)) - 1,
                 0,
@@ -1073,6 +1201,8 @@ def evaluate_rollout_horizons(
 
             z0 = encode(sim, 0)
             z = z0.clone()
+            z_previous = z0.clone()
+            z_previous_previous = z0.clone()
             context = (
                 encode_reference_context(
                     ae_model,
@@ -1081,6 +1211,7 @@ def evaluate_rollout_horizons(
                     normalizers=normalizers,
                     device=device,
                     include_temperature=context_include_temperature,
+                    pool_mode=context_pool_mode,
                 )
                 if use_static_context
                 else None
@@ -1096,7 +1227,33 @@ def evaluate_rollout_horizons(
             predicted_path = [clone_graph(sim[0]).cpu()] if temperature_data else []
             ground_truth_path = [clone_graph(sim[0]).cpu()] if temperature_data else []
 
-            if objective in {"velocity", "second_order"}:
+            if (
+                objective not in {"velocity", "second_order"}
+                and objective not in KINEMATIC_OBJECTIVES
+                and rollout_history_frames > 1
+            ):
+                observed_order = (rollout_history_frames - 1) * stride
+                if available < observed_order:
+                    continue
+                observed_index = frame_for_filtered_step(
+                    sim, observed_order, frame_skip=frame_skip
+                )
+                z = encode(sim, observed_index)
+                start_step = observed_order + stride
+                if temperature_data:
+                    for order in range(stride, observed_order + 1, stride):
+                        frame_index = frame_for_filtered_step(
+                            sim, order, frame_skip=frame_skip
+                        )
+                        predicted_path.append(
+                            _observed_position_graph(
+                                sim, frame_index, pos_dim=pos_dim
+                            )
+                        )
+                        ground_truth_path.append(
+                            clone_graph(sim[frame_index]).cpu()
+                        )
+            elif objective in {"velocity", "second_order"}:
                 if initial_velocity == "zero":
                     prev_dz = torch.zeros_like(z)
                 elif initial_velocity in {"first_step", "gt_first", "observed"}:
@@ -1112,6 +1269,61 @@ def evaluate_rollout_horizons(
                     prev_dz = latent_stats.dz_mean.squeeze(0).to(device)
                 else:
                     raise ValueError(f"Unknown initial_velocity: {initial_velocity}")
+            elif objective in KINEMATIC_OBJECTIVES:
+                if getattr(dyn_model, "uses_history_state", False):
+                    if initial_velocity not in THREE_FRAME_INITIALIZATIONS:
+                        raise ValueError(
+                            "The three-frame propagator requires "
+                            "initial_velocity='three_frames'."
+                        )
+                    observed_order = max(2, rollout_history_frames - 1) * stride
+                    if available < observed_order:
+                        continue
+                    history_orders = [
+                        observed_order - 2 * stride,
+                        observed_order - stride,
+                        observed_order,
+                    ]
+                    history_indices = [
+                        frame_for_filtered_step(sim, order, frame_skip=frame_skip)
+                        for order in history_orders
+                    ]
+                    z_history = [encode(sim, index) for index in history_indices]
+                    z_previous_previous, z_previous, z = (
+                        z_history[0].clone(),
+                        z_history[1].clone(),
+                        z_history[2].clone(),
+                    )
+                    start_step = observed_order + stride
+                    if temperature_data:
+                        for order in range(stride, observed_order + 1, stride):
+                            frame_index = frame_for_filtered_step(
+                                sim, order, frame_skip=frame_skip
+                            )
+                            predicted_path.append(
+                                _observed_position_graph(
+                                    sim, frame_index, pos_dim=pos_dim
+                                )
+                            )
+                            ground_truth_path.append(
+                                clone_graph(sim[frame_index]).cpu()
+                            )
+                elif initial_velocity == "zero":
+                    pass
+                elif initial_velocity in {"first_step", "gt_first", "observed"}:
+                    first_index = frame_for_filtered_step(
+                        sim, stride, frame_skip=frame_skip
+                    )
+                    z1 = encode(sim, first_index)
+                    z_previous, z = z0.clone(), z1.clone()
+                    start_step = 2 * stride
+                    if temperature_data:
+                        predicted_path.append(clone_graph(sim[first_index]).cpu())
+                        ground_truth_path.append(clone_graph(sim[first_index]).cpu())
+                elif initial_velocity == "mean":
+                    z_previous = z - latent_stats.dz_mean.squeeze(0).to(device)
+                else:
+                    raise ValueError(f"Unknown initial_velocity: {initial_velocity}")
 
             for step in range(start_step, min(max_horizon, available) + 1, stride):
                 if objective in {"velocity", "second_order"}:
@@ -1122,6 +1334,28 @@ def evaluate_rollout_horizons(
                         latent_stats,
                         context=context,
                     )
+                elif objective in KINEMATIC_OBJECTIVES:
+                    if getattr(dyn_model, "uses_history_state", False):
+                        z_next = latent_step_history(
+                            dyn_model,
+                            z,
+                            z_previous,
+                            z_previous_previous,
+                            z0,
+                            latent_stats,
+                            context=context,
+                        )
+                    else:
+                        z_next = latent_step_kinematic(
+                            dyn_model,
+                            z,
+                            z_previous,
+                            z0,
+                            latent_stats,
+                            progress=step / max(1, available),
+                            context=context,
+                        )
+                    z_previous_previous, z_previous, z = z_previous, z, z_next
                 else:
                     z = latent_step(
                         dyn_model,
@@ -1162,7 +1396,7 @@ def evaluate_rollout_horizons(
                     true_pr = ground_truth_p_ratio(
                         sim,
                         target_index,
-                        dataset_name=cfg["dataset_name"],
+                        dataset_name=sim_dataset_name,
                         cfg=cfg,
                     )
 
@@ -1251,7 +1485,6 @@ def evaluate_autoencoder_reconstruction_horizons(
 
     frame_skip = int(cfg.get("frame_skip", 1))
     pos_dim = int(cfg["pos_dim"])
-    temperature_data = is_temperature_dataset(cfg["dataset_name"])
     horizon_set = set(horizons)
     max_horizon = max(horizons)
     rows = []
@@ -1259,6 +1492,10 @@ def evaluate_autoencoder_reconstruction_horizons(
 
     with torch.no_grad():
         for sim_idx, sim in enumerate(sims):
+            sim_dataset_name = str(
+                getattr(sim[0], "source_name", cfg["dataset_name"])
+            )
+            temperature_data = is_temperature_dataset(sim_dataset_name)
             available = max(
                 len(filtered_frame_ids(sim, frame_skip=frame_skip, include_last=True)) - 1,
                 0,
@@ -1308,7 +1545,7 @@ def evaluate_autoencoder_reconstruction_horizons(
                     true_pr = ground_truth_p_ratio(
                         sim,
                         target_index,
-                        dataset_name=cfg["dataset_name"],
+                        dataset_name=sim_dataset_name,
                         cfg=cfg,
                     )
 
@@ -1392,6 +1629,10 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
     batch_graphs = int(params["batch_graphs"])
     frame_skip = int(params.get("frame_skip", 1))
     ae_frame_budget = int(params["ae_max_train_frames_per_sim"])
+    ae_val_frame_skip = int(params.get("ae_val_frame_skip", frame_skip))
+    ae_val_frame_budget = int(
+        params.get("ae_max_val_frames_per_sim", ae_frame_budget)
+    )
     node_mode = params["node_feature_mode"]
     target_mode = params["ae_target_mode"]
     edge_mode = str(params.get("edge_mode", "stored"))
@@ -1405,8 +1646,8 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
     )
     val_frames = make_frame_index(
         val_data,
-        frame_skip=frame_skip,
-        max_frames_per_sim=ae_frame_budget,
+        frame_skip=ae_val_frame_skip,
+        max_frames_per_sim=ae_val_frame_budget,
         include_last=True,
         start_frame_order=int(params.get("train_frame_start_order", 0)),
     )
@@ -1417,6 +1658,7 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
         batch_graphs=batch_graphs,
         device=device,
         target_mode=target_mode,
+        node_feature_mode=node_mode,
     )
     node_mean, node_std = fit_node_feature_stats(
         train_data,
@@ -1426,6 +1668,7 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
         device=device,
         node_feature_mode=node_mode,
     )
+    params["node_feature_dim"] = int(node_mean.numel())
     edge_mean, edge_std = fit_edge_stats(
         train_data,
         train_frames,
@@ -1448,10 +1691,12 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
     autoencoder_cls = _autoencoder_class(autoencoder_type)
     ae_model = autoencoder_cls(
         pos_dim=pos_dim,
+        node_feature_dim=int(node_mean.numel()),
         edge_dim=params["edge_feature_dim"],
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
+        reconstruction_dim=int(target_mean.numel()),
     ).to(device)
     ae_model.edge_mode = edge_mode
     pretrained_ae_path = params.get("pretrained_ae_cache_path")
@@ -1467,14 +1712,27 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
     print("autoencoder")
     if pretrained_ae_path:
         bundle = torch.load(pretrained_ae_path, map_location=device, weights_only=False)
-        if bundle.get("kind") != "ae_only":
-            raise ValueError(f"Expected an AE-only checkpoint at {pretrained_ae_path}")
+        if "ae_state_dict" not in bundle:
+            raise ValueError(
+                f"Checkpoint at {pretrained_ae_path} does not contain an autoencoder."
+            )
+        saved_stats = bundle.get("stats", bundle.get("normalizers"))
+        if saved_stats is None:
+            raise ValueError(
+                f"Checkpoint at {pretrained_ae_path} has no AE normalizers."
+            )
+        require_matching_stats = bool(
+            params.get("pretrained_ae_require_matching_normalizers", True)
+        )
         for key, current in normalizers.items():
-            cached = bundle["stats"][key].to(device)
-            if not torch.allclose(current, cached, rtol=1e-5, atol=1e-7):
+            cached = saved_stats[key].to(device)
+            if require_matching_stats and not torch.allclose(
+                current, cached, rtol=1e-5, atol=1e-7
+            ):
                 raise ValueError(
                     f"Pretrained AE normalizer {key!r} does not match the current data split."
                 )
+            normalizers[key] = cached
         ae_model.load_state_dict(bundle["ae_state_dict"])
         saved_history = pd.DataFrame(bundle.get("ae_history", [])).rename(
             columns={
@@ -1484,12 +1742,26 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
                 "val_mse_norm": "val_reconstruction",
             }
         )
-        best_row = saved_history.loc[saved_history["val_loss"].idxmin()]
+        if len(saved_history) and "val_loss" in saved_history:
+            finite_history = saved_history[
+                np.isfinite(saved_history["val_loss"].to_numpy(float))
+            ]
+        else:
+            finite_history = pd.DataFrame()
+        if finite_history.empty:
+            saved_history = pd.DataFrame(
+                [{"epoch": 0, "train_loss": np.nan, "val_loss": np.nan}]
+            )
+            best_val_loss, best_epoch = float("nan"), 0
+        else:
+            best_row = finite_history.loc[finite_history["val_loss"].idxmin()]
+            best_val_loss = float(best_row["val_loss"])
+            best_epoch = int(best_row["epoch"])
         ae_result = TrainingResult(
             model=ae_model,
             history=saved_history,
-            best_val_loss=float(best_row["val_loss"]),
-            best_epoch=int(best_row["epoch"]),
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
         )
         print(f"loaded pretrained AE: {pretrained_ae_path}")
     else:
@@ -1624,6 +1896,10 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     batch_graphs = int(params["batch_graphs"])
     frame_skip = int(params.get("frame_skip", 1))
     ae_frame_budget = int(params["ae_max_train_frames_per_sim"])
+    ae_val_frame_skip = int(params.get("ae_val_frame_skip", frame_skip))
+    ae_val_frame_budget = int(
+        params.get("ae_max_val_frames_per_sim", ae_frame_budget)
+    )
     dyn_budget = int(params["dyn_max_train_transitions_per_sim"])
     node_mode = params["node_feature_mode"]
     target_mode = params["ae_target_mode"]
@@ -1639,8 +1915,8 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     )
     val_frames = make_frame_index(
         val_data,
-        frame_skip=frame_skip,
-        max_frames_per_sim=ae_frame_budget,
+        frame_skip=ae_val_frame_skip,
+        max_frames_per_sim=ae_val_frame_budget,
         include_last=True,
         start_frame_order=int(params.get("train_frame_start_order", 0)),
     )
@@ -1651,6 +1927,7 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         batch_graphs=batch_graphs,
         device=device,
         target_mode=target_mode,
+        node_feature_mode=node_mode,
     )
     node_mean, node_std = fit_node_feature_stats(
         train_data,
@@ -1660,6 +1937,7 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         device=device,
         node_feature_mode=node_mode,
     )
+    params["node_feature_dim"] = int(node_mean.numel())
     edge_mean, edge_std = fit_edge_stats(
         train_data,
         train_frames,
@@ -1682,10 +1960,12 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     autoencoder_cls = _autoencoder_class(autoencoder_type)
     ae_model = autoencoder_cls(
         pos_dim=pos_dim,
+        node_feature_dim=int(node_mean.numel()),
         edge_dim=params["edge_feature_dim"],
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
+        reconstruction_dim=int(target_mean.numel()),
     ).to(device)
     ae_model.edge_mode = edge_mode
     if bool(params.get("pca_initialize_displacement_layers", False)):
@@ -1698,14 +1978,27 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     print("autoencoder")
     if pretrained_ae_path:
         bundle = torch.load(pretrained_ae_path, map_location=device, weights_only=False)
-        if bundle.get("kind") != "ae_only":
-            raise ValueError(f"Expected an AE-only checkpoint at {pretrained_ae_path}")
+        if "ae_state_dict" not in bundle:
+            raise ValueError(
+                f"Checkpoint at {pretrained_ae_path} does not contain an autoencoder."
+            )
+        saved_stats = bundle.get("stats", bundle.get("normalizers"))
+        if saved_stats is None:
+            raise ValueError(
+                f"Checkpoint at {pretrained_ae_path} has no AE normalizers."
+            )
+        require_matching_stats = bool(
+            params.get("pretrained_ae_require_matching_normalizers", True)
+        )
         for key, current in normalizers.items():
-            cached = bundle["stats"][key].to(device)
-            if not torch.allclose(current, cached, rtol=1e-5, atol=1e-7):
+            cached = saved_stats[key].to(device)
+            if require_matching_stats and not torch.allclose(
+                current, cached, rtol=1e-5, atol=1e-7
+            ):
                 raise ValueError(
                     f"Pretrained AE normalizer {key!r} does not match the current data split."
                 )
+            normalizers[key] = cached
         ae_model.load_state_dict(bundle["ae_state_dict"])
         saved_history = pd.DataFrame(bundle.get("ae_history", [])).rename(
             columns={
@@ -1715,12 +2008,26 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
                 "val_mse_norm": "val_reconstruction",
             }
         )
-        best_row = saved_history.loc[saved_history["val_loss"].idxmin()]
+        if len(saved_history) and "val_loss" in saved_history:
+            finite_history = saved_history[
+                np.isfinite(saved_history["val_loss"].to_numpy(float))
+            ]
+        else:
+            finite_history = pd.DataFrame()
+        if finite_history.empty:
+            saved_history = pd.DataFrame(
+                [{"epoch": 0, "train_loss": np.nan, "val_loss": np.nan}]
+            )
+            best_val_loss, best_epoch = float("nan"), 0
+        else:
+            best_row = finite_history.loc[finite_history["val_loss"].idxmin()]
+            best_val_loss = float(best_row["val_loss"])
+            best_epoch = int(best_row["epoch"])
         ae_result = TrainingResult(
             model=ae_model,
             history=saved_history,
-            best_val_loss=float(best_row["val_loss"]),
-            best_epoch=int(best_row["epoch"]),
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
         )
         print(f"loaded pretrained AE: {pretrained_ae_path}")
     else:
@@ -1783,13 +2090,20 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
             for sim_idx, _t_prev, t0, t1 in train_dyn_rows
             ]
     else:
-        if objective in {"multistep", "multi_step"}:
+        if objective in {"multistep", "multi_step"} | KINEMATIC_OBJECTIVES:
             if stride != 1:
                 raise ValueError("multistep propagator training currently requires propagator_step_stride=1.")
-            multistep_horizons = [
-                int(horizon)
-                for horizon in params.get("propagator_multistep_horizons", list(range(1, 9)))
-            ]
+            if objective in KINEMATIC_OBJECTIVES:
+                max_horizon = 1 if objective == "history_one_step" else 16
+                multistep_horizons = list(range(1, max_horizon + 1))
+                params["propagator_multistep_horizons"] = multistep_horizons
+            else:
+                multistep_horizons = [
+                    int(horizon)
+                    for horizon in params.get(
+                        "propagator_multistep_horizons", list(range(1, 9))
+                    )
+                ]
             train_dyn_rows = make_multistep_transition_index(
                 train_data,
                 horizons=multistep_horizons,
@@ -1855,30 +2169,41 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         context_include_temperature=bool(
             params.get("propagator_context_include_temperature", False)
         ),
+        context_pool_mode=str(params.get("propagator_context_pool", "mean")),
         rho_scale_mode=params.get("polar_rho_scale_mode"),
     )
-    if not bool(params.get("propagator_standardize_latent", True)):
-        latent_stats.z_mean = torch.zeros_like(latent_stats.z_mean)
-        latent_stats.z_std = torch.ones_like(latent_stats.z_std)
-        latent_stats.dz_mean = torch.zeros_like(latent_stats.dz_mean)
-        latent_stats.dz_std = torch.ones_like(latent_stats.dz_std)
-        if latent_stats.z_next_mean is not None:
-            latent_stats.z_next_mean = torch.zeros_like(latent_stats.z_next_mean)
-        if latent_stats.z_next_std is not None:
-            latent_stats.z_next_std = torch.ones_like(latent_stats.z_next_std)
-        print("latent propagator: raw z and delta-z (standardization disabled)")
+    latent_stats.z_mean = torch.zeros_like(latent_stats.z_mean)
+    latent_stats.z_std = torch.ones_like(latent_stats.z_std)
+    if latent_stats.z_next_mean is not None:
+        latent_stats.z_next_mean = torch.zeros_like(latent_stats.z_next_mean)
+    if latent_stats.z_next_std is not None:
+        latent_stats.z_next_std = torch.ones_like(latent_stats.z_next_std)
     loss_mode = str(params.get("propagator_loss", "delta")).lower()
     default_model = (
         "velocity_mlp"
         if objective in {"velocity", "second_order"}
-        else ("direct_mlp" if loss_mode in {"next_z", "jepa", "next_embedding"} else "residual_mlp")
+        else (
+            "kinematic_mlp"
+            if objective in KINEMATIC_OBJECTIVES
+            else (
+                "direct_mlp"
+                if loss_mode in {"next_z", "jepa", "next_embedding"}
+                else "residual_mlp"
+            )
+        )
     )
     dyn_model = make_latent_propagator(
         int(params["latent_dim"]),
-        int(params["hidden_size"]),
+        int(params.get("propagator_hidden_size", params["hidden_size"])),
         model_type=params.get("propagator_model") or default_model,
         context_dim=(
             int(params["hidden_size"])
+            * (
+                4
+                if str(params.get("propagator_context_pool", "mean")).lower()
+                in {"moments", "distribution", "mean_std_min_max"}
+                else 1
+            )
             + int(bool(params.get("propagator_context_include_temperature", False)))
             if params.get("propagator_use_static_context", False)
             else 0
@@ -1893,7 +2218,107 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
             params.get("propagator_use_static_context", False)
             and params.get("propagator_context_include_temperature", False)
         ),
+        context_pool_mode=str(params.get("propagator_context_pool", "mean")),
     ).to(device)
+
+    propagator_epoch_callback = None
+    rollout_checkpoint_metric = params.get("propagator_checkpoint_metric")
+    if bool(params.get("propagator_rollout_eval_every_epoch", False)) or rollout_checkpoint_metric:
+        configured_horizons = params.get("propagator_rollout_eval_horizons")
+        if configured_horizons is None:
+            eval_horizons = [
+                int(
+                    params.get(
+                        "propagator_rollout_eval_horizon",
+                        max(params.get("rollout_steps_grid", [100])),
+                    )
+                )
+            ]
+        else:
+            eval_horizons = sorted({int(step) for step in configured_horizons})
+            if not eval_horizons or min(eval_horizons) < 1:
+                raise ValueError(
+                    "propagator_rollout_eval_horizons must contain positive steps."
+                )
+        eval_per_source = params.get("propagator_rollout_eval_sims_per_source")
+        if eval_per_source is not None:
+            per_source = max(1, int(eval_per_source))
+            source_counts: dict[str, int] = {}
+            epoch_eval_sims = []
+            for sim in val_data:
+                source_name = str(getattr(sim[0], "source_name", label))
+                count = source_counts.get(source_name, 0)
+                if count >= per_source:
+                    continue
+                epoch_eval_sims.append(sim)
+                source_counts[source_name] = count + 1
+        else:
+            eval_count = params.get("propagator_rollout_eval_max_sims", 20)
+            epoch_eval_sims = (
+                val_data
+                if eval_count is None
+                else val_data[: max(1, int(eval_count))]
+            )
+
+        def propagator_epoch_callback(epoch, active_model):
+            del epoch
+            epoch_rows, epoch_stats = evaluate_rollout_horizons(
+                ae_model,
+                active_model,
+                epoch_eval_sims,
+                latent_stats,
+                cfg=params,
+                normalizers=normalizers,
+                dataset=label,
+                split_name="val_epoch",
+                rollout_steps=eval_horizons,
+                device=device,
+            )
+            if epoch_stats.empty:
+                return {
+                    "val_rollout_p_ratio_r2": float("nan"),
+                    "val_rollout_p_ratio_pearson": float("nan"),
+                    "val_rollout_used": 0.0,
+                }
+            finite_r2 = epoch_stats["p_ratio_r2"].to_numpy(float)
+            finite_r2 = finite_r2[np.isfinite(finite_r2)]
+            finite_pearson = epoch_stats["p_ratio_pearson"].to_numpy(float)
+            finite_pearson = finite_pearson[np.isfinite(finite_pearson)]
+            metrics = {
+                "val_rollout_p_ratio_r2": (
+                    float(np.mean(finite_r2)) if len(finite_r2) else float("nan")
+                ),
+                "val_rollout_p_ratio_pearson": (
+                    float(np.mean(finite_pearson))
+                    if len(finite_pearson)
+                    else float("nan")
+                ),
+                "val_rollout_used": float(epoch_stats["used"].min()),
+            }
+            if "source" in epoch_rows and not epoch_rows.empty:
+                source_scores = []
+                for (_step, _source), source_group in epoch_rows.groupby(
+                    ["rollout_steps", "source"], sort=False
+                ):
+                    score = r2_score(
+                        source_group["true_p_ratio"],
+                        source_group["pred_p_ratio"],
+                    )
+                    if np.isfinite(score):
+                        source_scores.append(float(score))
+                metrics["val_rollout_macro_source_p_ratio_r2"] = (
+                    float(np.mean(source_scores)) if source_scores else float("nan")
+                )
+                metrics["val_rollout_min_source_p_ratio_r2"] = (
+                    float(np.min(source_scores)) if source_scores else float("nan")
+                )
+            for _, horizon_metric in epoch_stats.iterrows():
+                step = int(horizon_metric["rollout_steps"])
+                metrics[f"val_rollout_p_ratio_r2_step_{step}"] = horizon_metric.get(
+                    "p_ratio_r2", float("nan")
+                )
+            return metrics
+
     dyn_result = train_propagator(
         dyn_model,
         ae_model,
@@ -1911,6 +2336,26 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         loss_mode=loss_mode,
         objective=objective,
         horizons=params.get("propagator_multistep_horizons"),
+        frame_skip=frame_skip,
+        context_pool_mode=str(params.get("propagator_context_pool", "mean")),
+        position_loss_weight=float(
+            params.get("propagator_position_loss_weight", 0.0)
+        ),
+        position_boundary_weight=float(
+            params.get("propagator_position_boundary_weight", 1.0)
+        ),
+        position_boundary_fraction=float(
+            params.get("propagator_position_boundary_fraction", 0.10)
+        ),
+        position_coordinate_weights=params.get(
+            "propagator_position_coordinate_weights"
+        ),
+        network_variation_weight=float(
+            params.get("propagator_network_variation_weight", 0.0)
+        ),
+        network_variation_floor_fraction=float(
+            params.get("propagator_network_variation_floor_fraction", 0.05)
+        ),
         use_static_context=bool(params.get("propagator_use_static_context", False)),
         context_include_temperature=bool(
             params.get("propagator_context_include_temperature", False)
@@ -1935,6 +2380,9 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
             if bool(params.get("physics_loss_enabled", False))
             else None
         ),
+        epoch_callback=propagator_epoch_callback,
+        selection_metric_key=rollout_checkpoint_metric,
+        selection_mode=str(params.get("propagator_checkpoint_mode", "min")),
         config=TrainingConfig(
             max_epochs=int(params["dyn_max_epochs"]),
             patience=int(params["dyn_patience"]),
@@ -1973,7 +2421,11 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         propagator_loss=loss_mode,
         propagator_objective=objective,
         propagator_multistep_horizons=str(params.get("propagator_multistep_horizons", "")),
-        propagator_multistep_loss="final_horizon",
+        propagator_multistep_loss=(
+            "all_steps_plus_optional_decoded_endpoint"
+            if objective in KINEMATIC_OBJECTIVES
+            else "final_horizon"
+        ),
         propagator_step_stride=stride,
         initial_velocity=params.get("initial_velocity", "zero"),
     )
@@ -2077,6 +2529,9 @@ def build_autoencoder(params: dict, *, edge_dim: int, device):
     autoencoder_cls = _autoencoder_class(params.get("autoencoder_model", "attention"))
     return autoencoder_cls(
         pos_dim=int(params["pos_dim"]),
+        node_feature_dim=int(
+            params.get("node_feature_dim", params["pos_dim"])
+        ),
         edge_dim=int(edge_dim),
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),

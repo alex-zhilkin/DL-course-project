@@ -34,6 +34,8 @@ class ExperimentConfig:
     stratify_temperature: bool = False
     mix_holdout_across_sources: bool = False
     node_features: str = "positions"
+    edge_multiplicity: int = 1
+    edge_vector_dim: int = 2
 
     def to_dict(self) -> dict:
         return asdict(self)
