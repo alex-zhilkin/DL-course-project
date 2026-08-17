@@ -29,7 +29,7 @@ from .models import (
     NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
-from .simulation import r2_score
+from .simulation import r2_score, set_reference_context_mode
 from .training import LatentNormalizer
 
 
@@ -204,12 +204,19 @@ def capacity_model_name(spec: dict) -> str:
     )
 
 
-def save_experiment_bundle(result: dict, spec: dict, path: str | Path) -> Path:
+def save_experiment_bundle(
+    result: dict,
+    spec: dict,
+    path: str | Path,
+    *,
+    cache_key: str | None = None,
+) -> Path:
     """Save a trained experiment without serializing trajectory objects."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     bundle = {
+        "cache_key": cache_key,
         "spec": dict(spec),
         "params": dict(result["params"]),
         "ae_state_dict": {
@@ -257,6 +264,9 @@ def load_experiment_bundle(
             "edge_std",
         )
     }
+    for key in ("ref_edge_mean", "ref_edge_std"):
+        if key in stats:
+            normalizers[key] = stats[key].to(device)
     latent_stats = LatentNormalizer.from_dict(
         {
             "z_mean": stats["z_mean"].to(device),
@@ -336,7 +346,6 @@ def load_experiment_bundle(
                 in {"moments", "distribution", "mean_std_min_max"}
                 else 1
             )
-            + int(bool(params.get("propagator_context_include_temperature", False)))
             if params.get("propagator_use_static_context", False)
             else 0
         ),
@@ -346,10 +355,7 @@ def load_experiment_bundle(
             and params.get("graph_context_dim") is not None
             else None
         ),
-        context_include_temperature=bool(
-            params.get("propagator_use_static_context", False)
-            and params.get("propagator_context_include_temperature", False)
-        ),
+        context_include_temperature=False,
         context_pool_mode=str(params.get("propagator_context_pool", "mean")),
     ).to(device)
     dyn_model.load_state_dict(bundle["dyn_state_dict"])
@@ -390,6 +396,10 @@ def load_experiment_bundle(
         if split_cache is not None:
             split_cache[split_key] = split_data
     train_data, val_data, test_data, split_info = split_data
+    for split in (train_data, val_data, test_data):
+        set_reference_context_mode(
+            split, params.get("reference_context_mode", "physical")
+        )
     return {
         "label": spec["label"],
         "params": params,

@@ -242,7 +242,8 @@ def run_graph_experiment(cfg: ExperimentConfig) -> dict:
 
     rollout_rows = rollout_metrics.pop("rows")
     write_csv(run_dir / "rollout_predictions.csv", rollout_rows)
-    _write_rollout_scatter(rollout_rows, run_dir / "rollout_pratio_scatter.png", title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})")
+    if cfg.save_plots:
+        _write_rollout_scatter(rollout_rows, run_dir / "rollout_pratio_scatter.png", title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})")
     torch.save(stats, run_dir / "train_stats.pt")
     (run_dir / "rollout_checkpoints.json").write_text(json.dumps(rollout_checkpoints, indent=2))
 
@@ -322,7 +323,8 @@ def run_graph_cv_experiment(cfg: ExperimentConfig) -> dict:
 
     rollout_rows = rollout_metrics.pop("rows")
     write_csv(run_dir / "rollout_predictions.csv", rollout_rows)
-    _write_rollout_scatter(rollout_rows, run_dir / "rollout_pratio_scatter.png", title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})")
+    if cfg.save_plots:
+        _write_rollout_scatter(rollout_rows, run_dir / "rollout_pratio_scatter.png", title=f"{cfg.run_name} rollout p-ratio (step={cfg.rollout_steps})")
     torch.save(stats, run_dir / "train_stats.pt")
     (run_dir / "rollout_checkpoints.json").write_text(json.dumps(rollout_checkpoints, indent=2))
 

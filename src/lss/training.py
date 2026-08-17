@@ -17,9 +17,10 @@ def _3g(value) -> str:
 
 def _build_graph_at_index(sim, index: int, cfg, device: str):
     frames = [clone_graph(sim[i]).to(device) for i in range(index - cfg.history, index + 1)]
-    
     if len(frames) > 1:
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
+    else:
+        frames[-1].vel_state = torch.zeros_like(frames[-1].x[:, : cfg.pos_dim])
     return build_graph(input_graphs=frames, node_features=cfg.node_features).to(device)
 
 
@@ -54,6 +55,8 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
     frames = [clone_graph(sim[i]).to(device) for i in range(index - cfg.history, index + 1)]
     if len(frames) > 1:
         frames[-1].vel_state = frames[-1].x[:, : cfg.pos_dim] - frames[-2].x[:, : cfg.pos_dim]
+    else:
+        frames[-1].vel_state = torch.zeros_like(frames[-1].x[:, : cfg.pos_dim])
 
     allow_norm_accum = bool(is_train)
     input_graph = build_graph(input_graphs=frames[-(cfg.history + 1):], node_features=cfg.node_features).to(device)
@@ -61,6 +64,8 @@ def _sample_autoregressive_loss(model, sim, index: int, cfg, device: str, model_
     prev_graph = clone_graph(frames[-2] if len(frames) > 1 else frames[-1]).to(device)
     if len(frames) > 1:
         cur_graph.vel_state = cur_graph.x[:, : cfg.pos_dim] - prev_graph.x[:, : cfg.pos_dim]
+    else:
+        cur_graph.vel_state = torch.zeros_like(cur_graph.x[:, : cfg.pos_dim])
     target_graph = clone_graph(sim[index + 1]).to(device)
     model_inputs = model_inputs_cls(prev_graph, cur_graph, target_graph, cfg.pos_dim)
 

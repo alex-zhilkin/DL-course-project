@@ -16,6 +16,30 @@ from .simulation import edge_features, frame_node_feature, pearson_r, r2_score
 from .training import encode_frame_latent
 
 
+def label_evaluation_sources(
+    frame: pd.DataFrame,
+    source_labels: dict[str, str],
+    *,
+    source_column: str = "source",
+    output_column: str = "source_family",
+) -> pd.DataFrame:
+    """Label mixed-source evaluation rows without reconstructing source from indices."""
+
+    if source_column not in frame:
+        raise KeyError(
+            f"Evaluation rows must contain authoritative {source_column!r} metadata."
+        )
+    sources = frame[source_column]
+    invalid = sources.isna() | sources.astype(str).str.strip().eq("")
+    if invalid.any():
+        raise ValueError(
+            f"Evaluation rows contain {int(invalid.sum())} missing source assignments."
+        )
+    labeled = frame.copy()
+    labeled[output_column] = sources.map(source_labels).fillna(sources.astype(str))
+    return labeled
+
+
 @dataclass
 class CVAnalysisContext:
     """Load saved sweep models and extract physical and latent trajectory data."""

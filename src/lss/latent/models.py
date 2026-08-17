@@ -145,6 +145,7 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
         self.reconstruction_dim = int(reconstruction_dim or pos_dim)
 
         self.edge_in = nn.Linear(edge_dim, hidden_size)
+        self.ref_edge_in = nn.Linear(edge_dim, hidden_size)
         self.ref_node_in = nn.Linear(pos_dim + hidden_size, hidden_size)
         self.node_in = nn.Linear(self.node_feature_dim + hidden_size, hidden_size)
         self.pool = PyramidAttentionPool(hidden_size, latent_dim)
@@ -165,10 +166,19 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
     def encode_reference_graph(
         self, ref_pos: Tensor, ref_edge_attr: Tensor, edge_index: Tensor
     ) -> Tensor:
-        edge_node = self.aggregate_edges(ref_edge_attr, edge_index, ref_pos.size(0))
+        edge_node = self.aggregate_edges(
+            ref_edge_attr, edge_index, ref_pos.size(0), projection=self.ref_edge_in
+        )
         return self.ref_node_in(torch.cat([ref_pos, edge_node], dim=-1))
 
-    def aggregate_edges(self, edge_attr: Tensor, edge_index: Tensor, num_nodes: int) -> Tensor:
+    def aggregate_edges(
+        self,
+        edge_attr: Tensor,
+        edge_index: Tensor,
+        num_nodes: int,
+        *,
+        projection: nn.Linear | None = None,
+    ) -> Tensor:
         if edge_attr.numel() == 0:
             return torch.zeros(
                 num_nodes, self.hidden_size, device=edge_attr.device, dtype=edge_attr.dtype
@@ -209,7 +219,7 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
                 endpoint_attr.size(0), 1, device=edge_attr.device, dtype=edge_attr.dtype
             ),
         )
-        projected = self.edge_in(node_sum / node_count.clamp_min(1.0))
+        projected = (projection or self.edge_in)(node_sum / node_count.clamp_min(1.0))
         return projected * (node_count > 0).to(projected.dtype)
 
     def encode_latent_graph(
@@ -786,6 +796,96 @@ class HistoryLatentDynamicsMLP(nn.Module):
         return self.net(features)
 
 
+class FixedObservedLatentDynamicsMLP(nn.Module):
+    """Predict delta-z from the current state and two fixed observed latents.
+
+    This model is intentionally autonomous: it receives no frame index or
+    normalized trajectory progress.
+    """
+
+    uses_fixed_observed_state = True
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_size: int,
+        context_dim: int = 0,
+        graph_context_dim: int | None = None,
+        context_include_temperature: bool = False,
+        context_pool_mode: str = "mean",
+    ):
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.context_pool_mode = str(context_pool_mode).lower()
+        if self.context_pool_mode in {
+            "learned_attention",
+            "attention",
+            "set_attention",
+        }:
+            self.context_projection = StaticAttentionContextProjection(
+                context_dim,
+                graph_context_dim,
+            )
+        else:
+            self.context_projection = StaticContextProjection(
+                context_dim,
+                graph_context_dim,
+                include_temperature=context_include_temperature,
+            )
+        self.context_dim = self.context_projection.output_dim
+        state_dim = 3 * self.latent_dim
+        # Each latent block is already standardized by LatentNormalizer.
+        # Preserve relative magnitude because z(k)-z(1) carries speed.
+        self.state_norm = nn.Identity()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + self.context_dim, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, self.latent_dim),
+        )
+        nn.init.xavier_uniform_(self.net[-1].weight)
+        self.net[-1].weight.data.mul_(0.01)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def encode_context(self, context: Tensor | None) -> Tensor | None:
+        if self.context_dim <= 0:
+            return context
+        projected = self.context_projection(context)
+        return projected.unsqueeze(0) if projected.ndim == 1 else projected
+
+    def forward(
+        self,
+        state: Tensor,
+        context: Tensor | None = None,
+        *,
+        context_is_encoded: bool = False,
+    ) -> Tensor:
+        expected = 3 * self.latent_dim
+        if state.size(-1) != expected:
+            raise ValueError(
+                f"Expected fixed-history state width {expected}, "
+                f"received {state.size(-1)}."
+            )
+        encoded_context = (
+            context if context_is_encoded else self.encode_context(context)
+        )
+        features = _append_context(
+            self.state_norm(state),
+            encoded_context,
+            self.context_dim,
+        )
+        return self.net(features)
+
+
+class FixedVelocityResidualLatentDynamicsMLP(FixedObservedLatentDynamicsMLP):
+    """Correct the constant velocity inferred from two fixed observations."""
+
+    uses_fixed_velocity_residual = True
+
+
 class PolarRhoLatentDynamics(nn.Module):
     """Constrained 2D latent dynamics: advance radius and preserve angle."""
 
@@ -943,6 +1043,28 @@ def make_latent_propagator(
             context_pool_mode=context_pool_mode,
             **context_kwargs,
         )
+    if model_type in {
+        "fixed_velocity_residual",
+        "fixed_velocity_residual_mlp",
+    }:
+        return FixedVelocityResidualLatentDynamicsMLP(
+            latent_dim,
+            hidden_size,
+            context_pool_mode=context_pool_mode,
+            **context_kwargs,
+        )
+    if model_type in {
+        "fixed_history",
+        "fixed_history_mlp",
+        "fixed_observed",
+        "fixed_observed_mlp",
+    }:
+        return FixedObservedLatentDynamicsMLP(
+            latent_dim,
+            hidden_size,
+            context_pool_mode=context_pool_mode,
+            **context_kwargs,
+        )
     if model_type in {"polar", "polar_rho", "rho_theta", "radial"}:
         return PolarRhoLatentDynamics(latent_dim, hidden_size, **context_kwargs)
     if model_type in {"velocity", "velocity_mlp", "second_order_mlp"}:
@@ -953,6 +1075,8 @@ def make_latent_propagator(
 __all__ = [
     "DirectLatentDynamicsMLP",
     "DeltaLatentDynamicsMLP",
+    "FixedObservedLatentDynamicsMLP",
+    "FixedVelocityResidualLatentDynamicsMLP",
     "LatentDynamicsMLP",
     "KinematicLatentDynamicsMLP",
     "HistoryLatentDynamicsMLP",

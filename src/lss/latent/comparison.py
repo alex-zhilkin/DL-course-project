@@ -43,9 +43,7 @@ def run_propagator_comparison(
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     use_static_context = bool(cfg.get("propagator_use_static_context", True))
-    context_include_temperature = bool(
-        cfg.get("propagator_context_include_temperature", False)
-    )
+    context_include_temperature = False
     graph_context_dim = int(cfg.get("graph_context_dim", 16))
     raw_context_dim = (
         int(cfg["hidden_size"]) + int(context_include_temperature)

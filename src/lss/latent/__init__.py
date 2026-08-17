@@ -8,6 +8,7 @@ from .models import (
     make_latent_propagator,
 )
 from .simulator import LatentSpaceSimulator
+from .transfer_strain_bundle import DirectionalStrainTransferBundle
 from .physics import PhysicsLossConfig, elastic_implicit_euler_energy
 from .experiment import (
     initial_latent_analysis,
@@ -30,6 +31,7 @@ __all__ = [
     "LatentDynamicsMLP",
     "LatentNormalizer",
     "LatentSpaceSimulator",
+    "DirectionalStrainTransferBundle",
     "NodeDeltaAttentionAutoEncoder",
     "NodeDeltaDirectAttentionAutoEncoder",
     "NodeDeltaSingleStageAttentionAutoEncoder",

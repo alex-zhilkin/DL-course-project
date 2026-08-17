@@ -12,6 +12,184 @@ from graph_utils.box import Box
 
 EdgeMultiplicity = Literal[1, 2]
 
+POSITION_NORMALIZATION = "position_normalization"
+
+
+def normalize_trajectory_to_reference_box(
+    simulation: list,
+    *,
+    pos_dim: int = 2,
+) -> list:
+    """Express a trajectory in one isotropically normalized length unit.
+
+    The scalar unit is the geometric mean of the initial box half-width and
+    half-height. The map is fixed at frame zero and applied to every frame,
+    preserving aspect ratio and angles. Geometry, stiffness, velocities, and
+    interaction length parameters are converted using that same unit.
+    ``edge_stiffness_length_exponent`` selects the source convention
+    ``k = material_factor / length**exponent`` and defaults to one.
+    """
+
+    if not simulation:
+        return simulation
+    if int(pos_dim) != 2:
+        raise ValueError("Reference-box normalization currently requires pos_dim=2.")
+    if all(
+        str(getattr(graph, "coordinate_normalization", "")).strip().lower()
+        == POSITION_NORMALIZATION
+        for graph in simulation
+    ):
+        return simulation
+
+    reference = simulation[0]
+    reference_box = getattr(reference, "box", None)
+    if reference_box is not None and all(
+        hasattr(reference_box, key) for key in ("x1", "x2", "y1", "y2")
+    ):
+        lower = torch.tensor(
+            [float(reference_box.x1), float(reference_box.y1)],
+            dtype=reference.x.dtype,
+            device=reference.x.device,
+        )
+        upper = torch.tensor(
+            [float(reference_box.x2), float(reference_box.y2)],
+            dtype=reference.x.dtype,
+            device=reference.x.device,
+        )
+    else:
+        reference_pos = reference.x[:, :2]
+        lower = reference_pos.amin(dim=0)
+        upper = reference_pos.amax(dim=0)
+    half_extent = ((upper - lower) / 2).clamp_min(1e-8)
+    center = (upper + lower) / 2
+    reference_edge_attr = getattr(reference, "edge_attr", None)
+    stiffness_length_exponent = int(
+        getattr(reference, "edge_stiffness_length_exponent", 1)
+    )
+    if stiffness_length_exponent < 0:
+        raise ValueError("edge_stiffness_length_exponent must be non-negative.")
+    edge_material_factor = None
+    if (
+        isinstance(reference_edge_attr, torch.Tensor)
+        and reference_edge_attr.ndim == 2
+        and reference_edge_attr.size(1) >= 4
+    ):
+        # Preserve the material factor for k=w/l or k=w/l**2 source data.
+        # Existing datasets default to exponent one; Real Reid stores two.
+        edge_material_factor = (
+            reference_edge_attr[:, 2].pow(stiffness_length_exponent)
+            * reference_edge_attr[:, -1]
+        ).clone()
+    normalized_reference_stiffness = None
+    length_scale = torch.sqrt(half_extent.prod()).clamp_min(1e-8)
+
+    for graph in simulation:
+        graph.x = graph.x.clone()
+        graph.x[:, :2] = (graph.x[:, :2] - center.to(graph.x)) / length_scale.to(graph.x)
+        if hasattr(graph, "pos") and isinstance(graph.pos, torch.Tensor):
+            graph.pos = graph.pos.clone()
+            graph.pos[:, :2] = (
+                graph.pos[:, :2] - center.to(graph.pos)
+            ) / length_scale.to(graph.pos)
+        if hasattr(graph, "vel_state") and isinstance(graph.vel_state, torch.Tensor):
+            graph.vel_state = graph.vel_state.clone()
+            graph.vel_state[:, :2] = (
+                graph.vel_state[:, :2] / length_scale.to(graph.vel_state)
+            )
+
+        current_box = getattr(graph, "box", None)
+        if current_box is not None and all(
+            hasattr(current_box, key) for key in ("x1", "x2", "y1", "y2")
+        ):
+            x1 = (float(current_box.x1) - float(center[0])) / float(length_scale)
+            x2 = (float(current_box.x2) - float(center[0])) / float(length_scale)
+            y1 = (float(current_box.y1) - float(center[1])) / float(length_scale)
+            y2 = (float(current_box.y2) - float(center[1])) / float(length_scale)
+            z1 = float(getattr(current_box, "z1", -0.1))
+            z2 = float(getattr(current_box, "z2", 0.1))
+            graph.box = Box(x1, x2, y1, y2, z1, z2)
+            normalized_box = torch.tensor(
+                [abs(x2 - x1), abs(y2 - y1)],
+                dtype=graph.x.dtype,
+                device=graph.x.device,
+            )
+        else:
+            normalized_box = torch.full(
+                (2,), 2.0, dtype=graph.x.dtype, device=graph.x.device
+            )
+        graph.box_tensor = normalized_box
+
+        edge_attr = getattr(graph, "edge_attr", None)
+        edge_index = getattr(graph, "edge_index", None)
+        if (
+            isinstance(edge_attr, torch.Tensor)
+            and edge_attr.ndim == 2
+            and edge_attr.size(1) >= 3
+            and isinstance(edge_index, torch.Tensor)
+        ):
+            source, target = edge_index.long()
+            vector = graph.x[target, :2] - graph.x[source, :2]
+            vector = vector - torch.round(
+                vector / normalized_box.reshape(1, 2)
+            ) * normalized_box.reshape(1, 2)
+            graph.edge_attr = edge_attr.clone()
+            graph.edge_attr[:, :2] = vector.to(graph.edge_attr)
+            graph.edge_attr[:, 2] = torch.linalg.vector_norm(
+                vector, dim=-1
+            ).to(graph.edge_attr)
+            if edge_material_factor is not None:
+                if graph.edge_attr.size(0) != edge_material_factor.numel():
+                    raise ValueError(
+                        "Every frame must retain the reference edge ordering for "
+                        "stiffness normalization."
+                    )
+                if normalized_reference_stiffness is None:
+                    normalized_reference_stiffness = (
+                        edge_material_factor.to(graph.edge_attr)
+                        / graph.edge_attr[:, 2]
+                        .clamp_min(1e-8)
+                        .pow(stiffness_length_exponent)
+                    )
+                graph.edge_attr[:, -1] = normalized_reference_stiffness
+
+        # LJ sigma and cutoff are lengths, so convert them with the same unit.
+        for attribute in ("lj_sigma", "lj_cutoff"):
+            value = getattr(graph, attribute, None)
+            if isinstance(value, (int, float)):
+                setattr(graph, attribute, float(value) / float(length_scale))
+
+        graph.coordinate_normalization = POSITION_NORMALIZATION
+        graph.reference_box_center = center.detach().cpu().clone()
+        graph.reference_box_half_extent = half_extent.detach().cpu().clone()
+        graph.reference_length_scale = length_scale.detach().cpu().clone()
+        graph.edge_stiffness_length_exponent = stiffness_length_exponent
+        if graph is reference and edge_material_factor is not None:
+            graph.edge_material_factor = edge_material_factor.detach().cpu().clone()
+    return simulation
+
+
+def normalize_dataset_coordinates(
+    simulations: list,
+    *,
+    mode: str | None,
+    pos_dim: int = 2,
+) -> list:
+    """Apply an explicitly requested coordinate convention in-place."""
+
+    normalized_mode = str(mode or "none").strip().lower()
+    if normalized_mode in {"", "none", "raw", "physical"}:
+        return simulations
+    if normalized_mode != POSITION_NORMALIZATION:
+        raise ValueError(f"Unknown coordinate_normalization: {mode}")
+    trajectories = (
+        [simulations]
+        if simulations and hasattr(simulations[0], "edge_index")
+        else simulations
+    )
+    for simulation in trajectories:
+        normalize_trajectory_to_reference_box(simulation, pos_dim=pos_dim)
+    return simulations
+
 
 def _install_legacy_auxetic_box_alias() -> None:
     """Map legacy MetaForge pickles to the shared graph_utils Box class."""
@@ -179,6 +357,9 @@ def load_dataset(
     edge_multiplicity: EdgeMultiplicity = 1,
     edge_vector_dim: int = 2,
     map_location: str | torch.device = "cpu",
+    coordinate_normalization: str | None = None,
+    pos_dim: int = 2,
+    edge_stiffness_length_exponent: int | None = None,
 ) -> list:
     """Load a trajectory dataset using the project-wide edge convention.
 
@@ -194,10 +375,22 @@ def load_dataset(
             map_location=map_location,
         )
     )
-    return normalize_dataset_edges(
+    if edge_stiffness_length_exponent is not None:
+        exponent = int(edge_stiffness_length_exponent)
+        if exponent < 0:
+            raise ValueError("edge_stiffness_length_exponent must be non-negative.")
+        for simulation in simulations:
+            for graph in simulation:
+                graph.edge_stiffness_length_exponent = exponent
+    normalize_dataset_edges(
         simulations,
         edge_multiplicity=edge_multiplicity,
         edge_vector_dim=edge_vector_dim,
+    )
+    return normalize_dataset_coordinates(
+        simulations,
+        mode=coordinate_normalization,
+        pos_dim=pos_dim,
     )
 
 
@@ -255,12 +448,18 @@ def resolve_dataset_splits(
     mix_holdout_across_sources: bool = False,
     edge_multiplicity: EdgeMultiplicity = 1,
     edge_vector_dim: int = 2,
+    coordinate_normalization: str | None = None,
+    pos_dim: int = 2,
+    edge_stiffness_length_exponent: int | None = None,
 ):
     if not dataset_mixture:
         sims = load_dataset(
             dataset_path,
             edge_multiplicity=edge_multiplicity,
             edge_vector_dim=edge_vector_dim,
+            coordinate_normalization=coordinate_normalization,
+            pos_dim=pos_dim,
+            edge_stiffness_length_exponent=edge_stiffness_length_exponent,
         )
         if stratify_temperature:
             temperatures = [simulation_temperature(sim) for sim in sims]
@@ -371,10 +570,24 @@ def resolve_dataset_splits(
             path,
             edge_multiplicity=spec.get("edge_multiplicity", edge_multiplicity),
             edge_vector_dim=int(spec.get("edge_vector_dim", edge_vector_dim)),
+            coordinate_normalization=spec.get(
+                "coordinate_normalization", coordinate_normalization
+            ),
+            pos_dim=int(spec.get("pos_dim", pos_dim)),
+            edge_stiffness_length_exponent=spec.get(
+                "edge_stiffness_length_exponent",
+                edge_stiffness_length_exponent,
+            ),
         )
         sims = [tag_simulation_source(sim, source_name) for sim in sims]
         if generator is not None:
-            order = torch.randperm(len(sims), generator=generator).tolist()
+            source_generator = generator
+            if spec.get("split_seed") is not None:
+                source_generator = torch.Generator()
+                source_generator.manual_seed(int(spec["split_seed"]))
+            order = torch.randperm(
+                len(sims), generator=source_generator
+            ).tolist()
             sims = [sims[i] for i in order]
         src_train = int(spec["train_count"])
         holdout_train_count = int(spec.get("holdout_train_count", src_train))

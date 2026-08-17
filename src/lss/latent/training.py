@@ -28,6 +28,8 @@ from .simulation import (
     frame_for_filtered_step,
     iter_batches,
     pearson_r,
+    reference_edge_features,
+    reference_positions_for_model,
     r2_score,
     undirected_complete_graph_edge_data,
 )
@@ -80,6 +82,12 @@ def _train_with_early_stopping(
     if selection_mode not in {"min", "max"}:
         raise ValueError("selection_mode must be 'min' or 'max'.")
     best_val = float("inf") if selection_mode == "min" else float("-inf")
+    # A rollout metric such as R² can be undefined when the validation targets
+    # are (nearly) constant.  Keep a validation-loss checkpoint until the first
+    # finite requested metric appears instead of finishing with no checkpoint.
+    using_selection_metric = selection_metric_key is None
+    best_fallback_val_loss = float("inf")
+    best_value_label = selection_metric_key or "val"
     best_epoch = 0
     stale = 0
     rows = []
@@ -117,13 +125,31 @@ def _train_with_early_stopping(
             if selection_metric_key is not None
             else val_loss
         )
-        improved = np.isfinite(selection_value) and (
-            selection_value < best_val - float(config.min_delta)
-            if selection_mode == "min"
-            else selection_value > best_val + float(config.min_delta)
-        )
+        finite_selection = np.isfinite(selection_value)
+        if selection_metric_key is not None and not using_selection_metric:
+            if finite_selection:
+                # The requested metric takes precedence over any provisional
+                # validation-loss checkpoint as soon as it becomes available.
+                improved = True
+                using_selection_metric = True
+            else:
+                improved = np.isfinite(val_loss) and (
+                    val_loss < best_fallback_val_loss - float(config.min_delta)
+                )
+        else:
+            improved = finite_selection and (
+                selection_value < best_val - float(config.min_delta)
+                if selection_mode == "min"
+                else selection_value > best_val + float(config.min_delta)
+            )
         if improved:
-            best_val = selection_value
+            if selection_metric_key is not None and not finite_selection:
+                best_fallback_val_loss = val_loss
+                best_val = val_loss
+                best_value_label = "val_loss_fallback"
+            else:
+                best_val = selection_value
+                best_value_label = selection_metric_key or "val"
             best_epoch = epoch
             best_state = {
                 key: value.detach().cpu().clone()
@@ -153,7 +179,7 @@ def _train_with_early_stopping(
             if verbose:
                 print(
                     f"{label} early stop at epoch {epoch:04d}; "
-                    f"best_epoch={best_epoch:04d} best_{selection_metric_key or 'val'}={best_val:.6g}"
+                    f"best_epoch={best_epoch:04d} best_{best_value_label}={best_val:.6g}"
                 )
             break
 
@@ -164,7 +190,7 @@ def _train_with_early_stopping(
     if verbose and stale < int(config.patience):
         print(
             f"{label} finished at max epoch {int(config.max_epochs):04d}; "
-            f"best_epoch={best_epoch:04d} best_{selection_metric_key or 'val'}={best_val:.6g}"
+            f"best_epoch={best_epoch:04d} best_{best_value_label}={best_val:.6g}"
         )
     return TrainingResult(
         model=model,
@@ -318,7 +344,9 @@ def encode_reference_context(
 ) -> torch.Tensor:
     """Pool the learned reference-node representation into static network context."""
     ref_graph = sim[0]
-    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    ref_pos = reference_positions_for_model(
+        ref_graph, pos_dim=pos_dim, device=device
+    )
     edge_mode = str(getattr(ae_model, "edge_mode", "stored"))
     if edge_mode == "complete":
         edge_index, _, ref_edge_attr = undirected_complete_graph_edge_data(
@@ -326,12 +354,14 @@ def encode_reference_context(
         )
     elif edge_mode == "stored":
         edge_index = ref_graph.edge_index.to(device).long()
-        ref_edge_attr = edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device)
+        ref_edge_attr = reference_edge_features(
+            ref_graph, pos_dim=pos_dim, device=device
+        )
     else:
         raise ValueError(f"Unknown edge_mode: {edge_mode}")
     ref_edge_attr_norm = (
-        ref_edge_attr - normalizers["edge_mean"].to(device)
-    ) / normalizers["edge_std"].to(device)
+        ref_edge_attr - normalizers.get("ref_edge_mean", normalizers["edge_mean"]).to(device)
+    ) / normalizers.get("ref_edge_std", normalizers["edge_std"]).to(device)
     h0 = ae_model.encode_reference_graph(
         ref_pos,
         ref_edge_attr_norm,
@@ -384,7 +414,9 @@ def encode_frame_latent(
 ) -> torch.Tensor:
     ref_graph = sim[0]
     cur_graph = sim[int(t)]
-    ref_pos = ref_graph.x[:, :pos_dim].to(device).float()
+    ref_pos = reference_positions_for_model(
+        ref_graph, pos_dim=pos_dim, device=device
+    )
     node_feature = frame_node_feature(
         sim,
         t,
@@ -403,15 +435,17 @@ def encode_frame_latent(
     elif edge_mode == "stored":
         edge_index = ref_graph.edge_index.to(device).long()
         edge_attr = edge_features(ref_graph, cur_graph, pos_dim=pos_dim, device=device)
-        ref_edge_attr = edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device)
+        ref_edge_attr = reference_edge_features(
+            ref_graph, pos_dim=pos_dim, device=device
+        )
     else:
         raise ValueError(f"Unknown edge_mode: {edge_mode}")
     edge_attr_norm = (edge_attr - normalizers["edge_mean"].to(device)) / normalizers[
         "edge_std"
     ].to(device)
     ref_edge_attr_norm = (
-        ref_edge_attr - normalizers["edge_mean"].to(device)
-    ) / normalizers["edge_std"].to(device)
+        ref_edge_attr - normalizers.get("ref_edge_mean", normalizers["edge_mean"]).to(device)
+    ) / normalizers.get("ref_edge_std", normalizers["edge_std"]).to(device)
     batch = torch.zeros(ref_pos.size(0), dtype=torch.long, device=device)
     z, _ = ae_model.encode(
         node_feature_norm,
@@ -693,6 +727,118 @@ def latent_step_history(
     return (z.unsqueeze(0) + next_velocity * dz_std).squeeze(0)
 
 
+def latent_step_fixed_history(
+    model,
+    z: torch.Tensor,
+    observed_first: torch.Tensor,
+    observed_second: torch.Tensor,
+    stats: LatentNormalizer,
+    *,
+    observed_frame_gap: int = 1,
+    context: torch.Tensor | None = None,
+    context_is_encoded: bool = False,
+) -> torch.Tensor:
+    """Advance z from current and fixed observed states, without a time input."""
+
+    if not getattr(model, "uses_fixed_observed_state", False):
+        raise ValueError(
+            f"{model.__class__.__name__} is not a fixed-history propagator."
+        )
+    velocity_residual = bool(
+        getattr(model, "uses_fixed_velocity_residual", False)
+    )
+    if velocity_residual:
+        frame_gap = max(int(observed_frame_gap), 1)
+        observed_velocity = (observed_second - observed_first) / frame_gap
+        state = torch.cat(
+            [
+                stats.normalize_z(z.unsqueeze(0)),
+                stats.normalize_z(observed_second.unsqueeze(0)),
+                observed_velocity.unsqueeze(0)
+                / stats.dz_std.to(z).clamp_min(1e-6),
+            ],
+            dim=-1,
+        )
+    else:
+        observed_velocity = torch.zeros_like(z)
+        state = torch.cat(
+            [
+                stats.normalize_z(z.unsqueeze(0)),
+                stats.normalize_z(observed_first.unsqueeze(0)),
+                stats.normalize_z(observed_second.unsqueeze(0)),
+            ],
+            dim=-1,
+        )
+    if context_is_encoded:
+        context_norm = context
+    else:
+        context_value = context
+        if context_value is not None and context_value.ndim == 1:
+            context_value = context_value.unsqueeze(0)
+        context_norm = stats.normalize_context(context_value)
+    predicted_delta_norm = model(
+        state,
+        context_norm,
+        context_is_encoded=context_is_encoded,
+    )
+    if velocity_residual:
+        # Zero network output must mean an exact constant-velocity rollout.
+        predicted_residual = (
+            predicted_delta_norm * stats.dz_std.to(z).clamp_min(1e-6)
+        ).squeeze(0)
+    else:
+        predicted_residual = stats.unnormalize_dz(predicted_delta_norm).squeeze(0)
+    return z + observed_velocity + predicted_residual
+
+
+def _source_mixed_rows(sims, rows, *, shuffle: bool) -> list:
+    """Interleave all source rows across an epoch without changing their counts."""
+
+    grouped: dict[str, list] = {}
+    for row in rows:
+        sim_idx = int(row[0])
+        source = str(getattr(sims[sim_idx][0], "source_name", "unknown"))
+        grouped.setdefault(source, []).append(row)
+    if len(grouped) <= 1:
+        return list(rows)
+
+    prepared: dict[str, list] = {}
+    for source in sorted(grouped):
+        source_rows = list(grouped[source])
+        if shuffle and len(source_rows) > 1:
+            order = torch.randperm(len(source_rows)).tolist()
+            source_rows = [source_rows[index] for index in order]
+        prepared[source] = source_rows
+
+    # With equal budgets, use literal round-robin source mixing: exactly one
+    # row from every source per cycle. Randomize each cycle's source order
+    # during training so the ordering itself cannot become a learned cue.
+    source_lengths = {len(source_rows) for source_rows in prepared.values()}
+    if len(source_lengths) == 1:
+        sources = sorted(prepared)
+        mixed_rows = []
+        for row_order in range(next(iter(source_lengths))):
+            cycle = sources
+            if shuffle:
+                order = torch.randperm(len(sources)).tolist()
+                cycle = [sources[index] for index in order]
+            mixed_rows.extend(prepared[source][row_order] for source in cycle)
+        return mixed_rows
+
+    keyed_rows = []
+    for source_order, source in enumerate(sorted(prepared)):
+        source_rows = prepared[source]
+        jitters = torch.rand(len(source_rows)).tolist() if shuffle else [0.5] * len(source_rows)
+        denominator = max(len(source_rows), 1)
+        for row_order, (row, jitter) in enumerate(zip(source_rows, jitters)):
+            # Normalized progress spreads every source over the full epoch;
+            # source_order only resolves the vanishingly rare exact tie.
+            key = ((row_order + float(jitter)) / denominator, source_order)
+            keyed_rows.append((key, row))
+    keyed_rows.sort(key=lambda item: item[0])
+    return [row for _, row in keyed_rows]
+
+
 def epoch_autoencoder(
     model,
     sims,
@@ -706,12 +852,22 @@ def epoch_autoencoder(
     device,
     edge_mode: str = "stored",
     coordinate_weights=None,
+    mix_sources: bool = False,
     optimizer=None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
     losses = []
-    for rows in iter_batches(frame_rows, batch_graphs, shuffle=is_train):
+    epoch_rows = (
+        _source_mixed_rows(sims, frame_rows, shuffle=True)
+        if is_train and mix_sources
+        else frame_rows
+    )
+    for rows in iter_batches(
+        epoch_rows,
+        batch_graphs,
+        shuffle=is_train and not mix_sources,
+    ):
         batch_data = batch_delta_graphs(
             sims,
             rows,
@@ -730,8 +886,9 @@ def epoch_autoencoder(
             "edge_std"
         ].to(device)
         ref_edge_attr_norm = (
-            batch_data["ref_edge_attr"] - normalizers["edge_mean"].to(device)
-        ) / normalizers["edge_std"].to(device)
+            batch_data["ref_edge_attr"]
+            - normalizers.get("ref_edge_mean", normalizers["edge_mean"]).to(device)
+        ) / normalizers.get("ref_edge_std", normalizers["edge_std"]).to(device)
         recon_norm, _ = model(
             node_feature_norm,
             batch_data["ref_pos"],
@@ -786,6 +943,7 @@ def train_autoencoder(
     config: TrainingConfig,
     edge_mode: str = "stored",
     coordinate_weights=None,
+    mix_sources: bool = False,
     verbose: bool = True,
 ) -> TrainingResult:
     """Train and restore the best latent autoencoder."""
@@ -799,6 +957,7 @@ def train_autoencoder(
         "device": device,
         "edge_mode": edge_mode,
         "coordinate_weights": coordinate_weights,
+        "mix_sources": mix_sources,
     }
     return _train_with_early_stopping(
         model,
@@ -829,6 +988,7 @@ def epoch_propagator(
     ae_target_mode: str | None = None,
     use_static_context: bool = False,
     context_include_temperature: bool = False,
+    context_pool_mode: str = "mean",
     rho_scale_mode: str | None = None,
     physics_config: PhysicsLossConfig | None = None,
     optimizer=None,
@@ -876,6 +1036,7 @@ def epoch_propagator(
                         normalizers=normalizers,
                         device=device,
                         include_temperature=context_include_temperature,
+                        pool_mode=context_pool_mode,
                     )
                     for row in rows
                 ],
@@ -1385,6 +1546,7 @@ def _precompute_kinematic_latents(
     use_static_context: bool,
     context_include_temperature: bool,
     context_pool_mode: str,
+    fixed_observed_frames: tuple[int, int] | None = None,
 ) -> tuple[dict[tuple[int, int], torch.Tensor], dict[int, torch.Tensor]]:
     """Encode every latent needed by history training once."""
 
@@ -1407,6 +1569,8 @@ def _precompute_kinematic_latents(
                 *(int(frame) for frame in target_frames),
             }
         )
+        if fixed_observed_frames is not None:
+            required[sim_idx].update(int(frame) for frame in fixed_observed_frames)
     latent_cache: dict[tuple[int, int], torch.Tensor] = {}
     context_cache: dict[int, torch.Tensor] = {}
     ae_model.eval()
@@ -1485,6 +1649,8 @@ def epoch_kinematic_multistep_propagator(
     position_coordinate_weights=None,
     network_variation_weight: float = 0.0,
     frame_variation=None,
+    fixed_observed_frames: tuple[int, int] | None = None,
+    mix_sources: bool = False,
     optimizer=None,
     **_unused,
 ) -> dict[str, float]:
@@ -1496,7 +1662,16 @@ def epoch_kinematic_multistep_propagator(
     unroll_steps = int(unroll_steps)
     losses, raw_losses, position_losses = [], [], []
 
-    for batch_rows in iter_batches(rows, batch_graphs, shuffle=is_train):
+    epoch_rows = (
+        _source_mixed_rows(sims, rows, shuffle=True)
+        if is_train and mix_sources
+        else rows
+    )
+    for batch_rows in iter_batches(
+        epoch_rows,
+        batch_graphs,
+        shuffle=is_train and not mix_sources,
+    ):
         row_losses, row_raw_losses = [], []
         for sim_idx, start_frame, target_frames in batch_rows:
             sim_idx, start_frame = int(sim_idx), int(start_frame)
@@ -1529,7 +1704,31 @@ def epoch_kinematic_multistep_propagator(
             step_losses, step_raw_losses, weights = [], [], []
             for offset in range(unroll_steps):
                 target_frame = int(target_frames[offset])
-                if getattr(model, "uses_history_state", False):
+                if getattr(model, "uses_fixed_observed_state", False):
+                    if fixed_observed_frames is None:
+                        raise ValueError(
+                            "fixed_observed_frames are required by the fixed-history model."
+                        )
+                    observed_first = latent_cache[
+                        (sim_idx, int(fixed_observed_frames[0]))
+                    ]
+                    observed_second = latent_cache[
+                        (sim_idx, int(fixed_observed_frames[1]))
+                    ]
+                    z_next = latent_step_fixed_history(
+                        model,
+                        z,
+                        observed_first,
+                        observed_second,
+                        stats,
+                        observed_frame_gap=(
+                            int(fixed_observed_frames[1])
+                            - int(fixed_observed_frames[0])
+                        ),
+                        context=encoded_context,
+                        context_is_encoded=encoded_context is not None,
+                    )
+                elif getattr(model, "uses_history_state", False):
                     z_next = latent_step_history(
                         model,
                         z,
@@ -1554,7 +1753,10 @@ def epoch_kinematic_multistep_propagator(
                     )
                 true_z = latent_cache[(sim_idx, target_frame)]
                 weight = 1.0 + offset / max(1, unroll_steps)
-                if getattr(model, "uses_history_state", False):
+                if (
+                    getattr(model, "uses_history_state", False)
+                    or getattr(model, "uses_fixed_observed_state", False)
+                ):
                     # The history model predicts motion, not an absolute
                     # coordinate. Train it on the increment at the natural
                     # delta-Z scale so small velocity errors are not hidden by
@@ -1583,7 +1785,10 @@ def epoch_kinematic_multistep_propagator(
                     )
                 step_raw_losses.append(F.mse_loss(z_next, true_z) * weight)
                 weights.append(weight)
-                z_previous_previous, z_previous, z = z_previous, z, z_next
+                if getattr(model, "uses_fixed_observed_state", False):
+                    z = z_next
+                else:
+                    z_previous_previous, z_previous, z = z_previous, z, z_next
             row_losses.append(torch.stack(step_losses).sum() / sum(weights))
             row_raw_losses.append(torch.stack(step_raw_losses).sum() / sum(weights))
             if float(position_loss_weight) > 0:
@@ -1734,6 +1939,10 @@ def train_propagator(
     position_coordinate_weights=None,
     network_variation_weight: float = 0.0,
     network_variation_floor_fraction: float = 0.05,
+    fixed_observed_frames: tuple[int, int] | None = None,
+    unroll_curriculum=None,
+    unroll_stage_epochs=None,
+    mix_sources: bool = False,
     use_static_context: bool = False,
     context_include_temperature: bool = False,
     rho_scale_mode: str | None = None,
@@ -1767,6 +1976,7 @@ def train_propagator(
             "loss_mode": loss_mode,
             "ae_target_mode": ae_target_mode,
             "physics_config": physics_config,
+            "context_pool_mode": context_pool_mode,
         }
     elif objective in {"multistep", "multi_step"}:
         if not horizons:
@@ -1782,6 +1992,7 @@ def train_propagator(
         "anchored_multistep",
         "closed_loop",
         "history_one_step",
+        "fixed_history_one_step",
     }:
         if not horizons:
             raise ValueError("horizons are required for kinematic multistep training.")
@@ -1829,7 +2040,25 @@ def train_propagator(
             val_rows = [
                 row for row in val_rows if has_three_frames(val_sims, row)
             ]
-        print("precomputing frozen AE latents for closed-loop training")
+        if getattr(model, "uses_fixed_observed_state", False):
+            if fixed_observed_frames is None or len(fixed_observed_frames) != 2:
+                raise ValueError(
+                    "The fixed-history model requires exactly two fixed_observed_frames."
+                )
+            fixed_observed_frames = tuple(int(frame) for frame in fixed_observed_frames)
+            if not 0 <= fixed_observed_frames[0] < fixed_observed_frames[1]:
+                raise ValueError(
+                    "fixed_observed_frames must be increasing non-negative indices."
+                )
+            last_observed = fixed_observed_frames[1]
+            train_rows = [row for row in train_rows if int(row[1]) >= last_observed]
+            val_rows = [row for row in val_rows if int(row[1]) >= last_observed]
+        training_label = (
+            "one-step history training"
+            if max_horizon == 1
+            else "closed-loop training"
+        )
+        print(f"precomputing frozen AE latents for {training_label}")
         train_cache, train_context_cache = _precompute_kinematic_latents(
             autoencoder,
             train_sims,
@@ -1842,6 +2071,7 @@ def train_propagator(
             use_static_context=use_static_context,
             context_include_temperature=context_include_temperature,
             context_pool_mode=context_pool_mode,
+            fixed_observed_frames=fixed_observed_frames,
         )
         val_cache, val_context_cache = _precompute_kinematic_latents(
             autoencoder,
@@ -1855,14 +2085,42 @@ def train_propagator(
             use_static_context=use_static_context,
             context_include_temperature=context_include_temperature,
             context_pool_mode=context_pool_mode,
+            fixed_observed_frames=fixed_observed_frames,
         )
         frame_variation = _per_frame_latent_variation(
             train_cache,
             global_scale=stats.z_std,
             floor_fraction=network_variation_floor_fraction,
         )
-        stages = [max_horizon]
-        stage_epochs = [int(config.max_epochs)]
+        if unroll_curriculum is None:
+            stages = [max_horizon]
+        else:
+            stages = [int(value) for value in unroll_curriculum]
+            if (
+                not stages
+                or stages != sorted(set(stages))
+                or min(stages) < 1
+                or max(stages) != max_horizon
+            ):
+                raise ValueError(
+                    "unroll_curriculum must be increasing, unique, positive, "
+                    f"and end at the maximum horizon ({max_horizon})."
+                )
+        if unroll_stage_epochs is None:
+            base, remainder = divmod(int(config.max_epochs), len(stages))
+            stage_epochs = [base + int(idx < remainder) for idx in range(len(stages))]
+        else:
+            stage_epochs = [int(value) for value in unroll_stage_epochs]
+            if len(stage_epochs) != len(stages) or min(stage_epochs) < 1:
+                raise ValueError(
+                    "unroll_stage_epochs must provide one positive epoch count "
+                    "per curriculum stage."
+                )
+            if sum(stage_epochs) != int(config.max_epochs):
+                raise ValueError(
+                    "unroll_stage_epochs must sum to the configured maximum "
+                    f"epochs ({int(config.max_epochs)})."
+                )
 
         histories = []
         epoch_offset = 0
@@ -1894,6 +2152,8 @@ def train_propagator(
                 "position_coordinate_weights": position_coordinate_weights,
                 "network_variation_weight": network_variation_weight,
                 "frame_variation": frame_variation,
+                "fixed_observed_frames": fixed_observed_frames,
+                "mix_sources": mix_sources,
             }
 
             def stage_epoch(sims, rows, cache, context_cache, optimizer=None):
@@ -2039,7 +2299,15 @@ def decode_latent_positions(
     """Decode a latent state to differentiable full-space node positions."""
 
     ref = sim[0]
-    ref_pos = ref.x[:, :pos_dim].to(device).float()
+    # The encoder may receive the original physical reference geometry as
+    # static context, but decoded displacements live in the stored/model
+    # coordinate system.  Keep these two reference positions separate: using
+    # the physical context position as the decoder origin would add normalized
+    # displacements to dimensional coordinates.
+    model_ref_pos = ref.x[:, :pos_dim].to(device).float()
+    context_ref_pos = reference_positions_for_model(
+        ref, pos_dim=pos_dim, device=device
+    )
     edge_mode = str(getattr(ae_model, "edge_mode", "stored"))
     if edge_mode == "complete":
         edge_index, _, ref_edge_attr = undirected_complete_graph_edge_data(
@@ -2047,14 +2315,16 @@ def decode_latent_positions(
         )
     elif edge_mode == "stored":
         edge_index = ref.edge_index.to(device).long()
-        ref_edge_attr = edge_features(ref, ref, pos_dim=pos_dim, device=device)
+        ref_edge_attr = reference_edge_features(ref, pos_dim=pos_dim, device=device)
     else:
         raise ValueError(f"Unknown edge_mode: {edge_mode}")
     ref_edge_attr_norm = (
-        ref_edge_attr - normalizers["edge_mean"].to(device)
-    ) / normalizers["edge_std"].to(device)
-    batch = torch.zeros(ref_pos.size(0), dtype=torch.long, device=device)
-    h0 = ae_model.encode_reference_graph(ref_pos, ref_edge_attr_norm, edge_index)
+        ref_edge_attr - normalizers.get("ref_edge_mean", normalizers["edge_mean"]).to(device)
+    ) / normalizers.get("ref_edge_std", normalizers["edge_std"]).to(device)
+    batch = torch.zeros(model_ref_pos.size(0), dtype=torch.long, device=device)
+    h0 = ae_model.encode_reference_graph(
+        context_ref_pos, ref_edge_attr_norm, edge_index
+    )
     target_norm = ae_model.decode(z.unsqueeze(0), h0, batch)
     target = target_norm * normalizers["target_std"].to(device) + normalizers["target_mean"].to(device)
     if ae_target_mode in ("position", "positions"):
@@ -2067,9 +2337,11 @@ def decode_latent_positions(
         "displacement_velocity_history3",
         "modular_history3",
     }:
-        scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
-        return ref_pos + target[:, :pos_dim] * scale.reshape(1, -1)
-    return ref_pos + target
+        scale = (
+            model_ref_pos.max(dim=0).values - model_ref_pos.min(dim=0).values
+        ).clamp_min(1e-6)
+        return model_ref_pos + target[:, :pos_dim] * scale.reshape(1, -1)
+    return model_ref_pos + target
 
 
 def decode_latent_to_graph(

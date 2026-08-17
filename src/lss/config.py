@@ -36,6 +36,7 @@ class ExperimentConfig:
     node_features: str = "positions"
     edge_multiplicity: int = 1
     edge_vector_dim: int = 2
+    save_plots: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)

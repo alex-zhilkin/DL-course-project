@@ -84,6 +84,64 @@ def iter_batches(rows, batch_graphs: int, *, shuffle: bool = True):
         yield rows[i : i + int(batch_graphs)]
 
 
+def _physical_edge_block(
+    graph,
+    vector: torch.Tensor,
+    length: torch.Tensor,
+    stiffness: torch.Tensor,
+) -> torch.Tensor:
+    """Recover physical edge units alongside normalized model features.
+
+    Reference-box normalization is intentionally invertible: normalized
+    geometry is used by the simulator, while this redundant four-column block
+    retains the absolute static length/stiffness scale that would otherwise be
+    deleted by per-network normalization.
+    """
+
+    context_mode = str(
+        getattr(graph, "reference_context_mode", "physical")
+    ).lower()
+    if context_mode in {"normalized", "scale_invariant", "dimensionless"}:
+        return torch.cat([vector, length, stiffness], dim=-1)
+    scale = getattr(graph, "reference_length_scale", None)
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(device=vector.device, dtype=vector.dtype).reshape(1, 1)
+    elif scale is None:
+        scale = vector.new_ones((1, 1))
+    else:
+        scale = vector.new_tensor(float(scale)).reshape(1, 1)
+    stiffness_exponent = int(
+        getattr(graph, "edge_stiffness_length_exponent", 1)
+    )
+    return torch.cat(
+        [vector * scale, length * scale, stiffness / scale.pow(stiffness_exponent)],
+        dim=-1,
+    )
+
+
+def reference_positions_for_model(graph, *, pos_dim: int, device) -> torch.Tensor:
+    """Return reference coordinates in their original physical length unit."""
+
+    position = graph.x[:, :pos_dim].to(device).float()
+    context_mode = str(
+        getattr(graph, "reference_context_mode", "physical")
+    ).lower()
+    if context_mode in {"normalized", "scale_invariant", "dimensionless"}:
+        return position
+    scale = getattr(graph, "reference_length_scale", None)
+    center = getattr(graph, "reference_box_center", None)
+    if scale is None:
+        return position
+    scale = torch.as_tensor(scale, device=device, dtype=position.dtype).reshape(1, 1)
+    if center is None:
+        center = torch.zeros((1, pos_dim), device=device, dtype=position.dtype)
+    else:
+        center = torch.as_tensor(center, device=device, dtype=position.dtype).reshape(1, -1)[
+            :, :pos_dim
+        ]
+    return position * scale + center
+
+
 def edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor:
     ref_e = ref_graph.edge_attr.to(device).float()
     cur_e = cur_graph.edge_attr.to(device).float()
@@ -94,7 +152,99 @@ def edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor
     stiffness = ref_e[:, -1:]
     stretch = cur_len - ref_len
     rel_stretch = stretch / ref_len.clamp_min(1e-6)
-    return torch.cat([ref_vec, cur_vec, ref_len, cur_len, stretch, rel_stretch, stiffness, cur_e], dim=-1)
+    current_features = torch.cat(
+        [ref_vec, cur_vec, ref_len, cur_len, stretch, rel_stretch, stiffness, cur_e],
+        dim=-1,
+    )
+    zero = torch.zeros_like(ref_len)
+    reference_features = torch.cat(
+        [ref_vec, ref_vec, ref_len, ref_len, zero, zero, stiffness, ref_e],
+        dim=-1,
+    )
+    # This channel represents evolving normalized geometry only. It is exactly
+    # zero at t=0, leaving all reference structure to the physical static
+    # encoder and preventing absolute compression scale from re-entering.
+    return current_features - reference_features
+
+
+def compact_edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor:
+    """Return each unique evolving edge quantity exactly once."""
+
+    ref_e = ref_graph.edge_attr.to(device).float()
+    cur_e = cur_graph.edge_attr.to(device).float()
+    ref_vec = ref_e[:, :pos_dim]
+    cur_vec = cur_e[:, :pos_dim]
+    ref_len = ref_e[:, pos_dim : pos_dim + 1]
+    cur_len = cur_e[:, pos_dim : pos_dim + 1]
+    stretch = cur_len - ref_len
+    relative_stretch = stretch / ref_len.clamp_min(1e-6)
+    return torch.cat([cur_vec - ref_vec, stretch, relative_stretch], dim=-1)
+
+
+def reference_edge_features(ref_graph, *, pos_dim: int, device) -> torch.Tensor:
+    """Encode only the fixed reference graph in its original physical units."""
+
+    ref_e = ref_graph.edge_attr.to(device).float()
+    ref_vec = ref_e[:, :pos_dim]
+    ref_len = ref_e[:, pos_dim : pos_dim + 1]
+    stiffness = ref_e[:, -1:]
+    physical = _physical_edge_block(ref_graph, ref_vec, ref_len, stiffness)
+    physical_vec = physical[:, :pos_dim]
+    physical_len = physical[:, pos_dim : pos_dim + 1]
+    physical_stiffness = physical[:, -1:]
+    zero = torch.zeros_like(physical_len)
+    return torch.cat(
+        [
+            physical_vec,
+            physical_vec,
+            physical_len,
+            physical_len,
+            zero,
+            zero,
+            physical_stiffness,
+            physical,
+        ],
+        dim=-1,
+    )
+
+
+def compact_reference_edge_features(
+    ref_graph, *, pos_dim: int, device
+) -> torch.Tensor:
+    """Return unique static geometry and stiffness in the selected context units."""
+
+    ref_e = ref_graph.edge_attr.to(device).float()
+    ref_vec = ref_e[:, :pos_dim]
+    ref_len = ref_e[:, pos_dim : pos_dim + 1]
+    stiffness = ref_e[:, -1:]
+    return _physical_edge_block(ref_graph, ref_vec, ref_len, stiffness)
+
+
+def set_reference_context_mode(sims, mode: str = "physical"):
+    """Select physical or scale-invariant static context for trajectories.
+
+    Dynamic positions and edge changes remain normalized in either mode. This
+    flag changes only the fixed reference branch seen by the autoencoder and
+    propagator context encoder.
+    """
+
+    normalized_mode = str(mode).lower()
+    aliases = {
+        "physical": "physical",
+        "original": "physical",
+        "normalized": "normalized",
+        "scale_invariant": "normalized",
+        "dimensionless": "normalized",
+    }
+    if normalized_mode not in aliases:
+        raise ValueError(
+            "reference_context_mode must be 'physical' or 'normalized'."
+        )
+    resolved = aliases[normalized_mode]
+    for sim in sims:
+        for graph in sim:
+            graph.reference_context_mode = resolved
+    return sims
 
 
 def complete_graph_edge_data(
@@ -148,7 +298,9 @@ def complete_graph_edge_data(
     def expanded_features(current_vec, current_len):
         stretch = current_len - ref_len
         relative_stretch = stretch / ref_len.clamp_min(1e-6)
-        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        current_raw = _physical_edge_block(
+            ref_graph, current_vec, current_len, stiffness
+        )
         return torch.cat(
             [
                 ref_vec,
@@ -208,7 +360,9 @@ def stored_graph_edge_data(
     def expanded_features(current_vec, current_len):
         stretch = current_len - ref_len
         relative_stretch = stretch / ref_len.clamp_min(1e-6)
-        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        current_raw = _physical_edge_block(
+            ref_graph, current_vec, current_len, stiffness
+        )
         return torch.cat(
             [
                 ref_vec,
@@ -268,7 +422,9 @@ def undirected_complete_graph_edge_data(
     def expanded_features(current_vec, current_len):
         stretch = current_len - ref_len
         relative_stretch = stretch / ref_len.clamp_min(1e-6)
-        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        current_raw = _physical_edge_block(
+            ref_graph, current_vec, current_len, stiffness
+        )
         return torch.cat(
             [
                 ref_vec,
@@ -341,7 +497,9 @@ def undirected_stored_graph_edge_data(
     def expanded_features(current_vec, current_len):
         stretch = current_len - ref_len
         relative_stretch = stretch / ref_len.clamp_min(1e-6)
-        current_raw = torch.cat([current_vec, current_len, stiffness], dim=-1)
+        current_raw = _physical_edge_block(
+            ref_graph, current_vec, current_len, stiffness
+        )
         return torch.cat(
             [
                 ref_vec,
@@ -452,7 +610,9 @@ def batch_delta_graphs(
         node_features.append(
             frame_node_feature(sim, t, pos_dim=pos_dim, mode=node_feature_mode, device=device)
         )
-        ref_xs.append(ref_pos)
+        ref_xs.append(
+            reference_positions_for_model(ref_graph, pos_dim=pos_dim, device=device)
+        )
         if edge_mode == "complete":
             # Store/compute each unordered all-pairs relation once.  The latent
             # AE contributes it to both endpoints inside aggregate_edges.
@@ -461,10 +621,33 @@ def batch_delta_graphs(
                 ref_graph, cur_graph, pos_dim=pos_dim, device=device
                 )
             )
+        elif edge_mode in {
+            "recomputed_stored",
+            "stored_recomputed",
+            "undirected_stored",
+        }:
+            local_edge_index, current_edges, reference_edges = (
+                undirected_stored_graph_edge_data(
+                    ref_graph,
+                    cur_graph,
+                    pos_dim=pos_dim,
+                    device=device,
+                )
+            )
+        elif edge_mode == "compact_stored":
+            local_edge_index = ref_graph.edge_index.to(device).long()
+            current_edges = compact_edge_features(
+                ref_graph, cur_graph, pos_dim=pos_dim, device=device
+            )
+            reference_edges = compact_reference_edge_features(
+                ref_graph, pos_dim=pos_dim, device=device
+            )
         elif edge_mode == "stored":
             local_edge_index = ref_graph.edge_index.to(device).long()
             current_edges = edge_features(ref_graph, cur_graph, pos_dim=pos_dim, device=device)
-            reference_edges = edge_features(ref_graph, ref_graph, pos_dim=pos_dim, device=device)
+            reference_edges = reference_edge_features(
+                ref_graph, pos_dim=pos_dim, device=device
+            )
         else:
             raise ValueError(f"Unknown edge_mode: {edge_mode}")
         edge_attrs.append(current_edges)
@@ -588,6 +771,31 @@ def fit_edge_stats(
             sims, rows_batch, pos_dim=pos_dim, device=device, edge_mode=edge_mode
         )
         chunks.append(batch_data["edge_attr"].detach())
+    all_edges = torch.cat(chunks, dim=0)
+    mean = all_edges.mean(dim=0, keepdim=True)
+    std = all_edges.std(dim=0, keepdim=True).clamp_min(1e-6)
+    return mean, std
+
+
+def fit_reference_edge_stats(
+    sims,
+    rows,
+    *,
+    pos_dim: int,
+    batch_graphs: int,
+    device,
+    edge_mode: str = "stored",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit training-only statistics for the physical reference channel."""
+
+    chunks = []
+    for rows_batch in iter_batches(rows, batch_graphs, shuffle=False):
+        batch_data = batch_delta_graphs(
+            sims, rows_batch, pos_dim=pos_dim, device=device, edge_mode=edge_mode
+        )
+        chunks.append(batch_data["ref_edge_attr"].detach())
+    if not chunks:
+        raise ValueError("Cannot fit reference-edge statistics from an empty frame index.")
     all_edges = torch.cat(chunks, dim=0)
     mean = all_edges.mean(dim=0, keepdim=True)
     std = all_edges.std(dim=0, keepdim=True).clamp_min(1e-6)
@@ -1011,6 +1219,7 @@ __all__ = [
     "fit_ae_target_stats",
     "fit_edge_stats",
     "fit_node_feature_stats",
+    "fit_reference_edge_stats",
     "frame_for_filtered_step",
     "frame_node_feature",
     "initial_graph_descriptors",
@@ -1019,8 +1228,10 @@ __all__ = [
     "make_frame_index",
     "make_transition_index",
     "pearson_r",
+    "reference_positions_for_model",
     "r2_score",
     "safe_linear_fit_1d",
+    "set_reference_context_mode",
     "shrink_p_ratio_series",
     "trajectory_p_ratio_sides_robust_series",
 ]
