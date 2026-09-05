@@ -29,7 +29,7 @@ from .models import (
     NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
-from .simulation import r2_score, set_reference_context_mode
+from .simulation import r2_score
 from .training import LatentNormalizer
 
 
@@ -339,12 +339,25 @@ def load_experiment_bundle(
         int(params.get("propagator_hidden_size", params["hidden_size"])),
         model_type=params.get("propagator_model") or default_model,
         context_dim=(
-            int(params["hidden_size"])
-            * (
-                4
-                if str(params.get("propagator_context_pool", "mean")).lower()
-                in {"moments", "distribution", "mean_std_min_max"}
-                else 1
+            (
+                (
+                    4
+                    if str(params.get("propagator_context_pool", "mean")).lower()
+                    in {"source_id", "source", "dataset_id"}
+                    else int(params["hidden_size"])
+                    * (
+                        4
+                        if str(params.get("propagator_context_pool", "mean")).lower()
+                        in {"moments", "distribution", "mean_std_min_max"}
+                        else 1
+                    )
+                )
+                + int(bool(params.get("propagator_context_include_temperature", False)))
+                + 4 * int(
+                    bool(params.get("propagator_context_include_source_id", False))
+                    and str(params.get("propagator_context_pool", "mean")).lower()
+                    not in {"source_id", "source", "dataset_id"}
+                )
             )
             if params.get("propagator_use_static_context", False)
             else 0
@@ -355,8 +368,25 @@ def load_experiment_bundle(
             and params.get("graph_context_dim") is not None
             else None
         ),
-        context_include_temperature=False,
+        context_include_temperature=bool(
+            params.get("propagator_context_include_temperature", False)
+        ),
         context_pool_mode=str(params.get("propagator_context_pool", "mean")),
+        fixed_history_include_progress=bool(
+            params.get("propagator_fixed_history_include_progress", False)
+        ),
+        fixed_history_size=int(params.get("propagator_fixed_history_size", 4)),
+        fixed_history_motion_context_dim=int(
+            params.get("propagator_fixed_history_motion_context_dim", 6)
+        ),
+        history_depth=int(params.get("propagator_history_depth", 3)),
+        history_activation=str(params.get("propagator_history_activation", "gelu")),
+        history_dropout=float(params.get("propagator_history_dropout", 0.0)),
+        history_attention_heads=int(params.get("propagator_history_attention_heads", 2)),
+        history_attention_layers=int(params.get("propagator_history_attention_layers", 1)),
+        source_names=sorted(
+            {str(item.get("name", "unknown")) for item in params.get("dataset_mixture", [])}
+        ),
     ).to(device)
     dyn_model.load_state_dict(bundle["dyn_state_dict"])
     dyn_model.eval()
@@ -396,10 +426,6 @@ def load_experiment_bundle(
         if split_cache is not None:
             split_cache[split_key] = split_data
     train_data, val_data, test_data, split_info = split_data
-    for split in (train_data, val_data, test_data):
-        set_reference_context_mode(
-            split, params.get("reference_context_mode", "physical")
-        )
     return {
         "label": spec["label"],
         "params": params,

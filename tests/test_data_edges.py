@@ -13,7 +13,11 @@ from lss.data import (
     resolve_dataset_splits,
 )
 from lss.latent.simulation import batch_delta_graphs, set_reference_context_mode
-from lss.latent.training import decode_latent_positions
+from lss.latent.training import (
+    decode_latent_positions,
+    encode_frame_latent,
+    fit_latent_step_stats,
+)
 
 
 def reciprocal_graph() -> Data:
@@ -59,6 +63,54 @@ def test_load_dataset_accepts_single_trajectory(tmp_path) -> None:
 
     assert len(trajectory) == 2
     assert trajectory[0].edge_index.size(1) == 2
+
+
+def test_load_dataset_adds_runtime_two_hop_lj_edges_without_changing_file(
+    tmp_path,
+) -> None:
+    edge_index = torch.tensor([[0, 1], [1, 2]])
+    positions = torch.tensor([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    vector = positions[edge_index[1]] - positions[edge_index[0]]
+    graph = Data(
+        x=positions,
+        edge_index=edge_index,
+        edge_attr=torch.column_stack(
+            [vector, torch.linalg.vector_norm(vector, dim=-1), torch.ones(2)]
+        ),
+        box=Box(-3, 3, -3, 3, -0.1, 0.1),
+    )
+    path = tmp_path / "two_hop.pt"
+    torch.save([[graph]], path)
+
+    simulations = load_dataset(
+        path,
+        append_lj_indicator=True,
+        add_lj_two_hop_edges=True,
+    )
+    augmented = simulations[0][0]
+
+    assert augmented.edge_index.tolist() == [[0, 1, 0], [1, 2, 2]]
+    assert augmented.edge_attr.shape == (3, 5)
+    torch.testing.assert_close(augmented.edge_attr[:2, -1], torch.zeros(2))
+    torch.testing.assert_close(augmented.edge_attr[2:, 3], torch.zeros(1))
+    torch.testing.assert_close(augmented.edge_attr[2:, -1], torch.ones(1))
+    assert augmented.lj_two_hop_edges_added == 1
+
+    untouched = load_dataset(path)
+    assert untouched[0][0].edge_index.size(1) == 2
+    assert untouched[0][0].edge_attr.size(1) == 4
+
+    batch = batch_delta_graphs(
+        simulations,
+        [(0, 0)],
+        pos_dim=2,
+        device="cpu",
+        edge_mode="compact_stored",
+    )
+    assert batch["edge_attr"].shape == (3, 5)
+    assert batch["ref_edge_attr"].shape == (3, 5)
+    torch.testing.assert_close(batch["edge_attr"][:, -1], augmented.edge_attr[:, -1])
+    torch.testing.assert_close(batch["ref_edge_attr"][:, -1], augmented.edge_attr[:, -1])
 
 
 def test_load_dataset_applies_stiffness_exponent_before_normalization(tmp_path) -> None:
@@ -230,6 +282,51 @@ def test_compact_stored_edges_remove_only_exactly_redundant_channels() -> None:
         batch["ref_edge_attr"],
         reference.edge_attr[:, [0, 1, 2, 3]],
     )
+
+
+def test_single_frame_encoder_supports_compact_stored_edges() -> None:
+    reference = reciprocal_graph()
+    current = deepcopy(reference)
+    current.x = current.x + torch.tensor([0.05, -0.02])
+
+    class Encoder:
+        edge_mode = "compact_stored"
+
+        def encode(self, node, ref_pos, edge, ref_edge, edge_index, batch):
+            assert edge.shape[1] == 4
+            assert ref_edge.shape[1] == 4
+            return torch.zeros((1, 2)), None
+
+    normalizers = {
+        "node_feature_mean": torch.zeros(2),
+        "node_feature_std": torch.ones(2),
+        "edge_mean": torch.zeros(4),
+        "edge_std": torch.ones(4),
+        "ref_edge_mean": torch.zeros(4),
+        "ref_edge_std": torch.ones(4),
+    }
+    latent = encode_frame_latent(
+        Encoder(),
+        [reference, current],
+        1,
+        pos_dim=2,
+        node_feature_mode="normalized_delta",
+        normalizers=normalizers,
+        device="cpu",
+    )
+    assert latent.shape == (2,)
+
+    stats = fit_latent_step_stats(
+        Encoder(),
+        [[reference, current]],
+        [(0, 0, 1)],
+        batch_graphs=1,
+        pos_dim=2,
+        node_feature_mode="normalized_delta",
+        normalizers=normalizers,
+        device="cpu",
+    )
+    assert stats.z_mean.shape[-1] == 2
 
 
 def test_physical_reference_context_does_not_change_decoded_coordinate_system() -> None:

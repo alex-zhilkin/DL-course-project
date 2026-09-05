@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from lss.data import load_dataset
+from lss.data import normalize_dataset_edges
 
 
 def install_legacy_box_alias() -> None:
@@ -33,6 +33,21 @@ def evenly_spaced_indices(length: int, count: int) -> list[int]:
     indices = np.rint(np.linspace(0, length - 1, int(count))).astype(int)
     if len(np.unique(indices)) != int(count):
         raise RuntimeError("Even frame selection unexpectedly produced duplicate indices.")
+    return indices.tolist()
+
+
+def fixed_stride_indices(length: int, count: int, stride: int) -> list[int]:
+    """Select exactly ``count`` frames at a constant source-frame interval."""
+
+    stride = int(stride)
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    indices = np.arange(int(count), dtype=int) * stride
+    if int(indices[-1]) >= int(length):
+        raise ValueError(
+            f"{count} frames at stride {stride} need source frame {int(indices[-1])}, "
+            f"but the trajectory has only {length} frames."
+        )
     return indices.tolist()
 
 
@@ -82,6 +97,11 @@ def main() -> None:
     parser.add_argument("output_path", type=Path)
     parser.add_argument("--max-sims", type=int, default=200)
     parser.add_argument("--frames", type=int, default=200)
+    parser.add_argument(
+        "--stride",
+        type=int,
+        help="Use a fixed source-frame stride instead of rounded evenly spaced sampling.",
+    )
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -106,8 +126,16 @@ def main() -> None:
     manifest_rows = []
     for compiled_idx, row in enumerate(selected.itertuples(index=False)):
         source_path = source_dir / Path(row.file_path).name
-        source_trajectory = load_dataset(source_path, edge_multiplicity=1)
-        frame_ids = evenly_spaced_indices(len(source_trajectory), int(args.frames))
+        # Select before edge canonicalization: each source chunk has 1,500
+        # frames, while the compiled dataset retains only ``frames``.  Loading
+        # and canonicalizing every source frame at once needlessly exhausts
+        # memory during a 200-trajectory compilation.
+        source_trajectory = torch.load(source_path, map_location="cpu", weights_only=False)
+        frame_ids = (
+            fixed_stride_indices(len(source_trajectory), int(args.frames), args.stride)
+            if args.stride is not None
+            else evenly_spaced_indices(len(source_trajectory), int(args.frames))
+        )
         trajectory = [
             convert_frame(
                 source_trajectory[frame_idx],
@@ -117,6 +145,7 @@ def main() -> None:
             )
             for frame_idx in frame_ids
         ]
+        normalize_dataset_edges(trajectory, edge_multiplicity=1)
         validate_trajectory(trajectory, expected_frames=int(args.frames))
         simulations.append(trajectory)
         manifest_rows.append(
@@ -131,6 +160,7 @@ def main() -> None:
                 "last_source_frame": frame_ids[-1],
             }
         )
+        del source_trajectory
         if compiled_idx == 0 or (compiled_idx + 1) % 10 == 0:
             print(f"compiled {compiled_idx + 1}/{len(selected)}: {source_path.name}", flush=True)
 

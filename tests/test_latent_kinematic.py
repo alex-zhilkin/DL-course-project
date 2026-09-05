@@ -4,6 +4,7 @@ from lss.latent.models import NodeDeltaMLPAutoEncoder, make_latent_propagator
 from lss.latent.training import (
     LatentNormalizer,
     latent_step_fixed_history,
+    latent_step_history,
     latent_step_kinematic,
 )
 
@@ -93,6 +94,38 @@ def test_fixed_history_step_has_no_progress_input():
 
     assert predicted.shape == (latent_dim,)
     assert model.net[0].in_features == 3 * latent_dim
+
+
+def test_history_delta_model_predicts_full_next_displacement():
+    latent_dim = 2
+    model = make_latent_propagator(
+        latent_dim,
+        8,
+        model_type="history_delta_mlp",
+    )
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    stats = LatentNormalizer(
+        z_mean=torch.zeros(1, latent_dim),
+        z_std=torch.ones(1, latent_dim),
+        dz_mean=torch.zeros(1, latent_dim),
+        dz_std=torch.tensor([[2.0, 3.0]]),
+    )
+    current = torch.tensor([4.0, -1.0])
+
+    predicted = latent_step_history(
+        model,
+        current,
+        torch.tensor([2.0, -2.0]),
+        torch.tensor([1.0, -4.0]),
+        torch.zeros(latent_dim),
+        stats,
+    )
+
+    # Zero network output means zero predicted delta, rather than continuing
+    # the previous velocity as the acceleration-based history model would.
+    torch.testing.assert_close(predicted, current)
+    assert model.predicts_direct_history_delta
 
 
 def test_fixed_velocity_residual_starts_from_observed_velocity():

@@ -34,6 +34,20 @@ def test_nested_component_configs_expand_without_notebook_prefixes():
     assert expanded["fixed_observed_frames"] == (1, 5)
 
 
+@pytest.mark.parametrize(
+    ("component", "legacy_key"),
+    [
+        ("ae_config", "ae_max_epochs"),
+        ("ae_config", "autoencoder_model"),
+        ("propagator_config", "propagator_loss"),
+        ("propagator_config", "dyn_max_epochs"),
+    ],
+)
+def test_nested_component_configs_reject_prefixed_keys(component, legacy_key):
+    with pytest.raises(ValueError, match="without a component prefix"):
+        _expand_component_configs({component: {legacy_key: 1}})
+
+
 def test_source_labels_come_from_evaluation_rows_not_simulation_indices():
     rows = pd.DataFrame(
         {

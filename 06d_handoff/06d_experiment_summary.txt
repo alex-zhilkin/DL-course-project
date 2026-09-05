@@ -1,0 +1,67 @@
+06d experiment summary
+======================
+
+Goal
+----
+Learn one shared autoencoder (AE) across Reid, de Pablo low-temperature,
+de Pablo mixed-temperature, and noisy-LJ, then simulate each dataset with a
+latent propagator. At inference the propagator receives observed graph frames
+only; it never receives a dataset identity.
+
+Shared AE
+---------
+- The AE is trained over all four datasets and is reused frozen by every
+  propagator experiment in 06d.
+- It has source-wise validation reconstruction position MSE and p-ratio R2 at
+  steps 10, 50, and 100. The printed fourth number per source is the SUM of
+  those three R2 values, not a fourth R2.
+- Checkpoint selection maximizes the minimum source-wise three-step R2 sum, so
+  one excellent source cannot alone select the AE.
+- AE sampling is currently source-balanced: each source contributes the same
+  number of training frame rows per epoch. Noisy-LJ has more available
+  trajectories for diversity, but it does not receive more gradient weight.
+- The AE can encode/decode noisy-LJ adequately. This does not by itself prove
+  that its latent state is Markov or stable under repeated learned dynamics.
+
+Noisy-LJ propagator results
+---------------------------
+- A noisy-LJ-only one-step delta MLP with static reference-structure context
+  achieved non-trivial teacher-forced next-step prediction, but its rollout
+  p-ratio R2 remained negative.
+- A three-frame history model improved local next-step error substantially.
+  In the saved stride-1 history run its best validation normalized delta-Z MSE
+  was about 0.275, while step-100 rollout p-ratio R2 was about -0.36.
+  This is direct evidence that local teacher-forced prediction can work while
+  autoregressive rollout fails.
+- Larger-stride history runs were only weakly positive at step 100 (roughly
+  0.04--0.06 validation R2 at their best); they are not a robust solution.
+- The current three-frame truncated five-step experiment uses a first-step
+  normalized delta-Z loss plus a five-step cumulative-displacement loss. The
+  rollout states at intermediate steps are detached, so the fifth-step loss
+  cannot assign gradient credit to the four transitions that produced its
+  input. In the saved run the first-step loss is small while the fifth-step
+  loss barely improves and rollout remains poor.
+
+Interpretation
+--------------
+The main noisy-LJ problem is currently rollout stability / state sufficiency,
+not demonstrated AE reconstruction failure. Likely contributors are missing
+velocity or stochastic state, latent dynamics that are not sufficiently
+Markov, and compounding off-manifold rollout error. A static reference graph
+helps identify the structure but does not provide instantaneous motion or a
+future stochastic kick.
+
+Other datasets
+--------------
+The three non-noisy datasets together have a propagator that works well in the
+separate experiment already evaluated by the project. The intended final goal
+is still one simulator covering all four datasets. The unresolved blocker is
+adding noisy-LJ without making its dynamics depend on a known source label.
+
+Current direction
+-----------------
+Use observed multi-frame history for noisy-LJ and train on self-generated
+states. A useful memory-efficient next experiment is a five-step detached
+rollout with supervision at every step, rather than only at steps 1 and 5:
+each call then learns a correct local update from the imperfect states it will
+actually encounter, without backpropagation through the earlier calls.

@@ -12,6 +12,25 @@ from graph_utils import directional_side_indices_from_box
 from ..graph import box_tensor
 
 
+# Static dataset metadata used when a model is explicitly source-conditioned.
+# Keep this order aligned with the latent propagator's source conditioning.
+_SOURCE_NODE_ORDER = (
+    "reid",
+    "depablo_low_temp",
+    "depablo_mixed_temp",
+    "lj_noisy",
+)
+
+
+def canonical_edge_mode(edge_mode: str | None) -> str:
+    """Normalize edge-mode spelling before feature dispatch."""
+
+    mode = str(edge_mode or "stored").strip().lower().replace("-", "_")
+    return {"compact": "compact_stored", "compactstored": "compact_stored", "compact_delta": "compact_delta_stored"}.get(
+        mode, mode
+    )
+
+
 
 def filtered_frame_ids(
     sim,
@@ -90,56 +109,18 @@ def _physical_edge_block(
     length: torch.Tensor,
     stiffness: torch.Tensor,
 ) -> torch.Tensor:
-    """Recover physical edge units alongside normalized model features.
+    """Return evolving geometry in the normalized simulation domain."""
 
-    Reference-box normalization is intentionally invertible: normalized
-    geometry is used by the simulator, while this redundant four-column block
-    retains the absolute static length/stiffness scale that would otherwise be
-    deleted by per-network normalization.
-    """
-
-    context_mode = str(
-        getattr(graph, "reference_context_mode", "physical")
-    ).lower()
-    if context_mode in {"normalized", "scale_invariant", "dimensionless"}:
-        return torch.cat([vector, length, stiffness], dim=-1)
-    scale = getattr(graph, "reference_length_scale", None)
-    if isinstance(scale, torch.Tensor):
-        scale = scale.to(device=vector.device, dtype=vector.dtype).reshape(1, 1)
-    elif scale is None:
-        scale = vector.new_ones((1, 1))
-    else:
-        scale = vector.new_tensor(float(scale)).reshape(1, 1)
-    stiffness_exponent = int(
-        getattr(graph, "edge_stiffness_length_exponent", 1)
-    )
-    return torch.cat(
-        [vector * scale, length * scale, stiffness / scale.pow(stiffness_exponent)],
-        dim=-1,
-    )
+    return torch.cat([vector, length, stiffness], dim=-1)
 
 
 def reference_positions_for_model(graph, *, pos_dim: int, device) -> torch.Tensor:
-    """Return reference coordinates in their original physical length unit."""
+    """Return the preserved original reference positions for static context."""
 
-    position = graph.x[:, :pos_dim].to(device).float()
-    context_mode = str(
-        getattr(graph, "reference_context_mode", "physical")
-    ).lower()
-    if context_mode in {"normalized", "scale_invariant", "dimensionless"}:
-        return position
-    scale = getattr(graph, "reference_length_scale", None)
-    center = getattr(graph, "reference_box_center", None)
-    if scale is None:
-        return position
-    scale = torch.as_tensor(scale, device=device, dtype=position.dtype).reshape(1, 1)
-    if center is None:
-        center = torch.zeros((1, pos_dim), device=device, dtype=position.dtype)
-    else:
-        center = torch.as_tensor(center, device=device, dtype=position.dtype).reshape(1, -1)[
-            :, :pos_dim
-        ]
-    return position * scale + center
+    position = getattr(graph, "reference_context_positions", None)
+    if not isinstance(position, torch.Tensor):
+        position = graph.x[:, :pos_dim]
+    return position[:, :pos_dim].to(device).float()
 
 
 def edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor:
@@ -149,7 +130,7 @@ def edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor
     cur_vec = cur_e[:, :pos_dim]
     ref_len = ref_e[:, pos_dim : pos_dim + 1]
     cur_len = cur_e[:, pos_dim : pos_dim + 1]
-    stiffness = ref_e[:, -1:]
+    stiffness = ref_e[:, pos_dim + 1 : pos_dim + 2]
     stretch = cur_len - ref_len
     rel_stretch = stretch / ref_len.clamp_min(1e-6)
     current_features = torch.cat(
@@ -178,17 +159,35 @@ def compact_edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torc
     cur_len = cur_e[:, pos_dim : pos_dim + 1]
     stretch = cur_len - ref_len
     relative_stretch = stretch / ref_len.clamp_min(1e-6)
-    return torch.cat([cur_vec - ref_vec, stretch, relative_stretch], dim=-1)
+    relation_features = cur_e[:, pos_dim + 2 :]
+    return torch.cat(
+        [cur_vec - ref_vec, stretch, relative_stretch, relation_features], dim=-1
+    )
+
+
+def compact_delta_edge_features(ref_graph, cur_graph, *, pos_dim: int, device) -> torch.Tensor:
+    """Return compact evolving edge displacement and absolute length change."""
+
+    ref_e = ref_graph.edge_attr.to(device).float()
+    cur_e = cur_graph.edge_attr.to(device).float()
+    ref_vec = ref_e[:, :pos_dim]
+    cur_vec = cur_e[:, :pos_dim]
+    stretch = cur_e[:, pos_dim : pos_dim + 1] - ref_e[:, pos_dim : pos_dim + 1]
+    relation_features = cur_e[:, pos_dim + 2 :]
+    return torch.cat([cur_vec - ref_vec, stretch, relation_features], dim=-1)
 
 
 def reference_edge_features(ref_graph, *, pos_dim: int, device) -> torch.Tensor:
-    """Encode only the fixed reference graph in its original physical units."""
+    """Encode the preserved original reference graph as static context."""
 
-    ref_e = ref_graph.edge_attr.to(device).float()
+    ref_e = getattr(ref_graph, "reference_context_edge_attr", None)
+    if not isinstance(ref_e, torch.Tensor):
+        ref_e = ref_graph.edge_attr
+    ref_e = ref_e.to(device).float()
     ref_vec = ref_e[:, :pos_dim]
     ref_len = ref_e[:, pos_dim : pos_dim + 1]
-    stiffness = ref_e[:, -1:]
-    physical = _physical_edge_block(ref_graph, ref_vec, ref_len, stiffness)
+    stiffness = ref_e[:, pos_dim + 1 : pos_dim + 2]
+    physical = torch.cat([ref_vec, ref_len, stiffness], dim=-1)
     physical_vec = physical[:, :pos_dim]
     physical_len = physical[:, pos_dim : pos_dim + 1]
     physical_stiffness = physical[:, -1:]
@@ -211,39 +210,39 @@ def reference_edge_features(ref_graph, *, pos_dim: int, device) -> torch.Tensor:
 def compact_reference_edge_features(
     ref_graph, *, pos_dim: int, device
 ) -> torch.Tensor:
-    """Return unique static geometry and stiffness in the selected context units."""
+    """Return unique static geometry and original stiffness as context."""
 
-    ref_e = ref_graph.edge_attr.to(device).float()
+    ref_e = getattr(ref_graph, "reference_context_edge_attr", None)
+    if not isinstance(ref_e, torch.Tensor):
+        ref_e = ref_graph.edge_attr
+    ref_e = ref_e.to(device).float()
     ref_vec = ref_e[:, :pos_dim]
     ref_len = ref_e[:, pos_dim : pos_dim + 1]
-    stiffness = ref_e[:, -1:]
-    return _physical_edge_block(ref_graph, ref_vec, ref_len, stiffness)
+    stiffness = ref_e[:, pos_dim + 1 : pos_dim + 2]
+    relation_features = ref_e[:, pos_dim + 2 :]
+    return torch.cat(
+        [
+            _physical_edge_block(ref_graph, ref_vec, ref_len, stiffness),
+            relation_features,
+        ],
+        dim=-1,
+    )
+
+
+def compact_delta_reference_edge_features(ref_graph, *, pos_dim: int, device) -> torch.Tensor:
+    """Return the zero reference tensor matching the 3D compact delta mode."""
+
+    ref_e = ref_graph.edge_attr.to(device).float()
+    zero_geometry = torch.zeros(
+        (ref_e.size(0), pos_dim + 1), device=device, dtype=ref_e.dtype
+    )
+    relation_features = ref_e[:, pos_dim + 2 :]
+    return torch.cat([zero_geometry, relation_features], dim=-1)
 
 
 def set_reference_context_mode(sims, mode: str = "physical"):
-    """Select physical or scale-invariant static context for trajectories.
+    """Backward-compatible no-op for the removed context-mode switch."""
 
-    Dynamic positions and edge changes remain normalized in either mode. This
-    flag changes only the fixed reference branch seen by the autoencoder and
-    propagator context encoder.
-    """
-
-    normalized_mode = str(mode).lower()
-    aliases = {
-        "physical": "physical",
-        "original": "physical",
-        "normalized": "normalized",
-        "scale_invariant": "normalized",
-        "dimensionless": "normalized",
-    }
-    if normalized_mode not in aliases:
-        raise ValueError(
-            "reference_context_mode must be 'physical' or 'normalized'."
-        )
-    resolved = aliases[normalized_mode]
-    for sim in sims:
-        for graph in sim:
-            graph.reference_context_mode = resolved
     return sims
 
 
@@ -519,17 +518,37 @@ def undirected_stored_graph_edge_data(
 
 def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch.Tensor:
     t = int(t)
+    mode = str(mode)
+    include_source_id = mode.lower().endswith("_source_id")
+    base_mode = mode[:-len("_source_id")].rstrip("_") if include_source_id else mode
     cur_pos = sim[t].x[:, :pos_dim].to(device).float()
-    if mode in ("position", "positions"):
-        return cur_pos
-    if mode == "delta":
+    if base_mode in ("position", "positions"):
+        features = cur_pos
+    elif base_mode == "delta":
         ref_pos = sim[0].x[:, :pos_dim].to(device).float()
-        return cur_pos - ref_pos
-    if mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
+        features = cur_pos - ref_pos
+    elif base_mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
         ref_pos = sim[0].x[:, :pos_dim].to(device).float()
         scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
-        return (cur_pos - ref_pos) / scale.reshape(1, -1)
-    if mode in {
+        features = (cur_pos - ref_pos) / scale.reshape(1, -1)
+    elif base_mode in {
+        "normalized_delta_prefix3",
+        "fixed_prefix3_normalized_delta",
+        "normalized_delta_history_prefix3",
+    }:
+        # Every encoded frame receives the same causal trajectory prefix in
+        # addition to its own displacement.  Frame zero is included explicitly
+        # for a stable fixed-width representation, even though its displacement
+        # is zero under the reference-frame convention.
+        ref_pos = sim[0].x[:, :pos_dim].to(device).float()
+        scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
+        prefix = []
+        for observed_t in (0, 1, 2):
+            observed_pos = sim[min(observed_t, len(sim) - 1)].x[:, :pos_dim].to(device).float()
+            prefix.append((observed_pos - ref_pos) / scale.reshape(1, -1))
+        current = (cur_pos - ref_pos) / scale.reshape(1, -1)
+        features = torch.cat([current, *prefix], dim=-1)
+    elif base_mode in {
         "normalized_delta_velocity",
         "delta_velocity",
         "displacement_velocity",
@@ -545,8 +564,8 @@ def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch
         else:
             prev_pos = sim[t - 1].x[:, :pos_dim].to(device).float()
             velocity = (cur_pos - prev_pos) / scale.reshape(1, -1)
-        return torch.cat([displacement, velocity], dim=-1)
-    if mode in {
+        features = torch.cat([displacement, velocity], dim=-1)
+    elif base_mode in {
         "normalized_delta_velocity_history3",
         "displacement_velocity_history3",
         "modular_history3",
@@ -569,13 +588,26 @@ def frame_node_feature(sim, t: int, *, pos_dim: int, mode: str, device) -> torch
                 previous = sim[current_index - 1].x[:, :pos_dim].to(device).float()
                 velocity = (current - previous) / scale.reshape(1, -1)
             velocities.append(velocity)
-        return torch.cat([displacement, *velocities], dim=-1)
-    if mode == "velocity":
+        features = torch.cat([displacement, *velocities], dim=-1)
+    elif base_mode == "velocity":
         if t <= 0:
-            return torch.zeros_like(cur_pos)
-        prev_pos = sim[t - 1].x[:, :pos_dim].to(device).float()
-        return cur_pos - prev_pos
-    raise ValueError(f"Unknown node_feature_mode: {mode}")
+            features = torch.zeros_like(cur_pos)
+        else:
+            prev_pos = sim[t - 1].x[:, :pos_dim].to(device).float()
+            features = cur_pos - prev_pos
+    else:
+        raise ValueError(f"Unknown node_feature_mode: {mode}")
+    if not include_source_id:
+        return features
+    source_name = str(getattr(sim[0], "source_name", ""))
+    source_id = torch.zeros(
+        len(_SOURCE_NODE_ORDER), dtype=features.dtype, device=features.device
+    )
+    if source_name in _SOURCE_NODE_ORDER:
+        source_id[_SOURCE_NODE_ORDER.index(source_name)] = 1.0
+    return torch.cat(
+        [features, source_id.reshape(1, -1).expand(features.size(0), -1)], dim=-1
+    )
 
 
 def batch_delta_graphs(
@@ -587,6 +619,7 @@ def batch_delta_graphs(
     node_feature_mode: str = "delta",
     edge_mode: str = "stored",
 ) -> dict[str, torch.Tensor]:
+    edge_mode = canonical_edge_mode(edge_mode)
     xs = []
     node_features = []
     cur_positions = []
@@ -595,6 +628,8 @@ def batch_delta_graphs(
     ref_edge_attrs = []
     edge_indices = []
     scales = []
+    normalized_velocities = []
+    normalized_accelerations = []
     batch = []
     node_offset = 0
     for local_idx, (sim_idx, t) in enumerate(rows):
@@ -606,6 +641,22 @@ def batch_delta_graphs(
         scale = (ref_pos.max(dim=0).values - ref_pos.min(dim=0).values).clamp_min(1e-6)
         xs.append(cur_pos - ref_pos)
         scales.append(scale.reshape(1, -1).expand(ref_pos.size(0), -1))
+        current_delta = (cur_pos - ref_pos) / scale.reshape(1, -1)
+        if int(t) <= 0:
+            velocity = torch.zeros_like(current_delta)
+        else:
+            previous_pos = sim[int(t) - 1].x[:, :pos_dim].to(device).float()
+            velocity = (cur_pos - previous_pos) / scale.reshape(1, -1)
+        if int(t) <= 1:
+            acceleration = torch.zeros_like(current_delta)
+        else:
+            previous_pos = sim[int(t) - 1].x[:, :pos_dim].to(device).float()
+            previous_previous_pos = sim[int(t) - 2].x[:, :pos_dim].to(device).float()
+            acceleration = (
+                cur_pos - 2.0 * previous_pos + previous_previous_pos
+            ) / scale.reshape(1, -1)
+        normalized_velocities.append(velocity)
+        normalized_accelerations.append(acceleration)
         cur_positions.append(cur_pos)
         node_features.append(
             frame_node_feature(sim, t, pos_dim=pos_dim, mode=node_feature_mode, device=device)
@@ -642,6 +693,14 @@ def batch_delta_graphs(
             reference_edges = compact_reference_edge_features(
                 ref_graph, pos_dim=pos_dim, device=device
             )
+        elif edge_mode == "compact_delta_stored":
+            local_edge_index = ref_graph.edge_index.to(device).long()
+            current_edges = compact_delta_edge_features(
+                ref_graph, cur_graph, pos_dim=pos_dim, device=device
+            )
+            reference_edges = compact_delta_reference_edge_features(
+                ref_graph, pos_dim=pos_dim, device=device
+            )
         elif edge_mode == "stored":
             local_edge_index = ref_graph.edge_index.to(device).long()
             current_edges = edge_features(ref_graph, cur_graph, pos_dim=pos_dim, device=device)
@@ -658,6 +717,8 @@ def batch_delta_graphs(
     return {
         "delta": torch.cat(xs, dim=0),
         "normalized_delta": torch.cat(xs, dim=0) / torch.cat(scales, dim=0),
+        "normalized_velocity": torch.cat(normalized_velocities, dim=0),
+        "normalized_acceleration": torch.cat(normalized_accelerations, dim=0),
         "position_scale": torch.cat(scales, dim=0),
         "cur_pos": torch.cat(cur_positions, dim=0),
         "node_feature": torch.cat(node_features, dim=0),
@@ -676,6 +737,22 @@ def ae_target_tensor(batch_data: dict[str, torch.Tensor], target_mode: str) -> t
         return batch_data["delta"]
     if target_mode in {"normalized_delta", "self_normalized_delta", "relative_delta"}:
         return batch_data["normalized_delta"]
+    if target_mode in {
+        "normalized_delta_velocity_acceleration",
+        "displacement_velocity_acceleration",
+        "kinematic_state",
+    }:
+        # The first position channels remain the normalized displacement used
+        # for rollout decoding. Target statistics normalize each kinematic
+        # block independently before the reconstruction loss is calculated.
+        return torch.cat(
+            [
+                batch_data["normalized_delta"],
+                batch_data["normalized_velocity"],
+                batch_data["normalized_acceleration"],
+            ],
+            dim=-1,
+        )
     if target_mode in {
         "normalized_delta_velocity_history3",
         "displacement_velocity_history3",

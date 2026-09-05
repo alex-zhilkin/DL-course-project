@@ -20,14 +20,13 @@ def normalize_trajectory_to_reference_box(
     *,
     pos_dim: int = 2,
 ) -> list:
-    """Express a trajectory in one isotropically normalized length unit.
+    """Normalize a trajectory to an initial ``[-1, 1] x [-1, 1]`` box.
 
-    The scalar unit is the geometric mean of the initial box half-width and
-    half-height. The map is fixed at frame zero and applied to every frame,
-    preserving aspect ratio and angles. Geometry, stiffness, velocities, and
-    interaction length parameters are converted using that same unit.
-    ``edge_stiffness_length_exponent`` selects the source convention
-    ``k = material_factor / length**exponent`` and defaults to one.
+    The per-axis map is fixed at frame zero and applied to every frame.
+    Positions, velocities, periodic boxes, edge vectors, and edge lengths are
+    expressed in this normalized coordinate system. Stiffness values are kept
+    exactly as stored in the source graph; they are not converted through a
+    source-specific length exponent.
     """
 
     if not simulation:
@@ -38,7 +37,7 @@ def normalize_trajectory_to_reference_box(
         str(getattr(graph, "coordinate_normalization", "")).strip().lower()
         == POSITION_NORMALIZATION
         for graph in simulation
-    ):
+    ) and isinstance(getattr(simulation[0], "reference_context_positions", None), torch.Tensor):
         return simulation
 
     reference = simulation[0]
@@ -63,51 +62,42 @@ def normalize_trajectory_to_reference_box(
     half_extent = ((upper - lower) / 2).clamp_min(1e-8)
     center = (upper + lower) / 2
     reference_edge_attr = getattr(reference, "edge_attr", None)
-    stiffness_length_exponent = int(
-        getattr(reference, "edge_stiffness_length_exponent", 1)
+    reference.reference_context_positions = reference.x[:, :pos_dim].detach().clone()
+    reference.reference_context_edge_attr = (
+        reference_edge_attr.detach().clone()
+        if isinstance(reference_edge_attr, torch.Tensor)
+        else None
     )
-    if stiffness_length_exponent < 0:
-        raise ValueError("edge_stiffness_length_exponent must be non-negative.")
-    edge_material_factor = None
-    if (
-        isinstance(reference_edge_attr, torch.Tensor)
-        and reference_edge_attr.ndim == 2
-        and reference_edge_attr.size(1) >= 4
-    ):
-        # Preserve the material factor for k=w/l or k=w/l**2 source data.
-        # Existing datasets default to exponent one; Real Reid stores two.
-        edge_material_factor = (
-            reference_edge_attr[:, 2].pow(stiffness_length_exponent)
-            * reference_edge_attr[:, -1]
-        ).clone()
-    normalized_reference_stiffness = None
-    length_scale = torch.sqrt(half_extent.prod()).clamp_min(1e-8)
 
     for graph in simulation:
         graph.x = graph.x.clone()
-        graph.x[:, :2] = (graph.x[:, :2] - center.to(graph.x)) / length_scale.to(graph.x)
+        graph.x[:, :2] = (graph.x[:, :2] - center.to(graph.x)) / half_extent.to(graph.x)
         if hasattr(graph, "pos") and isinstance(graph.pos, torch.Tensor):
             graph.pos = graph.pos.clone()
             graph.pos[:, :2] = (
                 graph.pos[:, :2] - center.to(graph.pos)
-            ) / length_scale.to(graph.pos)
+            ) / half_extent.to(graph.pos)
         if hasattr(graph, "vel_state") and isinstance(graph.vel_state, torch.Tensor):
             graph.vel_state = graph.vel_state.clone()
             graph.vel_state[:, :2] = (
-                graph.vel_state[:, :2] / length_scale.to(graph.vel_state)
+                graph.vel_state[:, :2] / half_extent.to(graph.vel_state)
             )
 
         current_box = getattr(graph, "box", None)
         if current_box is not None and all(
             hasattr(current_box, key) for key in ("x1", "x2", "y1", "y2")
         ):
-            x1 = (float(current_box.x1) - float(center[0])) / float(length_scale)
-            x2 = (float(current_box.x2) - float(center[0])) / float(length_scale)
-            y1 = (float(current_box.y1) - float(center[1])) / float(length_scale)
-            y2 = (float(current_box.y2) - float(center[1])) / float(length_scale)
+            x1 = (float(current_box.x1) - float(center[0])) / float(half_extent[0])
+            x2 = (float(current_box.x2) - float(center[0])) / float(half_extent[0])
+            y1 = (float(current_box.y1) - float(center[1])) / float(half_extent[1])
+            y2 = (float(current_box.y2) - float(center[1])) / float(half_extent[1])
             z1 = float(getattr(current_box, "z1", -0.1))
             z2 = float(getattr(current_box, "z2", 0.1))
             graph.box = Box(x1, x2, y1, y2, z1, z2)
+            # Positions are expressed relative to the *initial* box, so frame
+            # zero is [-1, 1]^2.  The periodic domain can still evolve during
+            # compression; edge minimum-image geometry must use this frame's
+            # transformed box rather than the initial [2, 2] extent.
             normalized_box = torch.tensor(
                 [abs(x2 - x1), abs(y2 - y1)],
                 dtype=graph.x.dtype,
@@ -137,34 +127,18 @@ def normalize_trajectory_to_reference_box(
             graph.edge_attr[:, 2] = torch.linalg.vector_norm(
                 vector, dim=-1
             ).to(graph.edge_attr)
-            if edge_material_factor is not None:
-                if graph.edge_attr.size(0) != edge_material_factor.numel():
-                    raise ValueError(
-                        "Every frame must retain the reference edge ordering for "
-                        "stiffness normalization."
-                    )
-                if normalized_reference_stiffness is None:
-                    normalized_reference_stiffness = (
-                        edge_material_factor.to(graph.edge_attr)
-                        / graph.edge_attr[:, 2]
-                        .clamp_min(1e-8)
-                        .pow(stiffness_length_exponent)
-                    )
-                graph.edge_attr[:, -1] = normalized_reference_stiffness
-
-        # LJ sigma and cutoff are lengths, so convert them with the same unit.
+        # Scalar interaction lengths use the geometric mean of the two
+        # coordinate scales; the evolving graph itself is normalized per axis.
+        scalar_length_scale = float(torch.sqrt(half_extent.prod()))
         for attribute in ("lj_sigma", "lj_cutoff"):
             value = getattr(graph, attribute, None)
             if isinstance(value, (int, float)):
-                setattr(graph, attribute, float(value) / float(length_scale))
+                setattr(graph, attribute, float(value) / scalar_length_scale)
 
         graph.coordinate_normalization = POSITION_NORMALIZATION
         graph.reference_box_center = center.detach().cpu().clone()
         graph.reference_box_half_extent = half_extent.detach().cpu().clone()
-        graph.reference_length_scale = length_scale.detach().cpu().clone()
-        graph.edge_stiffness_length_exponent = stiffness_length_exponent
-        if graph is reference and edge_material_factor is not None:
-            graph.edge_material_factor = edge_material_factor.detach().cpu().clone()
+        graph.reference_length_scale = half_extent.detach().cpu().clone()
     return simulation
 
 
@@ -351,6 +325,115 @@ def normalize_dataset_edges(
     return simulations
 
 
+def append_lj_edge_indicator(
+    simulations: list,
+    *,
+    add_two_hop_edges: bool = False,
+    max_graph_distance: int | None = None,
+    pos_dim: int = 2,
+) -> list:
+    """Add an in-memory LJ relation channel and optional short-range edges.
+
+    Existing stored edges keep their physical attributes and receive
+    ``is_lj=0``.  When requested, unordered node pairs separated by exactly
+    up to the requested stored-spring graph distance are appended with current minimum-image geometry,
+    zero stiffness, and ``is_lj=1``.  Serialized datasets are not modified.
+    """
+
+    if not simulations:
+        return simulations
+    if int(pos_dim) != 2:
+        raise ValueError("LJ graph-distance augmentation currently requires pos_dim=2.")
+    max_graph_distance = (
+        2 if bool(add_two_hop_edges) and max_graph_distance is None
+        else int(max_graph_distance or 1)
+    )
+    if max_graph_distance < 1:
+        raise ValueError("max_graph_distance must be positive.")
+    trajectories = (
+        [simulations]
+        if hasattr(simulations[0], "edge_index")
+        else simulations
+    )
+    for simulation in trajectories:
+        if not simulation:
+            continue
+        reference = simulation[0]
+        num_nodes = int(reference.x.size(0))
+        spring_index = reference.edge_index.long()
+        adjacency = torch.zeros(
+            (num_nodes, num_nodes), dtype=torch.bool, device=spring_index.device
+        )
+        adjacency[spring_index[0], spring_index[1]] = True
+        adjacency[spring_index[1], spring_index[0]] = True
+        if max_graph_distance >= 2:
+            reached = adjacency.clone()
+            frontier = adjacency.clone()
+            added = torch.zeros_like(adjacency)
+            for _distance in range(2, max_graph_distance + 1):
+                frontier = frontier.float().matmul(adjacency.float()) > 0
+                new_pairs = frontier & ~reached
+                added |= new_pairs
+                reached |= frontier
+            candidate_mask = torch.triu(added, diagonal=1)
+            lj_edge_index = candidate_mask.nonzero(as_tuple=False).T.contiguous()
+        else:
+            lj_edge_index = torch.empty(
+                (2, 0), dtype=torch.long, device=spring_index.device
+            )
+
+        for graph in simulation:
+            if bool(getattr(graph, "lj_edge_indicator_appended", False)):
+                continue
+            edge_attr = graph.edge_attr
+            if edge_attr.ndim != 2 or edge_attr.size(1) < pos_dim + 2:
+                raise ValueError(
+                    "LJ edge augmentation expects [vector, length, stiffness] "
+                    f"edge attributes; found {tuple(edge_attr.shape)}"
+                )
+            indicator = torch.zeros(
+                (edge_attr.size(0), 1), dtype=edge_attr.dtype, device=edge_attr.device
+            )
+            graph.edge_attr = torch.cat([edge_attr, indicator], dim=1)
+
+            if lj_edge_index.numel():
+                edge_index = lj_edge_index.to(graph.x.device)
+                source, target = edge_index
+                vector = graph.x[target, :pos_dim] - graph.x[source, :pos_dim]
+                box = getattr(graph, "box", None)
+                if box is not None and all(
+                    hasattr(box, key) for key in ("x1", "x2", "y1", "y2")
+                ):
+                    box_lengths = torch.tensor(
+                        [abs(float(box.x2) - float(box.x1)), abs(float(box.y2) - float(box.y1))],
+                        dtype=vector.dtype,
+                        device=vector.device,
+                    )
+                    vector = vector - torch.round(
+                        vector / box_lengths.reshape(1, pos_dim)
+                    ) * box_lengths.reshape(1, pos_dim)
+                added_attr = torch.zeros(
+                    (edge_index.size(1), graph.edge_attr.size(1)),
+                    dtype=graph.edge_attr.dtype,
+                    device=graph.edge_attr.device,
+                )
+                added_attr[:, :pos_dim] = vector.to(added_attr)
+                added_attr[:, pos_dim] = torch.linalg.vector_norm(
+                    vector, dim=-1
+                ).to(added_attr)
+                added_attr[:, -1] = 1
+                graph.edge_index = torch.cat(
+                    [graph.edge_index, edge_index.to(graph.edge_index.device)], dim=1
+                )
+                graph.edge_attr = torch.cat([graph.edge_attr, added_attr], dim=0)
+
+            graph.lj_edge_indicator_appended = True
+            graph.lj_two_hop_edges_added = int(lj_edge_index.size(1))
+            graph.lj_max_graph_distance = int(max_graph_distance)
+            graph.edge_feature_schema = "vector_length_stiffness_is_lj_v1"
+    return simulations
+
+
 def load_dataset(
     path: str | Path,
     *,
@@ -360,6 +443,9 @@ def load_dataset(
     coordinate_normalization: str | None = None,
     pos_dim: int = 2,
     edge_stiffness_length_exponent: int | None = None,
+    append_lj_indicator: bool = False,
+    add_lj_two_hop_edges: bool = False,
+    lj_max_graph_distance: int | None = None,
 ) -> list:
     """Load a trajectory dataset using the project-wide edge convention.
 
@@ -375,18 +461,20 @@ def load_dataset(
             map_location=map_location,
         )
     )
-    if edge_stiffness_length_exponent is not None:
-        exponent = int(edge_stiffness_length_exponent)
-        if exponent < 0:
-            raise ValueError("edge_stiffness_length_exponent must be non-negative.")
-        for simulation in simulations:
-            for graph in simulation:
-                graph.edge_stiffness_length_exponent = exponent
+    # Kept in the signature for compatibility with older callers. Stiffness
+    # is now passed through unchanged for every source.
     normalize_dataset_edges(
         simulations,
         edge_multiplicity=edge_multiplicity,
         edge_vector_dim=edge_vector_dim,
     )
+    if append_lj_indicator or add_lj_two_hop_edges or lj_max_graph_distance is not None:
+        append_lj_edge_indicator(
+            simulations,
+            add_two_hop_edges=add_lj_two_hop_edges,
+            max_graph_distance=lj_max_graph_distance,
+            pos_dim=pos_dim,
+        )
     return normalize_dataset_coordinates(
         simulations,
         mode=coordinate_normalization,
@@ -451,6 +539,9 @@ def resolve_dataset_splits(
     coordinate_normalization: str | None = None,
     pos_dim: int = 2,
     edge_stiffness_length_exponent: int | None = None,
+    append_lj_indicator: bool = False,
+    add_lj_two_hop_edges: bool = False,
+    lj_max_graph_distance: int | None = None,
 ):
     if not dataset_mixture:
         sims = load_dataset(
@@ -460,6 +551,9 @@ def resolve_dataset_splits(
             coordinate_normalization=coordinate_normalization,
             pos_dim=pos_dim,
             edge_stiffness_length_exponent=edge_stiffness_length_exponent,
+            append_lj_indicator=append_lj_indicator,
+            add_lj_two_hop_edges=add_lj_two_hop_edges,
+            lj_max_graph_distance=lj_max_graph_distance,
         )
         if stratify_temperature:
             temperatures = [simulation_temperature(sim) for sim in sims]
@@ -577,6 +671,13 @@ def resolve_dataset_splits(
             edge_stiffness_length_exponent=spec.get(
                 "edge_stiffness_length_exponent",
                 edge_stiffness_length_exponent,
+            ),
+            append_lj_indicator=bool(
+                spec.get("append_lj_indicator", append_lj_indicator)
+            ),
+            add_lj_two_hop_edges=bool(spec.get("add_lj_two_hop_edges", False)),
+            lj_max_graph_distance=spec.get(
+                "lj_max_graph_distance", lj_max_graph_distance
             ),
         )
         sims = [tag_simulation_source(sim, source_name) for sim in sims]
