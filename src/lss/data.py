@@ -681,6 +681,28 @@ def resolve_dataset_splits(
             ),
         )
         sims = [tag_simulation_source(sim, source_name) for sim in sims]
+        if "split_indices" in spec:
+            if mix_holdout_across_sources:
+                raise ValueError("Explicit split indices cannot be pooled across sources.")
+            indices = spec["split_indices"]
+            if set(indices) != {"train", "val", "test"}:
+                raise ValueError("split_indices must contain train, val, and test.")
+            flat = [i for name in ("train", "val", "test") for i in indices[name]]
+            if any(type(i) is not int or not 0 <= i < len(sims) for i in flat):
+                raise ValueError("split_indices contains a non-integer or out-of-range index.")
+            if len(set(flat)) != len(flat):
+                raise ValueError("split_indices must be disjoint and contain no duplicates.")
+            if len(indices["train"]) != int(spec["train_count"]) or len(indices["val"]) != int(spec["val_count"]):
+                raise ValueError("Explicit split lengths disagree with train_count/val_count.")
+            for name, destination in (("train", train_data), ("val", val_data), ("test", test_data)):
+                destination.extend(sims[i] for i in indices[name])
+            split_info.append({
+                "source": source_name, "path": str(path), "total": len(sims),
+                "train": len(indices["train"]), "val": len(indices["val"]),
+                "test": len(indices["test"]), "split_indices": indices,
+                "excluded": len(sims) - len(flat),
+            })
+            continue
         if generator is not None:
             source_generator = generator
             if spec.get("split_seed") is not None:

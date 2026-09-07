@@ -1374,8 +1374,8 @@ def epoch_autoencoder(
     is_train = optimizer is not None
     model.train(is_train)
     gradient_method = str(gradient_method).strip().lower()
-    if gradient_method not in {"mean", "standard", "nash", "nash_mtl", "nash-mtl"}:
-        raise ValueError("gradient_method must be 'mean' or 'nash_mtl'.")
+    if gradient_method not in {"mean", "standard", "source_mean", "nash", "nash_mtl", "nash-mtl"}:
+        raise ValueError("gradient_method must be 'mean', 'source_mean', or 'nash_mtl'.")
     losses = []
     source_reconstruction: dict[str, list[float]] = {}
     nash_alphas: dict[str, list[float]] = {}
@@ -1453,6 +1453,8 @@ def epoch_autoencoder(
             source_name: per_graph_loss[graph_indices].mean()
             for source_name, graph_indices in source_graph_indices.items()
         }
+        if gradient_method == "source_mean":
+            loss = torch.stack(list(source_losses.values())).mean()
         for source_name, source_loss in source_losses.items():
             source_reconstruction.setdefault(source_name, []).append(
                 float(
@@ -1523,6 +1525,10 @@ def epoch_autoencoder(
             for character in source_name.lower()
         ).strip("_")
         summary[f"source_{source_key}_reconstruction"] = float(np.mean(values))
+    if source_reconstruction:
+        source_means = [float(np.mean(values)) for values in source_reconstruction.values()]
+        summary["macro_source_reconstruction"] = float(np.mean(source_means))
+        summary["max_source_reconstruction"] = float(max(source_means))
     for source_name, values in nash_alphas.items():
         source_key = "".join(
             character if character.isalnum() else "_"

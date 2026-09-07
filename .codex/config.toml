@@ -3,3 +3,5 @@ sandbox_mode = "workspace-write"
 
 [projects."/absolute/path/to/your/folder"]
 trust_level = "trusted"
+[sandbox_workspace_write]
+network_access = true

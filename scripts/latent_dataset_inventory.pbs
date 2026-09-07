@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#PBS -N lss_inventory
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=2:mem=32gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTHONUNBUFFERED=1
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/lss-cache-${PBS_JOBID}"
+export MPLCONFIGDIR="$XDG_CACHE_HOME/matplotlib"
+exec .venv/bin/python scripts/latent_dataset_inventory.py

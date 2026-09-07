@@ -7,6 +7,12 @@ of the current working tree. Existing user changes were preserved.
 
 ## What the evidence supports
 
+The cluster restart is now running matched representation experiments; results
+and decisions are tracked in [latent_matched_study_log.md](latent_matched_study_log.md).
+All four raw datasets are available, but historical checkpoints/CSVs referenced
+below have not been transferred. The new split conservatively keeps repeated
+node-labelled spring topologies within a single partition across all sources.
+
 The promising paper question is: **When does a low-dimensional representation
 that organizes mechanical response also contain enough information to predict
 its evolution across different interaction laws?**

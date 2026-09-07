@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N lss_shared_ae
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l place=free:shared
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD" LSS_CODE_ROOT="$PWD/notebooks/results/shared_ae_architecture/${LSS_CODE_VERSION:-code_v3}"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-shared-ae-${PBS_JOBID}"
+mkdir -p notebooks/results/shared_ae_architecture/job_logs
+exec >"notebooks/results/shared_ae_architecture/job_logs/${PBS_JOBID}.log" 2>&1
+args=(--variant "${LSS_VARIANT:?}" --latent-dim "${LSS_LATENT_DIM:?}" --seed "${LSS_SEED:?}")
+if [[ "${LSS_SMOKE:-0}" == 1 ]]; then args+=(--smoke); fi
+exec .venv/bin/python "$LSS_CODE_ROOT/scripts/run_shared_ae_architecture.py" "${args[@]}"

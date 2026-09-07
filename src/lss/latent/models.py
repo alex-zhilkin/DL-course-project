@@ -134,6 +134,9 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
         latent_tokens: int,
         node_feature_dim: int | None = None,
         reconstruction_dim: int | None = None,
+        message_passing_steps: int = 0,
+        message_chunk_size: int = 8192,
+        correct_edge_reversal: bool = False,
     ):
         super().__init__()
         self.pos_dim = int(pos_dim)
@@ -143,11 +146,47 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
         self.latent_tokens = int(latent_tokens)
         self.node_feature_dim = int(node_feature_dim or pos_dim)
         self.reconstruction_dim = int(reconstruction_dim or pos_dim)
+        self.message_passing_steps = int(message_passing_steps)
+        self.message_chunk_size = int(message_chunk_size)
+        self.correct_edge_reversal = bool(correct_edge_reversal)
+        if self.message_passing_steps < 0:
+            raise ValueError("message_passing_steps must be non-negative.")
+        if self.message_chunk_size < 1:
+            raise ValueError("message_chunk_size must be positive.")
 
         self.edge_in = nn.Linear(edge_dim, hidden_size)
         self.ref_edge_in = nn.Linear(edge_dim, hidden_size)
         self.ref_node_in = nn.Linear(pos_dim + hidden_size, hidden_size)
         self.node_in = nn.Linear(self.node_feature_dim + hidden_size, hidden_size)
+        self.message_edge_in = nn.Linear(edge_dim, hidden_size)
+        self.message_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(3 * hidden_size, hidden_size),
+                    nn.GELU(),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+                for _ in range(self.message_passing_steps)
+            ]
+        )
+        self.message_updates = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(2 * hidden_size, hidden_size),
+                    nn.GELU(),
+                    nn.Linear(hidden_size, hidden_size),
+                )
+                for _ in range(self.message_passing_steps)
+            ]
+        )
+        self.message_norms = nn.ModuleList(
+            [nn.LayerNorm(hidden_size) for _ in range(self.message_passing_steps)]
+        )
+        # Filled from fitted edge normalizers by the experiment builder.  It
+        # is recomputed from saved normalizers on load, so frozen legacy state
+        # dictionaries remain loadable.
+        self.register_buffer("edge_reverse_offset", torch.zeros(edge_dim), persistent=False)
+        self.register_buffer("ref_edge_reverse_offset", torch.zeros(edge_dim), persistent=False)
         self.pool = PyramidAttentionPool(hidden_size, latent_dim)
         self.to_latent = None
 
@@ -198,7 +237,18 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
             directional_columns = [0, 1, 2, 3, 9, 10]
         else:
             directional_columns = list(range(min(self.pos_dim, edge_attr.size(-1))))
-        reverse_attr[:, directional_columns] *= -1
+        if self.correct_edge_reversal:
+            reverse_offset = (
+                self.ref_edge_reverse_offset
+                if projection is self.ref_edge_in
+                else self.edge_reverse_offset
+            )
+            reverse_attr[:, directional_columns] = (
+                -edge_attr[:, directional_columns]
+                + reverse_offset[directional_columns].to(edge_attr)
+            )
+        else:
+            reverse_attr[:, directional_columns] *= -1
         endpoint = torch.cat([col, row])
         endpoint_attr = torch.cat([edge_attr, reverse_attr], dim=0)
         # Linear projection commutes with mean aggregation:
@@ -222,6 +272,76 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
         projected = (projection or self.edge_in)(node_sum / node_count.clamp_min(1.0))
         return projected * (node_count > 0).to(projected.dtype)
 
+    def _bidirectional_edges(
+        self, edge_attr: Tensor, edge_index: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return receiving node, neighbouring node, and oriented attributes.
+
+        Stored graphs contain one canonical edge per pair.  The AE receives
+        normalized edge attributes.  Reversal therefore applies the fitted
+        affine offset ``-u - 2*mean/std`` for directional channels, exactly
+        matching reversal in raw coordinates followed by normalization.
+        """
+        row, col = edge_index
+        reverse_attr = edge_attr.clone()
+        if edge_attr.size(-1) == 4:
+            directional_columns = [0, 1]
+        elif edge_attr.size(-1) >= 11:
+            directional_columns = [0, 1, 2, 3, 9, 10]
+        else:
+            directional_columns = list(range(min(self.pos_dim, edge_attr.size(-1))))
+        if directional_columns:
+            offset = self.edge_reverse_offset[directional_columns].to(
+                device=edge_attr.device, dtype=edge_attr.dtype
+            )
+            reverse_attr[:, directional_columns] = (
+                -edge_attr[:, directional_columns] + offset
+            )
+        return (
+            torch.cat([col, row]),
+            torch.cat([row, col]),
+            torch.cat([edge_attr, reverse_attr], dim=0),
+        )
+
+    def set_edge_normalization(
+        self, edge_mean: Tensor, edge_std: Tensor,
+        ref_edge_mean: Tensor | None = None, ref_edge_std: Tensor | None = None,
+    ) -> None:
+        """Set the exact normalized-vector reversal offset for message layers."""
+        if edge_mean.numel() != self.edge_dim or edge_std.numel() != self.edge_dim:
+            raise ValueError("Edge normalization dimensionality does not match the AE.")
+        self.edge_reverse_offset.copy_(
+            (-2 * edge_mean.detach() / edge_std.detach().clamp_min(1e-12)).reshape(-1)
+        )
+        ref_mean = edge_mean if ref_edge_mean is None else ref_edge_mean
+        ref_std = edge_std if ref_edge_std is None else ref_edge_std
+        self.ref_edge_reverse_offset.copy_(
+            (-2 * ref_mean.detach() / ref_std.detach().clamp_min(1e-12)).reshape(-1)
+        )
+
+    def message_pass(self, h: Tensor, edge_attr: Tensor, edge_index: Tensor) -> Tensor:
+        """Residual nonlinear neighbour exchange with bounded edge intermediates."""
+        if not self.message_mlps or edge_attr.numel() == 0:
+            return h
+        receiver, neighbour, directed_attr = self._bidirectional_edges(edge_attr, edge_index)
+        edge_h = self.message_edge_in(directed_attr)
+        for message_mlp, update_mlp, norm in zip(
+            self.message_mlps, self.message_updates, self.message_norms
+        ):
+            summed = torch.zeros_like(h)
+            counts = torch.zeros((h.size(0), 1), device=h.device, dtype=h.dtype)
+            for start in range(0, receiver.numel(), self.message_chunk_size):
+                stop = min(start + self.message_chunk_size, receiver.numel())
+                recv = receiver[start:stop]
+                msg = message_mlp(
+                    torch.cat([h[recv], h[neighbour[start:stop]], edge_h[start:stop]], dim=-1)
+                )
+                summed.index_add_(0, recv, msg)
+                counts.index_add_(0, recv, torch.ones((stop - start, 1), device=h.device, dtype=h.dtype))
+            update = update_mlp(torch.cat([h, summed / counts.clamp_min(1)], dim=-1))
+            h = norm(h + update)
+        return h
+
     def encode_latent_graph(
         self,
         delta_pos_g: Tensor,
@@ -231,8 +351,7 @@ class NodeDeltaAttentionAutoEncoder(nn.Module):
     ) -> Tensor:
         edge_delta = self.aggregate_edges(edge_attr_g, edge_index_g, delta_pos_g.size(0))
         h = self.node_in(torch.cat([delta_pos_g, h0_g + edge_delta], dim=-1))  # [N, H]
-
-        return self.pool(h)
+        return self.pool(self.message_pass(h, edge_attr_g, edge_index_g))
 
     def encode_latent(
         self,
@@ -340,6 +459,20 @@ class NodeDeltaSingleStageAttentionAutoEncoder(NodeDeltaAttentionAutoEncoder):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.pool = DirectLatentAttentionPool(self.hidden_size, self.latent_dim)
+
+
+class NodeDeltaMessagePassingAutoEncoder(NodeDeltaAttentionAutoEncoder):
+    """Pyramid-attention AE with residual nonlinear neighbour messages."""
+
+    def __init__(self, *, message_passing_steps: int = 2, **kwargs):
+        super().__init__(message_passing_steps=message_passing_steps, correct_edge_reversal=True, **kwargs)
+
+
+class NodeDeltaOrientationCorrectedAttentionAutoEncoder(NodeDeltaAttentionAutoEncoder):
+    """Baseline attention AE with raw-coordinate-consistent edge reversal."""
+
+    def __init__(self, **kwargs):
+        super().__init__(correct_edge_reversal=True, **kwargs)
 
 
 class NodeDeltaMLPAutoEncoder(NodeDeltaAttentionAutoEncoder):
@@ -1745,6 +1878,8 @@ __all__ = [
     "LinearLatentDynamics",
     "NodeDeltaAttentionAutoEncoder",
     "NodeDeltaDirectAttentionAutoEncoder",
+    "NodeDeltaMessagePassingAutoEncoder",
+    "NodeDeltaOrientationCorrectedAttentionAutoEncoder",
     "NodeDeltaSingleStageAttentionAutoEncoder",
     "NodeDeltaMLPAutoEncoder",
     "NodeDeltaPyramidMLPAutoEncoder",

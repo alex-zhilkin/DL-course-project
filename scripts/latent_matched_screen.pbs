@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#PBS -N lss_ae_screen
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/lss-cache-${PBS_JOBID}"
+export MPLCONFIGDIR="$XDG_CACHE_HOME/matplotlib"
+mkdir -p notebooks/results/latent_matched_study/job_logs
+exec >"notebooks/results/latent_matched_study/job_logs/${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python notebooks/results/latent_matched_study/code_v1/scripts/run_latent_matched_screen.py \
+    --dim "${LSS_DIM:?}" --sources "${LSS_SOURCES:?}" --seed "${LSS_SEED:-123}"

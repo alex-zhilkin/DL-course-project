@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#PBS -N lss_science
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=48gb
+#PBS -l place=free:shared
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-science-${PBS_JOBID}"
+mkdir -p notebooks/results/latent_science_followup/job_logs
+exec >"notebooks/results/latent_science_followup/job_logs/${PBS_JOBID}.log" 2>&1
+if [[ "${LSS_TASK:?}" == diagnostics ]]; then
+    for variant in velocity_transfer3 delta_transfer3 acceleration_transfer3; do
+        .venv/bin/python notebooks/results/latent_science_followup/code_v1/scripts/run_latent_rollout_diagnostics.py --variant "$variant" --seed "${LSS_SEED:?}"
+    done
+else
+    .venv/bin/python notebooks/results/latent_science_followup/code_v1/scripts/run_latent_low_data.py --scope "${LSS_SCOPE:?}" --seed "${LSS_SEED:?}"
+fi

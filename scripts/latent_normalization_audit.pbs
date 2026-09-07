@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#PBS -N lss_norm_audit
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=2:mem=48gb
+#PBS -l place=free:shared
+#PBS -l walltime=02:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD" OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-audit-${PBS_JOBID}"
+mkdir -p notebooks/results/normalized_data_audit/job_logs
+exec >"notebooks/results/normalized_data_audit/job_logs/${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python scripts/data/audit_normalized_reference_box.py --source "${LSS_SOURCE:?}"

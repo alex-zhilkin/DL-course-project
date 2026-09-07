@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#PBS -N lss_control
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=48gb
+#PBS -l place=free:shared
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-control-${PBS_JOBID}"
+mkdir -p notebooks/results/latent_controlled_followup/job_logs
+exec >"notebooks/results/latent_controlled_followup/job_logs/${PBS_JOBID}.log" 2>&1
+if [[ "${LSS_TASK:?}" == stability ]]; then
+    export LSS_CODE_ROOT="$PWD/notebooks/results/latent_stability/code_v1"
+    export LSS_ROLLOUT_RESULTS="$PWD/notebooks/results/latent_stability"
+    exec .venv/bin/python "$LSS_CODE_ROOT/scripts/run_latent_stability.py" --variant "${LSS_VARIANT:?}" --scope shared4 --seed "${LSS_SEED:?}"
+elif [[ "$LSS_TASK" == lowdata ]]; then
+    exec .venv/bin/python notebooks/results/latent_low_data_update_matched/code_v1/scripts/run_latent_low_data_update_matched.py --scope "${LSS_SCOPE:?}" --seed "${LSS_SEED:?}"
+else
+    exit 2
+fi

@@ -4,6 +4,8 @@ from .models import (
     LatentDynamicsMLP,
     NodeDeltaAttentionAutoEncoder,
     NodeDeltaDirectAttentionAutoEncoder,
+    NodeDeltaMessagePassingAutoEncoder,
+    NodeDeltaOrientationCorrectedAttentionAutoEncoder,
     NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "DirectionalStrainTransferBundle",
     "NodeDeltaAttentionAutoEncoder",
     "NodeDeltaDirectAttentionAutoEncoder",
+    "NodeDeltaMessagePassingAutoEncoder",
+    "NodeDeltaOrientationCorrectedAttentionAutoEncoder",
     "NodeDeltaSingleStageAttentionAutoEncoder",
     "PhysicsLossConfig",
     "TrainingConfig",

@@ -97,3 +97,20 @@ def test_cache_fingerprint_changes_with_model_config_but_not_runtime_path():
 
     assert base == same_model
     assert base != changed_model
+
+
+@pytest.mark.parametrize('matches', [False, True])
+def test_cache_loading_checks_recipe_by_default(tmp_path, monkeypatch, matches):
+    import torch
+    import lss.latent.experiment as experiment
+    path=tmp_path/'ae.pt'
+    source={'path':'unused.pt','dataset_name':'example'}
+    cfg={'latent_dim':2,'cache_path':str(path),'should_rollout':False,'should_train_propagator':False}
+    key=experiment.latent_experiment_cache_key(source,cfg)
+    torch.save({'cache_key':key if matches else 'different-recipe'},path)
+    calls=[]
+    monkeypatch.setattr(experiment,'_load_ae_cache',lambda *a,**kw:calls.append('load') or {})
+    monkeypatch.setattr(experiment,'train_latent_autoencoder_experiment',lambda *a,**kw:calls.append('train') or {})
+    monkeypatch.setattr(experiment,'_save_ae_cache',lambda *a,**kw:None)
+    experiment.run_latent_experiment(source,cfg,device='cpu')
+    assert calls==(['load'] if matches else ['train'])

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#PBS -N lss_lj_ae
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l place=free:shared
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD" LSS_CODE_ROOT="$PWD/notebooks/results/lj_ae_capacity/code_v1"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-lj-ae-${PBS_JOBID}"
+mkdir -p notebooks/results/lj_ae_capacity/job_logs
+exec >"notebooks/results/lj_ae_capacity/job_logs/${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python "$LSS_CODE_ROOT/scripts/run_lj_ae_capacity.py" --variant "${LSS_VARIANT:?}" --seed "${LSS_SEED:?}"

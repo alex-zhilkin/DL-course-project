@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N lss_preflight
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -l walltime=00:10:00
+#PBS -j oe
+
+set -euo pipefail
+: "${PBS_JOBID:?Submit this file with qsub from the repository root}"
+cd "${PBS_O_WORKDIR:?Missing PBS working directory}"
+test -f scripts/latent_cluster_preflight.py
+mkdir -p notebooks/results/cluster_preflight
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-matplotlib-${PBS_JOBID}"
+export LSS_PREFLIGHT_REPORT="$PWD/notebooks/results/cluster_preflight/${PBS_JOBID}.json"
+LSS_PYTHON="${LSS_PYTHON:-$PWD/.venv/bin/python}"
+exec "$LSS_PYTHON" scripts/latent_cluster_preflight.py

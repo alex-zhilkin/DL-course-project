@@ -27,6 +27,8 @@ from .models import (
     NodeDeltaAttentionAutoEncoder,
     NodeDeltaDirectAttentionAutoEncoder,
     NodeDeltaMLPAutoEncoder,
+    NodeDeltaMessagePassingAutoEncoder,
+    NodeDeltaOrientationCorrectedAttentionAutoEncoder,
     NodeDeltaPyramidMLPAutoEncoder,
     NodeDeltaSingleStageAttentionAutoEncoder,
     make_latent_propagator,
@@ -369,6 +371,10 @@ def _autoencoder_class(model_type: str):
         return NodeDeltaDirectAttentionAutoEncoder
     if model_type in {"single_stage_attention", "direct_latent_attention", "node_to_latent_attention"}:
         return NodeDeltaSingleStageAttentionAutoEncoder
+    if model_type in {"message_passing", "message_passing_attention", "mp_attention"}:
+        return NodeDeltaMessagePassingAutoEncoder
+    if model_type in {"orientation_corrected", "orientation_corrected_attention"}:
+        return NodeDeltaOrientationCorrectedAttentionAutoEncoder
     if model_type in {"attention", "attention_mlp"}:
         return NodeDeltaAttentionAutoEncoder
     raise ValueError(f"Unknown autoencoder_model: {model_type}")
@@ -607,9 +613,17 @@ def _load_ae_cache(path: Path, cfg: dict, *, device) -> dict:
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
         reconstruction_dim=int(normalizers["target_mean"].numel()),
+        message_passing_steps=int(params.get("message_passing_steps", 0)),
     ).to(device)
+    ae_model.set_edge_normalization(normalizers["edge_mean"], normalizers["edge_std"], normalizers.get("ref_edge_mean"), normalizers.get("ref_edge_std"))
     ae_model.edge_mode = str(params.get("edge_mode", "stored"))
-    ae_model.load_state_dict(bundle["ae_state_dict"])
+    # Legacy attention checkpoints predate optional message modules.  Missing
+    # message weights are inert when their saved recipe has zero message steps.
+    incompatible = ae_model.load_state_dict(bundle["ae_state_dict"], strict=False)
+    if incompatible.unexpected_keys or (
+        int(params.get("message_passing_steps", 0)) > 0 and incompatible.missing_keys
+    ):
+        raise RuntimeError(f"Incompatible AE checkpoint: {incompatible}")
     ae_model.eval()
     for parameter in ae_model.parameters():
         parameter.requires_grad_(False)
@@ -2718,7 +2732,9 @@ def train_latent_autoencoder_experiment(source_spec: dict, cfg: dict, *, device)
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
         reconstruction_dim=int(target_mean.numel()),
+        message_passing_steps=int(params.get("message_passing_steps", 0)),
     ).to(device)
+    ae_model.set_edge_normalization(edge_mean, edge_std, ref_edge_mean, ref_edge_std)
     ae_model.edge_mode = edge_mode
     pretrained_ae_path = params.get("pretrained_ae_cache_path")
     use_pretrained_ae = bool(
@@ -2896,7 +2912,7 @@ def run_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
     cache_is_current = False
     if path is not None and path.exists() and not bool(cfg.get("force_train", False)):
         cached = torch.load(path, map_location="cpu", weights_only=False)
-        require_matching_cache = bool(cfg.get("cache_require_matching_config", False))
+        require_matching_cache = bool(cfg.get("cache_require_matching_config", True))
         cache_is_current = (
             cached.get("cache_key") == expected_cache_key
             if require_matching_cache
@@ -3108,7 +3124,9 @@ def train_latent_experiment(source_spec: dict, cfg: dict, *, device) -> dict:
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
         reconstruction_dim=int(target_mean.numel()),
+        message_passing_steps=int(params.get("message_passing_steps", 0)),
     ).to(device)
+    ae_model.set_edge_normalization(edge_mean, edge_std, ref_edge_mean, ref_edge_std)
     ae_model.edge_mode = edge_mode
     if use_pretrained_ae and bool(params.get("pca_initialize_displacement_layers", False)):
         raise ValueError("Cannot combine pretrained_ae_cache_path with PCA initialization.")
@@ -4066,6 +4084,7 @@ def build_autoencoder(params: dict, *, edge_dim: int, device):
         hidden_size=int(params["hidden_size"]),
         latent_dim=int(params["latent_dim"]),
         latent_tokens=int(params["latent_tokens"]),
+        message_passing_steps=int(params.get("message_passing_steps", 0)),
     ).to(device)
 
 

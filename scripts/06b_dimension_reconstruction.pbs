@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#PBS -N lss_06b4d
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l place=free:shared
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export LSS_CODE_ROOT="$PWD/notebooks/results/06b_4d_reconstruction/code_v2"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-06b-${PBS_JOBID}"
+mkdir -p notebooks/results/06b_4d_reconstruction/job_logs
+exec >"notebooks/results/06b_4d_reconstruction/job_logs/${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python "$LSS_CODE_ROOT/scripts/run_06b_dimension_reconstruction.py" --seed "${LSS_SEED:?}" --dim "${LSS_DIM:?}"

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#PBS -N lss_ae_collect
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=1:mem=2gb
+#PBS -l place=free:shared
+#PBS -l walltime=00:15:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+exec >"notebooks/results/lj_ae_repair/job_logs/collection-${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python scripts/finalize_lj_ae_study.py

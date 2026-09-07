@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N lss_rollout
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=24gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export LSS_CODE_ROOT="$PWD/notebooks/results/latent_matched_rollouts/${LSS_CODE_VERSION:-code_v1}"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/lss-rollout-${PBS_JOBID}"
+export MPLCONFIGDIR="$XDG_CACHE_HOME/matplotlib"
+mkdir -p notebooks/results/latent_matched_rollouts/job_logs
+exec >"notebooks/results/latent_matched_rollouts/job_logs/${PBS_JOBID}.log" 2>&1
+exec .venv/bin/python "$LSS_CODE_ROOT/scripts/run_latent_matched_rollout.py" \
+    --variant "${LSS_VARIANT:?}" --scope "${LSS_SCOPE:?}" --seed "${LSS_SEED:?}"

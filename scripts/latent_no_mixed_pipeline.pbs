@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#PBS -N lss_no_mixed
+#PBS -q mendels_q
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?}"
+export LSS_PROJECT_ROOT="$PWD"
+export LSS_CODE_ROOT="$PWD/notebooks/results/latent_no_mixed/code_v1"
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/lss-mpl-${PBS_JOBID}"
+mkdir -p notebooks/results/latent_no_mixed/job_logs
+exec >"notebooks/results/latent_no_mixed/job_logs/${PBS_JOBID}.log" 2>&1
+.venv/bin/python "$LSS_CODE_ROOT/scripts/run_latent_matched_screen.py" \
+    --dim "${LSS_DIM:?}" --sources shared_no_mixed --seed "${LSS_SEED:?}"
+export LSS_AE_PATH="$PWD/notebooks/results/latent_matched_study/shared_no_mixed_d${LSS_DIM}_s${LSS_SEED}/ae.pt"
+export LSS_LATENT_DIM="$LSS_DIM"
+export LSS_ROLLOUT_RESULTS="$PWD/notebooks/results/latent_no_mixed/d${LSS_DIM}_ae${LSS_SEED}"
+for variant in acceleration_transfer3 velocity_transfer3 delta_transfer3; do
+    .venv/bin/python "$LSS_CODE_ROOT/scripts/run_latent_matched_rollout.py" \
+        --variant "$variant" --scope shared4 --seed "$LSS_SEED"
+done

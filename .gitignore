@@ -2,5 +2,9 @@ data/**
 results/**
 notebooks/results/**
 __pycache__/
+.venv/
+src/lss.egg-info/
 *.pyc
+*.o[0-9]*
+*.e[0-9]*
 **/course_project.egg-info/
